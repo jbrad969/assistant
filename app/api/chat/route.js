@@ -1,109 +1,77 @@
-import OpenAI from "openai";
+import { google } from "googleapis";
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const TIME_ZONE = "America/Phoenix";
 
-function detectDate(message) {
-  const msg = message.toLowerCase();
-  const today = new Date();
-
-  if (msg.includes("tomorrow")) {
-    const d = new Date(today);
-    d.setDate(d.getDate() + 1);
-    return d;
-  }
-
-  const days = {
-    sunday: 0,
-    monday: 1,
-    tuesday: 2,
-    wednesday: 3,
-    thursday: 4,
-    friday: 5,
-    saturday: 6,
-  };
-
-  for (const day in days) {
-    if (msg.includes(day)) {
-      return getNextDay(days[day]);
-    }
-  }
-
-  return today;
-}
-
-function getNextDay(dayIndex) {
-  const today = new Date();
-  const result = new Date();
-
-  const diff = (dayIndex + 7 - today.getDay()) % 7 || 7;
-  result.setDate(today.getDate() + diff);
-
-  return result;
-}
-
-async function getCalendarForDate(date) {
-  const iso = date.toISOString();
-
-  const res = await fetch(
-    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${iso}`
+function getGoogleClient() {
+  const client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
   );
 
-  const data = await res.json();
+  client.setCredentials({
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+  });
 
-  if (!data.events || data.events.length === 0) {
-    return "No events scheduled.";
-  }
-
-  return data.events
-    .map((e) => {
-      const time = new Date(e.start).toLocaleTimeString("en-US", {
-        hour: "numeric",
-        minute: "2-digit",
-        timeZone: "America/Phoenix",
-      });
-
-      return `${time} — ${e.title}`;
-    })
-    .join("\n");
+  return client;
 }
 
-export async function POST(req) {
+function getDateRange(dateString) {
+  const date = dateString ? new Date(dateString) : new Date();
+
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return {
+    timeMin: start.toISOString(),
+    timeMax: end.toISOString(),
+  };
+}
+
+function formatTime(dateString) {
+  if (!dateString) return "All day";
+
+  return new Date(dateString).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: TIME_ZONE,
+  });
+}
+
+export async function GET(req) {
   try {
-    const { message } = await req.json();
+    const { searchParams } = new URL(req.url);
+    const date = searchParams.get("date");
 
-    const date = detectDate(message);
-    const calendarData = await getCalendarForDate(date);
+    const auth = getGoogleClient();
+    const calendar = google.calendar({ version: "v3", auth });
 
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `
-You are Jess, Brad's assistant.
+    const { timeMin, timeMax } = getDateRange(date);
 
-Always use the provided schedule to answer questions about dates.
-
-Schedule:
-${calendarData}
-          `,
-        },
-        {
-          role: "user",
-          content: message,
-        },
-      ],
+    const result = await calendar.events.list({
+      calendarId: "primary",
+      timeMin,
+      timeMax,
+      timeZone: TIME_ZONE,
+      singleEvents: true,
+      orderBy: "startTime",
+      maxResults: 50,
     });
 
-    return Response.json({
-      reply: completion.choices[0].message.content,
-    });
+    const events = (result.data.items || []).map((event) => ({
+      title: event.summary || "Untitled event",
+      start: event.start?.dateTime || event.start?.date,
+      end: event.end?.dateTime || event.end?.date,
+      time: formatTime(event.start?.dateTime || event.start?.date),
+      location: event.location || "",
+    }));
+
+    return Response.json({ events });
   } catch (error) {
-    return Response.json({
-      reply: "Jess had an issue.",
-      error: error.message,
-    });
+    return Response.json({ error: error.message }, { status: 500 });
   }
 }

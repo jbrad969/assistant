@@ -25,6 +25,43 @@ function cleanResponse(text) {
   return text.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "").trim();
 }
 
+const NEVER_RESEARCH_RULE = `CRITICAL: Never re-search for information already present in the conversation history. If calendar data was already retrieved in this conversation, use it. If Brad references an event already discussed, use that event's details. Never say you can't find something that was already shown in the conversation.`;
+
+const DAYS_PATTERN = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+
+function historyHasCalendarData(history) {
+  const recent = history.slice(-10);
+  for (const m of recent) {
+    if (m.role !== "assistant") continue;
+    const content = m.content || "";
+    const times = content.match(/\b\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)\b/g) || [];
+    if (times.length >= 2) return true;
+  }
+  return false;
+}
+
+function isExplicitCalendarRefresh(message) {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("check my calendar again") ||
+    msg.includes("re-check") ||
+    msg.includes("refetch") ||
+    msg.includes("refresh") ||
+    msg.includes("look again") ||
+    msg.includes("any new events")
+  );
+}
+
+function mentionsDifferentDay(message, history) {
+  const msgDays = (message.toLowerCase().match(DAYS_PATTERN) || []).map((d) => d.toLowerCase());
+  if (msgDays.length === 0) return false;
+  const recent = history
+    .slice(-10)
+    .map((m) => (m.content || "").toLowerCase())
+    .join(" ");
+  return msgDays.some((day) => !recent.includes(day));
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -539,30 +576,34 @@ function detectOrigin(message) {
   return HOME_ADDRESS;
 }
 
-async function extractEventReference(message, history = []) {
-  const recentHistory = history.slice(-6);
+async function extractDepartureContext(message, history = []) {
+  const recentHistory = history.slice(-10);
   const conversationContext = recentHistory.length
     ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
     : "(no prior turns)";
 
   const result = await anthropic.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 256,
-    system: `You determine if Brad is asking about a SPECIFIC named event versus just "his next appointment".
+    max_tokens: 384,
+    system: `Brad is asking about departure / travel timing for a calendar event.
 
-Look at the recent conversation and the current question. If Brad references a specific event by name (e.g. "the shrimp boil", "the Trunzo job", "the team meeting"), return a 1-3 word title fragment that can be substring-matched against calendar event titles. If he is asking generically ("when do I need to leave", "how long until my next appointment"), return null.
+Look at the recent conversation. If history already shows the event's location AND start time, return them so we can skip looking up the calendar.
 
 Return ONLY a single JSON object. No preamble, no code fence, no extra text:
 {
-  "eventReference": "1-3 word title fragment" | null
+  "eventReference": "1-3 word title fragment to search calendar by" | null,
+  "knownLocation": "exact location string copied from history (full address if visible)" | null,
+  "knownArrivalTime": "HH:MM 24-hour Phoenix" | null
 }
 
+If the event is named but the conversation does not include both a location and a time, set knownLocation/knownArrivalTime to null and just return eventReference.
+If Brad is asking generically without naming an event, set eventReference to null too.
+
 Examples:
-- "what time should I leave for the shrimp boil tonight" -> {"eventReference": "shrimp boil"}
-- "how long until I get to my next appointment" -> {"eventReference": null}
-- "should I leave for the Trunzo job" -> {"eventReference": "trunzo"}
-- "when do I need to leave" -> {"eventReference": null}
-- After assistant said "You have the shrimp boil at 7 PM", Brad asks "what time should I leave" -> {"eventReference": "shrimp boil"}`,
+- After "9 AM BNI at Rudy's BBQ 15257 N Northsight Blvd" in history, "when should I leave" -> {"eventReference":"BNI","knownLocation":"Rudy's BBQ 15257 N Northsight Blvd","knownArrivalTime":"09:00"}
+- "what time should I leave for the shrimp boil tonight" with no prior context -> {"eventReference":"shrimp boil","knownLocation":null,"knownArrivalTime":null}
+- "how long until I get to my next appointment" -> {"eventReference":null,"knownLocation":null,"knownArrivalTime":null}
+- "should I leave for the Trunzo job" -> {"eventReference":"trunzo","knownLocation":null,"knownArrivalTime":null}`,
     messages: [
       {
         role: "user",
@@ -574,13 +615,108 @@ Examples:
   const raw = result.content?.[0]?.text || "";
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) {
+    return { eventReference: null, knownLocation: null, knownArrivalTime: null };
+  }
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return { eventReference: null, knownLocation: null, knownArrivalTime: null };
+  }
+}
+
+function isArrivalTargetQuestion(message) {
+  const msg = message.toLowerCase();
+  const arrivalPattern = /\b(need to|have to|gotta|got to|i need to|i have to)\s+(?:be|get|make it)\s+(?:at|to|in|there|by)\b/;
+  if (!arrivalPattern.test(msg)) return false;
+  return /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/.test(msg);
+}
+
+async function extractArrivalTarget(message) {
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 256,
+    system: `Brad just told you a place he needs to be and a time. Extract them.
+
+Brad's locations:
+- "desk", "the desk", "office", "the office", "shop", "the shop" -> the SHOP
+- "home", "house", "my house" -> HOME
+
+Return ONLY a single JSON object, no preamble:
+{
+  "destinationKey": "shop" | "home" | "other",
+  "destinationLiteral": "the literal place name if destinationKey is 'other'" | null,
+  "arrivalTime": "HH:MM 24-hour Phoenix"
+}
+
+Examples:
+- "I need to be at my desk at 8:45" -> {"destinationKey":"shop","destinationLiteral":null,"arrivalTime":"08:45"}
+- "I have to be at the office by 9" -> {"destinationKey":"shop","destinationLiteral":null,"arrivalTime":"09:00"}
+- "I need to be home by 6 PM" -> {"destinationKey":"home","destinationLiteral":null,"arrivalTime":"18:00"}
+- "I need to be at Rudy's BBQ at 7" -> {"destinationKey":"other","destinationLiteral":"Rudy's BBQ","arrivalTime":"07:00"}`,
+    messages: [{ role: "user", content: message }],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1) return null;
   try {
-    const parsed = JSON.parse(raw.slice(start, end + 1));
-    return parsed.eventReference || null;
+    return JSON.parse(raw.slice(start, end + 1));
   } catch {
     return null;
   }
+}
+
+async function callMapsForDeparture({ origin, destination, arrivalIso }) {
+  const params = new URLSearchParams({ origin, destination, arrivalTime: arrivalIso });
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/maps?${params.toString()}`
+  );
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    return { error: data.error || `maps API returned ${res.status}` };
+  }
+  return data;
+}
+
+function buildPhoenixIsoFromTimeToday(hhmm) {
+  const phoenixDate = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: TIME_ZONE,
+  }).format(new Date());
+
+  let target = new Date(`${phoenixDate}T${hhmm}:00-07:00`);
+  // If the time has already passed today, push to tomorrow.
+  if (target.getTime() <= Date.now()) {
+    target = new Date(target.getTime() + 24 * 60 * 60 * 1000);
+  }
+  return target.toISOString();
+}
+
+function formatFriendlyDeparture(departureMs, nowMs) {
+  const minutesUntil = Math.round((departureMs - nowMs) / 60000);
+  if (minutesUntil <= 0) return "right now";
+  if (minutesUntil <= 60) return `in ${minutesUntil} minute${minutesUntil === 1 ? "" : "s"}`;
+
+  const dep = new Date(departureMs);
+  const now = new Date(nowMs);
+  const tomorrow = new Date(nowMs + 24 * 60 * 60 * 1000);
+  const dateFmt = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIME_ZONE,
+  });
+  const timeFmt = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric", minute: "2-digit", hour12: true, timeZone: TIME_ZONE,
+  });
+  const depDate = dateFmt.format(dep);
+  if (depDate === dateFmt.format(now)) return `at ${timeFmt.format(dep)} today`;
+  if (depDate === dateFmt.format(tomorrow)) return `tomorrow at ${timeFmt.format(dep)}`;
+  const dayName = new Intl.DateTimeFormat("en-US", {
+    weekday: "long", timeZone: TIME_ZONE,
+  }).format(dep);
+  return `${dayName} at ${timeFmt.format(dep)}`;
 }
 
 /* ---------------- CALENDAR ---------------- */
@@ -1316,11 +1452,84 @@ No markdown. Be concise.`,
       // action === "none" — fall through to read/normal-chat handling
     }
 
+    // ARRIVAL TARGET — Brad named a place and a time he has to be there ("be at my desk at 8:45")
+    if (isArrivalTargetQuestion(message)) {
+      const target = await extractArrivalTarget(message);
+      if (!target?.arrivalTime) {
+        // fall through to other handlers / normal chat
+      } else {
+        const origin = detectOrigin(message);
+        const destination =
+          target.destinationKey === "shop"
+            ? SHOP_ADDRESS
+            : target.destinationKey === "home"
+            ? HOME_ADDRESS
+            : target.destinationLiteral || SHOP_ADDRESS;
+
+        const arrivalIso = buildPhoenixIsoFromTimeToday(target.arrivalTime);
+        const maps = await callMapsForDeparture({ origin, destination, arrivalIso });
+        if (maps.error) {
+          console.log("[chat] arrival-target maps error:", maps.error);
+          return Response.json({
+            reply: "I'm having trouble reaching Google Maps right now - try again in a moment.",
+          });
+        }
+
+        const arrivalMs = new Date(arrivalIso).getTime();
+        const driveMin = maps.driveTimeMinutes;
+        const trafficMin = maps.trafficDelayMinutes;
+        const departureMs = arrivalMs - (driveMin + 10) * 60 * 1000;
+        const friendly = formatFriendlyDeparture(departureMs, Date.now());
+
+        const arrivalLabel = new Date(arrivalIso).toLocaleTimeString("en-US", {
+          hour: "numeric", minute: "2-digit", hour12: true, timeZone: TIME_ZONE,
+        });
+
+        const trafficNote =
+          trafficMin >= 5 ? ` Traffic is adding about ${trafficMin} minutes.` : "";
+
+        return Response.json({
+          reply: `Leave ${friendly} to make ${arrivalLabel} at ${destination} — ${driveMin} minutes from where you are.${trafficNote}`,
+        });
+      }
+    }
+
     // DEPARTURE
     if (isDepartureQuestion(message)) {
       const origin = detectOrigin(message);
-      const eventQuery = await extractEventReference(message, history);
-      console.log("[chat] departure detected; origin:", origin, "eventQuery:", eventQuery, "message:", message);
+      const ctx = await extractDepartureContext(message, history);
+      console.log("[chat] departure detected; origin:", origin, "ctx:", JSON.stringify(ctx), "message:", message);
+
+      // If history already has both location and arrival time, skip /api/departure (which re-fetches calendar)
+      if (ctx.knownLocation && ctx.knownArrivalTime) {
+        const arrivalIso = buildPhoenixIsoFromTimeToday(ctx.knownArrivalTime);
+        const maps = await callMapsForDeparture({
+          origin,
+          destination: ctx.knownLocation,
+          arrivalIso,
+        });
+        if (maps.error) {
+          console.log("[chat] departure (history) maps error:", maps.error);
+          return Response.json({
+            reply: "I'm having trouble reaching Google Maps right now - try again in a moment.",
+          });
+        }
+
+        const arrivalMs = new Date(arrivalIso).getTime();
+        const driveMin = maps.driveTimeMinutes;
+        const trafficMin = maps.trafficDelayMinutes;
+        const departureMs = arrivalMs - (driveMin + 10) * 60 * 1000;
+        const friendly = formatFriendlyDeparture(departureMs, Date.now());
+        const trafficNote =
+          trafficMin >= 5 ? ` Traffic is adding about ${trafficMin} minutes.` : "";
+        const eventLabel = ctx.eventReference ? `the ${ctx.eventReference}` : ctx.knownLocation;
+
+        return Response.json({
+          reply: `Leave ${friendly} to make ${eventLabel} — ${driveMin} minutes drive.${trafficNote}`,
+        });
+      }
+
+      const eventQuery = ctx.eventReference;
       let data;
       try {
         const params = new URLSearchParams({ origin });
@@ -1397,6 +1606,14 @@ Brad asked: "${message}"`,
 
     // CALENDAR
     if (isCalendarQuestion(message)) {
+      const skipBecauseHistory =
+        historyHasCalendarData(history) &&
+        !isExplicitCalendarRefresh(message) &&
+        !mentionsDifferentDay(message, history);
+
+      if (skipBecauseHistory) {
+        // Fall through to normal chat — Claude will answer from history without re-fetching the calendar.
+      } else {
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendarForDate));
 
@@ -1428,6 +1645,7 @@ Rules:
       return Response.json({
         reply: cleanResponse(completion.content?.[0]?.text || ""),
       });
+      }
     }
 
     // NORMAL CHAT
@@ -1437,6 +1655,8 @@ Rules:
       system: `You are Jess, Brad's executive assistant.
 
 Today is ${today}. Always use this as your reference for current date. Never reference events from wrong years.
+
+${NEVER_RESEARCH_RULE}
 
 ${KNOWN_LOCATIONS_CONTEXT}
 

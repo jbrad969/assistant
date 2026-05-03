@@ -471,16 +471,76 @@ async function extractPersonReference(message) {
     max_tokens: 256,
     system: `Extract who/what to search for in Brad's email. Return ONLY a JSON object, no preamble:
 {
-  "personName": "first or full name to search by sender" | null,
+  "personName": "first or full name to search by sender (use exactly what Brad said)" | null,
   "subjectKeyword": "additional keyword to filter (subject or body)" | null
 }
+
+Words like "last", "latest", "recent", "any", "the", "an" are NOT names — ignore them.
 
 Examples:
 - "find email from Yvonne about BNI" -> {"personName":"Yvonne","subjectKeyword":"BNI"}
 - "did Mike email me" -> {"personName":"Mike","subjectKeyword":null}
 - "search for email from John about the contract" -> {"personName":"John","subjectKeyword":"contract"}
-- "any emails from Sarah" -> {"personName":"Sarah","subjectKeyword":null}`,
+- "any emails from Sarah" -> {"personName":"Sarah","subjectKeyword":null}
+- "last emails from Nicole" -> {"personName":"Nicole","subjectKeyword":null}
+- "emails from Nicole" -> {"personName":"Nicole","subjectKeyword":null}
+- "show me the last few emails from Mike" -> {"personName":"Mike","subjectKeyword":null}`,
     messages: [{ role: "user", content: message }],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return { personName: null, subjectKeyword: null };
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return { personName: null, subjectKeyword: null };
+  }
+}
+
+function isReadEmailQuestion(message, history = []) {
+  const msg = message.toLowerCase();
+  if (!/\b(read it|read that|read me|read aloud|read out|read the email|read the message)\b/.test(msg)) {
+    return false;
+  }
+  if (/\b(email|emails|message|inbox)\b/.test(msg)) return true;
+  const recentText = history
+    .slice(-4)
+    .map((m) => m.content || "")
+    .join(" ")
+    .toLowerCase();
+  return /\b(email|emails|message|inbox|from\s+\w+)\b/.test(recentText);
+}
+
+async function extractEmailReference(message, history = []) {
+  const recentHistory = history.slice(-6);
+  const conversationContext = recentHistory.length
+    ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
+    : "(no prior turns)";
+
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 256,
+    system: `Brad just asked you to read an email. Look at the recent conversation to identify which email he's referring to.
+Return ONLY a JSON object, no preamble:
+{
+  "personName": "sender name to search Gmail" | null,
+  "subjectKeyword": "keyword in email" | null
+}
+
+If history mentions emails from a person, use that person. If multiple people, use the most recently mentioned.
+
+Examples:
+- After "emails from Nicole" was just shown, "read me that email" -> {"personName":"Nicole","subjectKeyword":null}
+- After "Yvonne emailed about BNI", "read it to me" -> {"personName":"Yvonne","subjectKeyword":"BNI"}
+- "read me Brad's last email from Sarah" -> {"personName":"Sarah","subjectKeyword":null}`,
+    messages: [
+      {
+        role: "user",
+        content: `Recent conversation:\n${conversationContext}\n\nCurrent question: "${message}"`,
+      },
+    ],
   });
 
   const raw = result.content?.[0]?.text || "";
@@ -567,8 +627,9 @@ If the email does not contain ${desc}, return {"value": null}.`,
   }
 }
 
-async function getEmailsBySearch(search, limit = 5) {
+async function getEmailsBySearch(search, limit = 5, fullBody = false) {
   const params = new URLSearchParams({ search, limit: String(limit) });
+  if (fullBody) params.set("full", "true");
   const res = await fetch(
     `${process.env.NEXT_PUBLIC_BASE_URL}/api/email?${params.toString()}`
   );
@@ -751,14 +812,58 @@ export async function POST(req) {
       });
       const patchData = await patchRes.json();
 
-      if (!patchData.success) {
+      if (!patchRes.ok || !patchData.success) {
+        console.log("[chat] calendar PATCH failed:", patchData.error || patchRes.status);
         return Response.json({
-          reply: `Found the new ${req.field} ("${info.value}") but couldn't update the event: ${patchData.error}`,
+          reply: "I had trouble updating that, let me try again.",
+        });
+      }
+
+      // Verify the change actually landed by re-fetching the event.
+      const verifyEvents = await findEventsByTitleNext7Days(req.eventReference);
+      const verified = verifyEvents.find((e) => e.id === event.id);
+      const expected = info.value;
+      const actual =
+        req.field === "location"
+          ? verified?.location
+          : req.field === "title"
+          ? verified?.title
+          : null; // skip verification for fields we can't read back here
+      if (actual !== null && actual !== expected) {
+        console.log("[chat] post-PATCH verify mismatch; expected", expected, "got", actual);
+        return Response.json({
+          reply: "I had trouble updating that, let me try again.",
         });
       }
 
       return Response.json({
         reply: `Done — updated "${event.title}" ${req.field} to ${info.value} (from ${req.personName}'s email).`,
+      });
+    }
+
+    // EMAIL READ — read full body of an email referenced in conversation
+    if (isReadEmailQuestion(message, history)) {
+      const ref = await extractEmailReference(message, history);
+      if (!ref?.personName) {
+        return Response.json({
+          reply: "Which email do you want me to read? Tell me who it's from.",
+        });
+      }
+
+      const search = ref.subjectKeyword
+        ? `from:${ref.personName} ${ref.subjectKeyword}`
+        : `from:${ref.personName}`;
+      const emails = await getEmailsBySearch(search, 1, true);
+
+      if (emails.length === 0) {
+        return Response.json({
+          reply: `Couldn't find that email from ${ref.personName}.`,
+        });
+      }
+
+      const email = emails[0];
+      return Response.json({
+        reply: `Email from ${email.from}, ${email.date}.\nSubject: ${email.subject}\n\n${email.body}`,
       });
     }
 

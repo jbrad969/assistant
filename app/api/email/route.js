@@ -46,6 +46,7 @@ export async function GET(req) {
     const limit = searchParams.get("limit") || "5";
     const all = searchParams.get("all") === "true";
     const search = searchParams.get("search");
+    const fullBody = searchParams.get("full") === "true";
 
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
@@ -64,21 +65,32 @@ export async function GET(req) {
 
     const emails = await Promise.all(
       messages.map(async (msg) => {
-        const full = await gmail.users.messages.get({
+        const detail = await gmail.users.messages.get({
           userId: "me",
           id: msg.id,
           format: "full",
         });
 
-        const headers = full.data.payload?.headers || [];
+        const headers = detail.data.payload?.headers || [];
         const subject = headers.find((h) => h.name === "Subject")?.value || "No subject";
         const from = headers.find((h) => h.name === "From")?.value || "Unknown";
         const date = headers.find((h) => h.name === "Date")?.value || "";
-        const body = decodeBody(full.data.payload).slice(0, 500);
+        const decoded = decodeBody(detail.data.payload);
+        const body = fullBody ? decoded.slice(0, 8000) : decoded.slice(0, 500);
 
-        return { id: msg.id, subject, from, date, body };
+        return {
+          id: msg.id,
+          subject,
+          from,
+          date,
+          body,
+          internalDate: detail.data.internalDate || "0",
+        };
       })
     );
+
+    // Newest first by Gmail's internalDate (ms since epoch)
+    emails.sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
 
     return Response.json({ emails });
   } catch (error) {

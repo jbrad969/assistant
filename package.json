@@ -1,5 +1,5 @@
 {
-  "name": "jess-ai-assistant-v1",
+  "name": "jess-ai-assistant-v2",
   "private": true,
   "scripts": {
     "dev": "next dev",

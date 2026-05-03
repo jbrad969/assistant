@@ -156,9 +156,7 @@ async function getCalendarForDate(date) {
   const iso = date.toISOString();
 
   const res = await fetch(
-    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(
-      iso
-    )}`
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`
   );
 
   const data = await res.json();
@@ -187,7 +185,7 @@ async function getCalendarForDate(date) {
 
 export async function POST(req) {
   try {
-    const { message } = await req.json();
+    const { message, history = [] } = await req.json();
 
     // MEMORY UPDATE
     const currentMemory = await getMemory();
@@ -211,7 +209,7 @@ export async function POST(req) {
       return Response.json({ reply });
     }
 
-    // NORMAL CHAT (USES MEMORY)
+    // NORMAL CHAT (USES MEMORY + HISTORY)
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -231,6 +229,10 @@ Rules:
 - Act like a real assistant
           `,
         },
+        ...history.map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
         { role: "user", content: message },
       ],
     });

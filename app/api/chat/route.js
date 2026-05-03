@@ -14,20 +14,54 @@ export async function POST(req) {
   try {
     const { message } = await req.json();
 
+    if (!message) {
+      return Response.json({ reply: "Please type a message." });
+    }
+
+    // 1. Pull current memory from Supabase
+    const { data: memories, error: readError } = await supabase
+      .from("memory")
+      .select("content")
+      .order("created_at", { ascending: true });
+
+    if (readError) {
+      return Response.json({
+        reply: "Supabase read error: " + readError.message,
+      });
+    }
+
+    const memoryText =
+      memories && memories.length > 0
+        ? memories.map((m) => `- ${m.content}`).join("\n")
+        : "No saved facts yet.";
+
+    // 2. Extract a clean fact from Brad's message
     const factCheck = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
           content: `
-Extract a clear personal fact from the user's message.
+You extract personal facts about Brad from messy user messages.
+
+Return ONE clean fact if the message contains a fact.
+Return EXACTLY NONE if there is no fact.
 
 Examples:
 "my dogs name is frank" -> "Brad's dog's name is Frank"
 "my dog's name is frank" -> "Brad's dog's name is Frank"
+"my dog name is frank" -> "Brad's dog's name is Frank"
+"dog is frank" -> "Brad's dog's name is Frank"
+"i have a dog named frank" -> "Brad's dog's name is Frank"
 "my favorite color is blue" -> "Brad's favorite color is Blue"
+"my fav color is blue" -> "Brad's favorite color is Blue"
+"i live in phoenix" -> "Brad lives in Phoenix"
 
-If no fact exists, return EXACTLY: NONE
+Rules:
+- Be forgiving with grammar and spelling.
+- Capitalize names and values.
+- Do not answer the user.
+- Only return the fact text or NONE.
           `,
         },
         { role: "user", content: message },
@@ -36,18 +70,37 @@ If no fact exists, return EXACTLY: NONE
 
     const fact = factCheck.choices[0].message.content.trim();
 
-    if (fact !== "NONE") {
-      await supabase.from("memory").insert([{ content: fact }]);
+    // 3. Save the fact BEFORE answering
+    if (fact && fact.toUpperCase() !== "NONE") {
+      const { error: insertError } = await supabase
+        .from("memory")
+        .insert([{ content: fact }]);
+
+      if (insertError) {
+        return Response.json({
+          reply: "Supabase insert error: " + insertError.message,
+        });
+      }
     }
 
-    const { data: memories } = await supabase
+    // 4. Pull memory again so the new fact is included immediately
+    const { data: updatedMemories, error: secondReadError } = await supabase
       .from("memory")
       .select("content")
       .order("created_at", { ascending: true });
 
-    const memoryText =
-      memories?.map((m) => `- ${m.content}`).join("\n") || "No stored facts yet.";
+    if (secondReadError) {
+      return Response.json({
+        reply: "Supabase second read error: " + secondReadError.message,
+      });
+    }
 
+    const updatedMemoryText =
+      updatedMemories && updatedMemories.length > 0
+        ? updatedMemories.map((m) => `- ${m.content}`).join("\n")
+        : "No saved facts yet.";
+
+    // 5. Ask Jess with memory
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -59,15 +112,17 @@ You are Jess, Brad's AI assistant.
 You have stored facts about Brad.
 
 Stored facts:
-${memoryText}
+${updatedMemoryText}
 
 Rules:
-- Use the stored facts above as truth.
-- If Brad asks about his dog, use any stored fact about "Brad's dog's name".
+- Treat stored facts as true.
+- Use stored facts to answer directly.
 - "dog", "dogs", and "dog's" mean the same thing.
-- Answer directly when a stored fact answers the question.
-- Do not say you don't know when the answer is in stored facts.
-- Never invent facts not listed above.
+- If Brad asks about his dog, look for Brad's dog's name in stored facts.
+- If Brad asks about his favorite color, look for Brad's favorite color in stored facts.
+- Do not say you don't know if the answer is in stored facts.
+- Never invent facts that are not in stored facts.
+- Be concise and helpful.
           `,
         },
         { role: "user", content: message },
@@ -79,7 +134,7 @@ Rules:
     return Response.json({ reply });
   } catch (err) {
     return Response.json(
-      { reply: "Jess had an issue: " + err.message },
+      { reply: "Server error: " + err.message },
       { status: 500 }
     );
   }

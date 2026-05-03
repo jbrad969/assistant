@@ -1,9 +1,24 @@
 import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const CLAUDE_MODEL = "claude-sonnet-4-20250514";
+
+function toAnthropicHistory(history) {
+  const startIdx = history.findIndex((m) => m.role === "user");
+  if (startIdx === -1) return [];
+  return history
+    .slice(startIdx)
+    .map((m) => ({ role: m.role, content: m.content }));
+}
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -144,17 +159,14 @@ async function extractEventDetails(message) {
     timeZone: TIME_ZONE,
   });
 
-  const result = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `You convert natural-language calendar commands into JSON.
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 1024,
+    system: `You convert natural-language calendar commands into JSON.
 
 Today is ${todayLabel} (America/Phoenix timezone).
 
-Return JSON:
+Return ONLY a single JSON object. No preamble, no code fence, no extra text. The shape:
 {
   "action": "add" | "delete" | "move" | "none",
   "title": "event title or null",
@@ -174,12 +186,20 @@ Rules:
 - For "move": (date+time OR title) identifies the event; provide newDate and/or newTime
 - If the user is asking what's on their calendar (read intent), return action "none"
 - If unclear or not a calendar action, return action "none"`,
-      },
-      { role: "user", content: message },
-    ],
+    messages: [{ role: "user", content: message }],
   });
 
-  return JSON.parse(result.choices[0].message.content);
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) {
+    return { action: "none" };
+  }
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return { action: "none" };
+  }
 }
 
 function format12Hour(time24) {
@@ -481,17 +501,15 @@ export async function POST(req) {
         .map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nPreview: ${e.body.slice(0, 200)}`)
         .join("\n\n");
 
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are Jess, Brad's executive assistant. 
+      const completion = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: `You are Jess, Brad's executive assistant.
 Summarize these unread emails naturally and conversationally.
 For each one mention who it's from and what it's about in plain English.
 Flag anything urgent or from tnkroofing.com as a quote response.
 No markdown. Be concise.`,
-          },
+        messages: [
           {
             role: "user",
             content: `Here are Brad's unread emails:\n\n${emailContext}`,
@@ -500,7 +518,7 @@ No markdown. Be concise.`,
       });
 
       return Response.json({
-        reply: completion.choices[0].message.content,
+        reply: completion.content?.[0]?.text || "",
       });
     }
 
@@ -680,12 +698,10 @@ No markdown. Be concise.`,
         timeZone: TIME_ZONE,
       });
 
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are Jess, Brad's executive assistant.
+      const completion = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: `You are Jess, Brad's executive assistant.
 Narrate departure timing naturally — like a real assistant briefing him.
 USE THESE EXACT NUMBERS — do not estimate, recompute, or do math. Use the values verbatim.
 
@@ -694,7 +710,7 @@ Rules:
 - State the drive time in minutes. State the traffic delay only if it is 5 minutes or more.
 - Mention the destination by event title and/or location.
 - One or two sentences. No markdown. No bullet lists.`,
-          },
+        messages: [
           {
             role: "user",
             content: `Departure data:
@@ -710,7 +726,7 @@ Brad asked: "${message}"`,
         ],
       });
 
-      return Response.json({ reply: completion.choices[0].message.content });
+      return Response.json({ reply: completion.content?.[0]?.text || "" });
     }
 
     // CALENDAR
@@ -722,12 +738,10 @@ Brad asked: "${message}"`,
         .map((s) => `${s.label}:\n${s.text}`)
         .join("\n\n");
 
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are Jess, Brad's executive assistant.
+      const completion = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: `You are Jess, Brad's executive assistant.
 Rules:
 - Be direct and conversational, like a real assistant briefing their boss
 - Summarize the schedule naturally, don't just list it robotically
@@ -735,7 +749,7 @@ Rules:
 - If there's a location, mention it naturally
 - No markdown formatting
 - Keep it tight — Brad is busy`,
-          },
+        messages: [
           {
             role: "user",
             content: `Here is Brad's calendar data:\n\n${calendarContext}\n\nHis question was: "${message}"`,
@@ -744,17 +758,15 @@ Rules:
       });
 
       return Response.json({
-        reply: completion.choices[0].message.content,
+        reply: completion.content?.[0]?.text || "",
       });
     }
 
     // NORMAL CHAT
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are Jess, Brad's executive assistant.
+    const completion = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 1024,
+      system: `You are Jess, Brad's executive assistant.
 
 ${KNOWN_LOCATIONS_CONTEXT}
 
@@ -768,14 +780,14 @@ Rules:
 - No markdown formatting
 - Act like a real assistant
 - NEVER estimate drive times, distances, or traffic. If Brad asks about travel time, drive time, traffic, or when to leave, tell him to ask "how long to get to my next appointment" so I can pull live data from Google Maps.`,
-        },
-        ...history.map((m) => ({ role: m.role, content: m.content })),
+      messages: [
+        ...toAnthropicHistory(history),
         { role: "user", content: message },
       ],
     });
 
     return Response.json({
-      reply: completion.choices[0].message.content,
+      reply: completion.content?.[0]?.text || "",
     });
   } catch (error) {
     return Response.json({

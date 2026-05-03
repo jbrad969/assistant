@@ -393,6 +393,70 @@ async function findEventByCriteria({ date, time, title }) {
   });
 }
 
+/* ---------------- REMINDERS ---------------- */
+
+function isReminderRequest(message) {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("remind me") ||
+    msg.includes("set a reminder") ||
+    msg.includes("set reminder") ||
+    msg.includes("don't let me forget") ||
+    msg.includes("dont let me forget") ||
+    msg.includes("remind brad")
+  );
+}
+
+async function extractReminder(message) {
+  const currentPhoenix = new Date().toLocaleString("en-US", {
+    timeZone: TIME_ZONE,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 384,
+    system: `Extract reminder details from Brad's message.
+
+Current Phoenix local date/time: ${currentPhoenix}. America/Phoenix is UTC-7 with no DST.
+
+Return ONLY a JSON object, no preamble:
+{
+  "message": "what to remind Brad about (concise)" | null,
+  "remindAt": "YYYY-MM-DD HH:MM in 24-hour Phoenix local time" | null
+}
+
+Resolve relative times against the current Phoenix date/time above.
+- "in 30 minutes" -> add 30 min to current Phoenix time
+- "tomorrow at 3pm" -> next day, 15:00
+- "Wednesday at 10am" -> the next Wednesday, 10:00 (use the most upcoming one)
+- "tonight at 8" -> today, 20:00
+If only a time is given (e.g. "at 3"), assume the next occurrence in the next 24 hours.
+
+Examples:
+- "remind me on Wednesday at 10am to leave for BNI" -> {"message":"leave for BNI","remindAt":"2026-05-06 10:00"}
+- "set a reminder in 30 minutes to call Mike" -> {"message":"call Mike","remindAt":"2026-05-04 13:30"}
+- "don't let me forget to email John tomorrow at 3" -> {"message":"email John","remindAt":"2026-05-05 15:00"}`,
+    messages: [{ role: "user", content: message }],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
 /* ---------------- DEPARTURE ---------------- */
 
 function isDepartureQuestion(message) {
@@ -842,6 +906,53 @@ export async function POST(req) {
       injectionMemory.length > 0
         ? injectionMemory.map((m) => `- ${stripTag(m.content)}`).join("\n")
         : "";
+
+    // REMINDER (must run before departure / calendar branches)
+    if (isReminderRequest(message)) {
+      const reminder = await extractReminder(message);
+      if (!reminder?.message || !reminder?.remindAt) {
+        return Response.json({
+          reply: "When and what should I remind you about?",
+        });
+      }
+
+      // Phoenix is fixed UTC-7; build an ISO string with the explicit offset.
+      const phoenixIso = `${reminder.remindAt.replace(" ", "T")}:00-07:00`;
+      const remindDate = new Date(phoenixIso);
+      if (Number.isNaN(remindDate.getTime())) {
+        return Response.json({
+          reply: "I couldn't parse that time. Try saying something like 'remind me tomorrow at 10am to ...'.",
+        });
+      }
+
+      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/reminders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: reminder.message,
+          remind_at: remindDate.toISOString(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        console.log("[chat] reminder save failed:", data.error || res.status);
+        return Response.json({
+          reply: "I had trouble saving that reminder, let me try again.",
+        });
+      }
+
+      const phoenixLabel = remindDate.toLocaleString("en-US", {
+        weekday: "long",
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+        timeZone: TIME_ZONE,
+      });
+
+      return Response.json({
+        reply: `Done — I'll remind you on ${phoenixLabel} to ${reminder.message}.`,
+      });
+    }
 
     // QUOTE REQUEST
     if (isQuoteRequest(message)) {

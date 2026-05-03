@@ -453,6 +453,7 @@ export default function Page() {
   const inputRef = useRef(null);
   const isListeningRef = useRef(false);
   const micStreamRef = useRef(null);
+  const shownRemindersRef = useRef(new Set());
 
   async function loadMemory() {
     const res = await fetch("/api/memory");
@@ -523,6 +524,34 @@ export default function Page() {
     setLoading(false);
   }
 
+  async function checkReminders() {
+    try {
+      const res = await fetch("/api/reminders/check");
+      const data = await res.json();
+      const due = data.reminders || [];
+      for (const reminder of due) {
+        if (shownRemindersRef.current.has(reminder.id)) continue;
+        shownRemindersRef.current.add(reminder.id);
+
+        const text = `⏰ Reminder: ${reminder.message}`;
+        setMessages((prev) => [...prev, { role: "assistant", content: text }]);
+        speak(`Reminder. ${reminder.message}`);
+
+        try {
+          await fetch("/api/reminders", {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: reminder.id }),
+          });
+        } catch (patchErr) {
+          // ignore — local de-dup prevents repeats this session
+        }
+      }
+    } catch (e) {
+      // network blip — swallow so the chat UI keeps working
+    }
+  }
+
   async function deleteMemory(id) {
     await fetch("/api/memory/delete", {
       method: "POST",
@@ -544,6 +573,12 @@ export default function Page() {
   }
 
   useEffect(() => { loadMemory(); }, []);
+
+  useEffect(() => {
+    checkReminders();
+    const interval = setInterval(checkReminders, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

@@ -1052,30 +1052,50 @@ export async function POST(req) {
         });
       }
 
-      // Phoenix is fixed UTC-7; build an ISO string with the explicit offset.
+      // Phoenix is fixed UTC-7; keep the ISO with the explicit -07:00 offset so the
+      // Supabase row stays human-readable in Phoenix local time.
       const phoenixIso = `${reminder.remindAt.replace(" ", "T")}:00-07:00`;
       const remindDate = new Date(phoenixIso);
       if (Number.isNaN(remindDate.getTime())) {
+        console.log("[chat] reminder time unparseable:", reminder.remindAt);
         return Response.json({
-          reply: "I couldn't parse that time. Try saying something like 'remind me tomorrow at 10am to ...'.",
+          reply: "I had trouble saving that reminder, please try again.",
         });
       }
 
-      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/reminders`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: reminder.message,
-          remind_at: remindDate.toISOString(),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        console.log("[chat] reminder save failed:", data.error || res.status);
+      console.log(`Saving reminder: "${reminder.message}" at ${phoenixIso}`);
+
+      let data;
+      try {
+        const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/reminders`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: reminder.message,
+            remind_at: phoenixIso,
+          }),
+        });
+        data = await res.json();
+        if (!res.ok || data.error) {
+          console.log(
+            "Reminder save FAILED:",
+            data?.error || `status ${res.status}`,
+            "| code:", data?.code,
+            "| details:", data?.details,
+            "| hint:", data?.hint
+          );
+          return Response.json({
+            reply: "I had trouble saving that reminder, please try again.",
+          });
+        }
+      } catch (fetchErr) {
+        console.log("Reminder save FAILED (fetch threw):", fetchErr.message);
         return Response.json({
-          reply: "I had trouble saving that reminder, let me try again.",
+          reply: "I had trouble saving that reminder, please try again.",
         });
       }
+
+      console.log("Reminder saved successfully:", data?.reminder?.id);
 
       const phoenixLabel = remindDate.toLocaleString("en-US", {
         weekday: "long",

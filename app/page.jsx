@@ -366,6 +366,71 @@ const styles = `
       transform: scale(1.05);
     }
   }
+
+  .voice-bar {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 10px;
+  }
+
+  .stop-btn {
+    background: #ff3b3b;
+    color: #fff;
+    border: none;
+    border-radius: 24px;
+    padding: 10px 20px 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    transition: background 0.15s;
+    font-family: 'DM Sans', sans-serif;
+    animation: stop-pulse 1.4s ease-in-out infinite;
+  }
+
+  .stop-btn:hover {
+    background: #e02f2f;
+  }
+
+  .stop-btn::before {
+    content: "";
+    width: 11px;
+    height: 11px;
+    background: #fff;
+    border-radius: 2px;
+    display: inline-block;
+  }
+
+  @keyframes stop-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 59, 59, 0.5); }
+    50% { box-shadow: 0 0 0 8px rgba(255, 59, 59, 0); }
+  }
+
+  .reply-choice {
+    display: flex;
+    gap: 10px;
+  }
+
+  .reply-choice-btn {
+    background: #141414;
+    color: #e8e8e8;
+    border: 1px solid #2a2a2a;
+    border-radius: 20px;
+    padding: 9px 18px;
+    font-size: 13px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .reply-choice-btn:hover {
+    background: #1f1f1f;
+    border-color: #555;
+    color: #fff;
+  }
 `;
 
 export default function Page() {
@@ -379,9 +444,12 @@ export default function Page() {
   const [editingId, setEditingId] = useState(null);
   const [editingText, setEditingText] = useState("");
   const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [showReplyChoice, setShowReplyChoice] = useState(false);
   const bottomRef = useRef(null);
   const recognitionRef = useRef(null);
   const voiceRef = useRef(null);
+  const inputRef = useRef(null);
 
   async function loadMemory() {
     const res = await fetch("/api/memory");
@@ -396,6 +464,7 @@ export default function Page() {
     setMessages((prev) => [...prev, { role: "user", content: userText }]);
     setInput("");
     setLoading(true);
+    setShowReplyChoice(false);
 
     try {
       const res = await fetch("/api/chat", {
@@ -411,6 +480,7 @@ export default function Page() {
         { role: "assistant", content: reply },
       ]);
       speak(reply);
+      setShowReplyChoice(true);
       loadMemory();
     } catch (error) {
       setMessages((prev) => [
@@ -501,7 +571,26 @@ export default function Page() {
     if (voiceRef.current) utterance.voice = voiceRef.current;
     utterance.rate = 1;
     utterance.pitch = 1.05;
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => setIsSpeaking(false);
+    utterance.onerror = () => setIsSpeaking(false);
     window.speechSynthesis.speak(utterance);
+  }
+
+  function stopSpeaking() {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    setIsSpeaking(false);
+  }
+
+  function chooseVoiceReply() {
+    setShowReplyChoice(false);
+    if (!isListening) toggleListening();
+  }
+
+  function chooseTextReply() {
+    setShowReplyChoice(false);
+    inputRef.current?.focus();
   }
 
   function toggleListening() {
@@ -542,9 +631,11 @@ export default function Page() {
           <div className="header-actions">
             <button
               className="btn"
-              onClick={() =>
-                setMessages([{ role: "assistant", content: "Hey Brad — I'm Jess. What do you need?" }])
-              }
+              onClick={() => {
+                stopSpeaking();
+                setShowReplyChoice(false);
+                setMessages([{ role: "assistant", content: "Hey Brad — I'm Jess. What do you need?" }]);
+              }}
             >
               Clear
             </button>
@@ -638,8 +729,28 @@ export default function Page() {
 
         {/* INPUT */}
         <div className="input-bar">
+          {isSpeaking && (
+            <div className="voice-bar">
+              <button className="stop-btn" onClick={stopSpeaking}>
+                Stop Jess
+              </button>
+            </div>
+          )}
+          {showReplyChoice && !isSpeaking && !isListening && !loading && !input.trim() && (
+            <div className="voice-bar">
+              <div className="reply-choice">
+                <button className="reply-choice-btn" onClick={chooseVoiceReply}>
+                  Reply by Voice
+                </button>
+                <button className="reply-choice-btn" onClick={chooseTextReply}>
+                  Reply by Text
+                </button>
+              </div>
+            </div>
+          )}
           <div className="input-wrap">
             <input
+              ref={inputRef}
               className="input-field"
               value={input}
               onChange={(e) => setInput(e.target.value)}

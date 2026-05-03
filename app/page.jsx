@@ -33,7 +33,7 @@ export default function Page() {
     } catch {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Jess could not connect. Try again." },
+        { role: "assistant", content: data.error || "Jess could not connect. Try again." },
       ]);
     }
 

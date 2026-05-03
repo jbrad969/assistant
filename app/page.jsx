@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 export default function Page() {
   const [messages, setMessages] = useState([
-    { role: "assistant", content: "Hey Brad — I’m Jess. What do you need?" },
+    { role: "assistant", content: "Hey Brad — I'm Jess. What do you need?" },
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -26,7 +26,8 @@ export default function Page() {
     if (!input.trim() || loading) return;
 
     const userText = input;
-    setMessages((prev) => [...prev, { role: "user", content: userText }]);
+    const updatedMessages = [...messages, { role: "user", content: userText }];
+    setMessages(updatedMessages);
     setInput("");
     setLoading(true);
 
@@ -34,7 +35,10 @@ export default function Page() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userText }),
+        body: JSON.stringify({
+          message: userText,
+          history: messages,
+        }),
       });
 
       const data = await res.json();
@@ -61,7 +65,6 @@ export default function Page() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id }),
     });
-
     loadMemory();
   }
 
@@ -71,7 +74,6 @@ export default function Page() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, content: editingText }),
     });
-
     setEditingId(null);
     setEditingText("");
     loadMemory();
@@ -122,7 +124,7 @@ export default function Page() {
           <div>
             <h1 style={{ margin: 0, fontSize: 24 }}>Jess AI 🚀</h1>
             <p style={{ margin: "4px 0 0", fontSize: 12, color: "#666" }}>
-              Brad’s assistant
+              Brad's assistant
             </p>
           </div>
 
@@ -132,7 +134,7 @@ export default function Page() {
                 setMessages([
                   {
                     role: "assistant",
-                    content: "Hey Brad — I’m Jess. What do you need?",
+                    content: "Hey Brad — I'm Jess. What do you need?",
                   },
                 ])
               }
@@ -215,6 +217,7 @@ export default function Page() {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendMessage()}
               placeholder="Ask Jess..."
               style={{ flex: 1, padding: 12 }}
             />

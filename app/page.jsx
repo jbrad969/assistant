@@ -450,6 +450,8 @@ export default function Page() {
   const recognitionRef = useRef(null);
   const voiceRef = useRef(null);
   const inputRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const micStreamRef = useRef(null);
 
   async function loadMemory() {
     const res = await fetch("/api/memory");
@@ -517,11 +519,22 @@ export default function Page() {
   useEffect(() => {
     if (typeof window === "undefined") return;
 
+    if (navigator.mediaDevices?.getUserMedia && !micStreamRef.current) {
+      navigator.mediaDevices
+        .getUserMedia({ audio: true })
+        .then((stream) => {
+          micStreamRef.current = stream;
+        })
+        .catch(() => {
+          // user denied or unavailable; voice input will fail gracefully when invoked
+        });
+    }
+
     const SpeechRecognition =
       window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
-      recognition.continuous = false;
+      recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = "en-US";
 
@@ -532,8 +545,26 @@ export default function Page() {
         }
         setInput(transcript);
       };
-      recognition.onend = () => setIsListening(false);
-      recognition.onerror = () => setIsListening(false);
+      recognition.onend = () => {
+        if (isListeningRef.current) {
+          try {
+            recognition.start();
+          } catch (e) {
+            isListeningRef.current = false;
+            setIsListening(false);
+          }
+        } else {
+          setIsListening(false);
+        }
+      };
+      recognition.onerror = (event) => {
+        if (event.error === "no-speech" || event.error === "aborted") {
+          // let onend decide whether to restart
+          return;
+        }
+        isListeningRef.current = false;
+        setIsListening(false);
+      };
 
       recognitionRef.current = recognition;
     }
@@ -561,6 +592,10 @@ export default function Page() {
 
     return () => {
       if (window.speechSynthesis) window.speechSynthesis.cancel();
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach((t) => t.stop());
+        micStreamRef.current = null;
+      }
     };
   }, []);
 
@@ -599,16 +634,19 @@ export default function Page() {
       return;
     }
     if (isListening) {
-      recognitionRef.current.stop();
+      isListeningRef.current = false;
+      try { recognitionRef.current.stop(); } catch (e) {}
       setIsListening(false);
       return;
     }
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     setInput("");
+    isListeningRef.current = true;
     try {
       recognitionRef.current.start();
       setIsListening(true);
     } catch (e) {
+      isListeningRef.current = false;
       setIsListening(false);
     }
   }

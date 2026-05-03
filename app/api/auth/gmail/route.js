@@ -1,0 +1,21 @@
+import { google } from "googleapis";
+
+export async function GET() {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_GMAIL_CLIENT_ID,
+    process.env.GOOGLE_GMAIL_CLIENT_SECRET,
+    "https://project-xsf5a.vercel.app/api/google/callback"
+  );
+
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.send",
+      "https://www.googleapis.com/auth/gmail.modify",
+    ],
+  });
+
+  return Response.redirect(url);
+}

@@ -30,9 +30,11 @@ const TIME_ZONE = "America/Phoenix";
 const HOME_ADDRESS = "4139 East Desert Sands Place Chandler AZ";
 const SHOP_ADDRESS = "4211 East Elwood Street Phoenix AZ";
 const KNOWN_LOCATIONS_CONTEXT = `Brad's key locations:
-- Home: ${HOME_ADDRESS}
-- Shop: ${SHOP_ADDRESS}
-When Brad refers to "home" or "the shop", these are the addresses he means.`;
+- Home: ONLY ${HOME_ADDRESS}. No other address is Brad's home.
+- Shop: ${SHOP_ADDRESS}.
+When Brad refers to "home" or "the shop", these are the addresses he means.
+Any other address that appears in calendar events is a DESTINATION (a customer site, venue, or meeting place), never Brad's home.
+Never assume Brad is hosting an event just because the location shows a Scottsdale, Phoenix, or any other address — those are places he's going TO, not where he lives.`;
 
 /* ---------------- MEMORY ---------------- */
 
@@ -361,6 +363,50 @@ function detectOrigin(message) {
   return HOME_ADDRESS;
 }
 
+async function extractEventReference(message, history = []) {
+  const recentHistory = history.slice(-6);
+  const conversationContext = recentHistory.length
+    ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
+    : "(no prior turns)";
+
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 256,
+    system: `You determine if Brad is asking about a SPECIFIC named event versus just "his next appointment".
+
+Look at the recent conversation and the current question. If Brad references a specific event by name (e.g. "the shrimp boil", "the Trunzo job", "the team meeting"), return a 1-3 word title fragment that can be substring-matched against calendar event titles. If he is asking generically ("when do I need to leave", "how long until my next appointment"), return null.
+
+Return ONLY a single JSON object. No preamble, no code fence, no extra text:
+{
+  "eventReference": "1-3 word title fragment" | null
+}
+
+Examples:
+- "what time should I leave for the shrimp boil tonight" -> {"eventReference": "shrimp boil"}
+- "how long until I get to my next appointment" -> {"eventReference": null}
+- "should I leave for the Trunzo job" -> {"eventReference": "trunzo"}
+- "when do I need to leave" -> {"eventReference": null}
+- After assistant said "You have the shrimp boil at 7 PM", Brad asks "what time should I leave" -> {"eventReference": "shrimp boil"}`,
+    messages: [
+      {
+        role: "user",
+        content: `Recent conversation:\n${conversationContext}\n\nCurrent question: "${message}"`,
+      },
+    ],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    const parsed = JSON.parse(raw.slice(start, end + 1));
+    return parsed.eventReference || null;
+  } catch {
+    return null;
+  }
+}
+
 /* ---------------- CALENDAR ---------------- */
 
 function isCalendarQuestion(message) {
@@ -674,10 +720,12 @@ No markdown. Be concise.`,
     // DEPARTURE
     if (isDepartureQuestion(message)) {
       const origin = detectOrigin(message);
-      console.log("[chat] departure detected; origin:", origin, "message:", message);
+      const eventQuery = await extractEventReference(message, history);
+      console.log("[chat] departure detected; origin:", origin, "eventQuery:", eventQuery, "message:", message);
       let data;
       try {
         const params = new URLSearchParams({ origin });
+        if (eventQuery) params.set("eventQuery", eventQuery);
         const res = await fetch(
           `${process.env.NEXT_PUBLIC_BASE_URL}/api/departure?${params.toString()}`
         );
@@ -693,6 +741,11 @@ No markdown. Be concise.`,
         });
       }
 
+      if (data.noEventMatch) {
+        return Response.json({
+          reply: `I don't see an event matching "${data.query}" on your calendar in the next 7 days.`,
+        });
+      }
       if (data.noEvent) {
         return Response.json({
           reply: "You don't have an upcoming event with a location in the next 24 hours.",

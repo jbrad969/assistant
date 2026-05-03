@@ -44,12 +44,13 @@ function formatFriendlyDeparture(departureMs, nowMs) {
   return `${dayName} at ${timeStr}`;
 }
 
-async function findNextEventWithLocation() {
+async function findNextEventWithLocation(eventQuery = null) {
   const auth = getGoogleClient();
   const calendar = google.calendar({ version: "v3", auth });
 
   const now = new Date();
-  const horizon = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const horizonDays = eventQuery ? 7 : 1;
+  const horizon = new Date(now.getTime() + horizonDays * 24 * 60 * 60 * 1000);
 
   const result = await calendar.events.list({
     calendarId: "primary",
@@ -58,25 +59,42 @@ async function findNextEventWithLocation() {
     timeZone: TIME_ZONE,
     singleEvents: true,
     orderBy: "startTime",
-    maxResults: 50,
+    maxResults: 100,
   });
 
   const events = result.data.items || [];
-  return (
-    events.find((event) => {
-      if (!event.location || !event.start?.dateTime) return false;
-      return new Date(event.start.dateTime).getTime() > Date.now();
-    }) || null
-  );
+  const upcoming = events.filter((event) => {
+    if (!event.location || !event.start?.dateTime) return false;
+    return new Date(event.start.dateTime).getTime() > Date.now();
+  });
+
+  if (eventQuery) {
+    const q = eventQuery.toLowerCase();
+    return (
+      upcoming.find((event) => (event.summary || "").toLowerCase().includes(q)) ||
+      null
+    );
+  }
+
+  return upcoming[0] || null;
 }
 
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
     const origin = searchParams.get("origin") || DEFAULT_ORIGIN;
+    const eventQuery = searchParams.get("eventQuery");
 
-    const event = await findNextEventWithLocation();
+    const event = await findNextEventWithLocation(eventQuery);
     if (!event) {
+      if (eventQuery) {
+        console.log("[departure] no event match for query:", eventQuery);
+        return Response.json({
+          noEventMatch: true,
+          query: eventQuery,
+          message: `No event matching "${eventQuery}" found in the next 7 days`,
+        });
+      }
       console.log("[departure] no upcoming event with a location");
       return Response.json({
         noEvent: true,

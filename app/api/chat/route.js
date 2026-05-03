@@ -4,6 +4,8 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+let lastCalendarData = "";
+
 async function getTodayCalendar() {
   try {
     const res = await fetch(
@@ -26,17 +28,35 @@ async function getTodayCalendar() {
           hour: "numeric",
           minute: "2-digit",
           hour12: true,
-          timeZone: "America/Phoenix", // 🔥 FIXED TIMEZONE
+          timeZone: "America/Phoenix",
         });
 
         return `${time} — ${e.title}`;
       })
       .join("\n");
 
+    lastCalendarData = formatted;
+
     return `Today's schedule:\n${formatted}`;
   } catch (err) {
     return "Could not retrieve calendar.";
   }
+}
+
+function shouldUseCalendar(message) {
+  const msg = message.toLowerCase();
+
+  return (
+    msg.includes("schedule") ||
+    msg.includes("calendar") ||
+    msg.includes("today") ||
+    msg.includes("morning") ||
+    msg.includes("afternoon") ||
+    msg.includes("evening") ||
+    msg.includes("tonight") ||
+    msg.includes("later") ||
+    msg.includes("earlier")
+  );
 }
 
 export async function POST(req) {
@@ -45,12 +65,10 @@ export async function POST(req) {
 
     let calendarContext = "";
 
-    if (
-      message.toLowerCase().includes("schedule") ||
-      message.toLowerCase().includes("calendar") ||
-      message.toLowerCase().includes("today")
-    ) {
+    if (shouldUseCalendar(message)) {
       calendarContext = await getTodayCalendar();
+    } else if (lastCalendarData) {
+      calendarContext = `Today's schedule:\n${lastCalendarData}`;
     }
 
     const completion = await client.chat.completions.create({
@@ -61,7 +79,10 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's AI assistant.
 
-When given a schedule, list events clearly with correct times.
+You have access to today's calendar.
+
+If asked follow-up questions like "this morning", "later", or "what about earlier",
+you MUST use the calendar data provided.
 
 Calendar:
 ${calendarContext}

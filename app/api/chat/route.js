@@ -154,9 +154,16 @@ async function getCalendarForDate(date) {
 function isEmailQuestion(message) {
   const msg = message.toLowerCase();
   return (
-    msg.includes("email") || msg.includes("inbox") ||
-    msg.includes("unread") || msg.includes("messages") ||
-    msg.includes("did i get") || msg.includes("any emails")
+    msg.includes("email") ||
+    msg.includes("eamil") ||
+    msg.includes("gmail") ||
+    msg.includes("inbox") ||
+    msg.includes("unread") ||
+    msg.includes("messages") ||
+    msg.includes("did i get") ||
+    msg.includes("any mail") ||
+    msg.includes("check mail") ||
+    msg.includes("read my")
   );
 }
 

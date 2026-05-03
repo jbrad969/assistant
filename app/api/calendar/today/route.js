@@ -16,7 +16,7 @@ function getGoogleClient() {
   return client;
 }
 
-function getDateRange(dateString) {
+function getDateRange(dateString, days = 1) {
   const date = dateString ? new Date(dateString) : new Date();
 
   // Resolve the Phoenix-local Y-M-D for the given moment, regardless of server timezone.
@@ -30,7 +30,7 @@ function getDateRange(dateString) {
 
   // Phoenix is fixed UTC-7 (never observes DST). Midnight Phoenix == 07:00 UTC of the same date.
   const start = new Date(`${phoenixDate}T07:00:00Z`);
-  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  const end = new Date(start.getTime() + days * 24 * 60 * 60 * 1000);
 
   return {
     timeMin: start.toISOString(),
@@ -91,11 +91,13 @@ export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
     const date = searchParams.get("date");
+    const days = Math.max(1, Math.min(30, parseInt(searchParams.get("days") || "1", 10)));
+    const searchTitle = searchParams.get("searchTitle");
 
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
 
-    const { timeMin, timeMax } = getDateRange(date);
+    const { timeMin, timeMax } = getDateRange(date, days);
 
     const result = await calendar.events.list({
       calendarId: "primary",
@@ -104,7 +106,7 @@ export async function GET(req) {
       timeZone: TIME_ZONE,
       singleEvents: true,
       orderBy: "startTime",
-      maxResults: 50,
+      maxResults: days > 1 ? 250 : 50,
     });
 
     let events = (result.data.items || []).map((event) => ({
@@ -115,6 +117,11 @@ export async function GET(req) {
       time: formatTime(event.start?.dateTime || event.start?.date),
       location: event.location || "",
     }));
+
+    if (searchTitle) {
+      const q = searchTitle.toLowerCase();
+      events = events.filter((e) => (e.title || "").toLowerCase().includes(q));
+    }
 
     events = sortEvents(events);
 

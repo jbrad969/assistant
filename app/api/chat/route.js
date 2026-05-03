@@ -442,6 +442,149 @@ async function getCalendarForDate(date) {
   return { label: formatDateLabel(date), text };
 }
 
+/* ---------------- EMAIL SEARCH ---------------- */
+
+function isEmailSearchQuestion(message) {
+  const msg = message.toLowerCase();
+  if (msg.includes("email from") || msg.includes("emails from")) return true;
+  if (/\b(find|search|look\s+for|look\s+up|check)\s+(?:the\s+|an?\s+|any\s+|my\s+)?emails?\b/.test(msg)) return true;
+  if (/\bdid\s+\w+\s+email\b/.test(msg)) return true;
+  return false;
+}
+
+function isEmailToCalendarUpdate(message) {
+  const msg = message.toLowerCase();
+  const hasEmail = msg.includes("email");
+  const hasUpdate = /\b(update|change|modify|fix|set)\b/.test(msg);
+  const hasCalendar =
+    msg.includes("calendar") ||
+    msg.includes("event") ||
+    msg.includes("appointment") ||
+    msg.includes("meeting") ||
+    /\b(with|to)\s+the\s+new\b/.test(msg);
+  return hasEmail && hasUpdate && hasCalendar;
+}
+
+async function extractPersonReference(message) {
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 256,
+    system: `Extract who/what to search for in Brad's email. Return ONLY a JSON object, no preamble:
+{
+  "personName": "first or full name to search by sender" | null,
+  "subjectKeyword": "additional keyword to filter (subject or body)" | null
+}
+
+Examples:
+- "find email from Yvonne about BNI" -> {"personName":"Yvonne","subjectKeyword":"BNI"}
+- "did Mike email me" -> {"personName":"Mike","subjectKeyword":null}
+- "search for email from John about the contract" -> {"personName":"John","subjectKeyword":"contract"}
+- "any emails from Sarah" -> {"personName":"Sarah","subjectKeyword":null}`,
+    messages: [{ role: "user", content: message }],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return { personName: null, subjectKeyword: null };
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return { personName: null, subjectKeyword: null };
+  }
+}
+
+async function extractEmailToCalendarRequest(message) {
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 384,
+    system: `Brad wants to use info from an email to update a calendar event. Extract the parts.
+Return ONLY a JSON object, no preamble:
+{
+  "personName": "email sender name" | null,
+  "subjectKeyword": "keyword in email" | null,
+  "eventReference": "1-3 word calendar event title fragment to find" | null,
+  "field": "location" | "title" | "time" | "notes" | null
+}
+
+Map "address" or "new address" to field "location". Map "new time" to "time". Map "name" to "title".
+
+Examples:
+- "find the email from Yvonne about BNI and update my calendar with the new address"
+  -> {"personName":"Yvonne","subjectKeyword":"BNI","eventReference":"BNI","field":"location"}
+- "use the email from Mike to update the meeting time"
+  -> {"personName":"Mike","subjectKeyword":null,"eventReference":"meeting","field":"time"}
+- "update the Trunzo job address from John's email"
+  -> {"personName":"John","subjectKeyword":null,"eventReference":"Trunzo","field":"location"}`,
+    messages: [{ role: "user", content: message }],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+async function extractInfoFromEmail(emailBody, field) {
+  const fieldDescriptions = {
+    location: "the new street address or location mentioned in this email",
+    title: "the new event title or name mentioned",
+    time: "the new time or date+time mentioned (return as 'YYYY-MM-DD HH:MM' 24-hour if a date is given, or 'HH:MM' if just a time)",
+    notes: "any relevant notes/details Brad would want on the event",
+  };
+  const desc = fieldDescriptions[field] || `the ${field} mentioned`;
+
+  const result = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 256,
+    system: `You extract a single field from an email. Return ONLY a JSON object, no preamble:
+{
+  "value": "extracted ${field}" | null
+}
+
+If the email does not contain ${desc}, return {"value": null}.`,
+    messages: [
+      {
+        role: "user",
+        content: `Extract ${desc} from this email:\n\n${emailBody.slice(0, 4000)}`,
+      },
+    ],
+  });
+
+  const raw = result.content?.[0]?.text || "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+async function getEmailsBySearch(search, limit = 5) {
+  const params = new URLSearchParams({ search, limit: String(limit) });
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/email?${params.toString()}`
+  );
+  const data = await res.json();
+  return data.emails || [];
+}
+
+async function findEventsByTitleNext7Days(title) {
+  const params = new URLSearchParams({ days: "7", searchTitle: title });
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?${params.toString()}`
+  );
+  const data = await res.json();
+  return data.events || [];
+}
+
 /* ---------------- EMAIL ---------------- */
 
 function isEmailQuestion(message) {
@@ -546,6 +689,119 @@ export async function POST(req) {
           reply: `Something went wrong submitting the quote: ${data.error}`,
         });
       }
+    }
+
+    // EMAIL → CALENDAR UPDATE (multi-step: find email, extract field, patch event)
+    if (isEmailToCalendarUpdate(message)) {
+      const req = await extractEmailToCalendarRequest(message);
+      if (!req || !req.personName || !req.eventReference || !req.field) {
+        return Response.json({
+          reply: "I need a sender name, the event to update, and what to change. Can you give me those?",
+        });
+      }
+
+      const search = req.subjectKeyword
+        ? `from:${req.personName} ${req.subjectKeyword}`
+        : `from:${req.personName}`;
+      const emails = await getEmailsBySearch(search, 5);
+
+      if (emails.length === 0) {
+        return Response.json({
+          reply: `Couldn't find an email from ${req.personName}${req.subjectKeyword ? ` about ${req.subjectKeyword}` : ""}.`,
+        });
+      }
+
+      const email = emails[0];
+      const info = await extractInfoFromEmail(email.body || "", req.field);
+      if (!info?.value) {
+        return Response.json({
+          reply: `Found the email from ${req.personName} but couldn't pull a ${req.field} out of it. Subject: "${email.subject}".`,
+        });
+      }
+
+      const matches = await findEventsByTitleNext7Days(req.eventReference);
+      if (matches.length === 0) {
+        return Response.json({
+          reply: `I found ${req.field} "${info.value}" in ${req.personName}'s email, but couldn't find a "${req.eventReference}" event on your calendar in the next 7 days.`,
+        });
+      }
+
+      const event = matches[0];
+      const patchBody = { eventId: event.id };
+      if (req.field === "location") {
+        patchBody.location = info.value;
+      } else if (req.field === "title") {
+        patchBody.title = info.value;
+      } else if (req.field === "notes") {
+        patchBody.description = info.value;
+      } else if (req.field === "time") {
+        return Response.json({
+          reply: `Found new time "${info.value}" for "${event.title}". Time updates from email aren't wired up yet — say "move ${event.title} to ${info.value}" and I can do it.`,
+        });
+      } else {
+        return Response.json({
+          reply: `Found ${req.field}="${info.value}" but I don't know how to write that field to the calendar yet.`,
+        });
+      }
+
+      const patchRes = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patchBody),
+      });
+      const patchData = await patchRes.json();
+
+      if (!patchData.success) {
+        return Response.json({
+          reply: `Found the new ${req.field} ("${info.value}") but couldn't update the event: ${patchData.error}`,
+        });
+      }
+
+      return Response.json({
+        reply: `Done — updated "${event.title}" ${req.field} to ${info.value} (from ${req.personName}'s email).`,
+      });
+    }
+
+    // EMAIL SEARCH (sender-targeted)
+    if (isEmailSearchQuestion(message)) {
+      const ref = await extractPersonReference(message);
+      if (!ref?.personName) {
+        return Response.json({
+          reply: "Who do you want to search for? Tell me a name like 'find emails from Yvonne'.",
+        });
+      }
+
+      const search = ref.subjectKeyword
+        ? `from:${ref.personName} ${ref.subjectKeyword}`
+        : `from:${ref.personName}`;
+      const emails = await getEmailsBySearch(search, 5);
+
+      if (emails.length === 0) {
+        return Response.json({
+          reply: `No emails from ${ref.personName}${ref.subjectKeyword ? ` about ${ref.subjectKeyword}` : ""} found.`,
+        });
+      }
+
+      const emailContext = emails
+        .map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${(e.body || "").slice(0, 300)}`)
+        .join("\n\n");
+
+      const completion = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: `You are Jess, Brad's executive assistant.
+Summarize these emails naturally and conversationally — who they're from, when, and what they're about.
+If there's only one, give Brad the gist in 1-3 sentences.
+No markdown. Be concise.`,
+        messages: [
+          {
+            role: "user",
+            content: `Brad asked: "${message}"\n\nMatching emails:\n\n${emailContext}`,
+          },
+        ],
+      });
+
+      return Response.json({ reply: completion.content?.[0]?.text || "" });
     }
 
     // EMAIL

@@ -45,13 +45,14 @@ export async function GET(req) {
     const { searchParams } = new URL(req.url);
     const limit = searchParams.get("limit") || "5";
     const all = searchParams.get("all") === "true";
+    const search = searchParams.get("search");
 
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
     const listRes = await gmail.users.messages.list({
       userId: "me",
-      q: "is:unread",
+      q: search || "is:unread",
       maxResults: all ? 50 : parseInt(limit),
     });
 

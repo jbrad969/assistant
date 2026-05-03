@@ -1,5 +1,7 @@
 import { google } from "googleapis";
 
+const TIME_ZONE = "America/Phoenix";
+
 function getGoogleClient() {
   const client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -29,6 +31,17 @@ function getDateRange(dateString) {
   };
 }
 
+function formatTime(dateString) {
+  if (!dateString) return "All day";
+
+  return new Date(dateString).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: TIME_ZONE,
+  });
+}
+
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
@@ -43,13 +56,18 @@ export async function GET(req) {
       calendarId: "primary",
       timeMin,
       timeMax,
+      timeZone: TIME_ZONE,
       singleEvents: true,
       orderBy: "startTime",
+      maxResults: 50,
     });
 
     const events = (result.data.items || []).map((event) => ({
-      title: event.summary || "Untitled",
+      title: event.summary || "Untitled event",
       start: event.start?.dateTime || event.start?.date,
+      end: event.end?.dateTime || event.end?.date,
+      time: formatTime(event.start?.dateTime || event.start?.date),
+      location: event.location || "",
     }));
 
     return Response.json({ events });

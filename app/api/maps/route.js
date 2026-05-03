@@ -44,6 +44,7 @@ export async function GET(req) {
     console.log("[maps] status:", data.status, "element:", data.rows?.[0]?.elements?.[0]?.status);
 
     if (data.status !== "OK") {
+      console.log("[maps] non-OK response:", JSON.stringify(data));
       return Response.json(
         { error: `Maps API error: ${data.status} ${data.error_message || ""}`.trim() },
         { status: 502 }
@@ -52,6 +53,7 @@ export async function GET(req) {
 
     const element = data.rows?.[0]?.elements?.[0];
     if (!element || element.status !== "OK") {
+      console.log("[maps] element error:", JSON.stringify(element));
       return Response.json(
         { error: `No route found: ${element?.status || "unknown"}` },
         { status: 404 }

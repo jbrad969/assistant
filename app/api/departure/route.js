@@ -2,7 +2,7 @@ import { google } from "googleapis";
 
 const TIME_ZONE = "America/Phoenix";
 const BUFFER_MINUTES = 10;
-const DEFAULT_ORIGIN = "Phoenix, AZ";
+const DEFAULT_ORIGIN = "4139 East Desert Sands Place Chandler AZ";
 
 function getGoogleClient() {
   const client = new google.auth.OAuth2(

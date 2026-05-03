@@ -12,6 +12,13 @@ const supabase = createClient(
 
 const TIME_ZONE = "America/Phoenix";
 
+const HOME_ADDRESS = "4139 East Desert Sands Place Chandler AZ";
+const SHOP_ADDRESS = "4211 East Elwood Street Phoenix AZ";
+const KNOWN_LOCATIONS_CONTEXT = `Brad's key locations:
+- Home: ${HOME_ADDRESS}
+- Shop: ${SHOP_ADDRESS}
+When Brad refers to "home" or "the shop", these are the addresses he means.`;
+
 /* ---------------- MEMORY ---------------- */
 
 async function getMemory() {
@@ -261,15 +268,21 @@ function isDepartureQuestion(message) {
     "when should i leave",
     "when do i leave",
     "should i leave",
+    "what time should i leave",
+    "what time do i leave",
+    "do i need to leave",
     "time to leave",
     "leave now",
     "leave for",
+    "leave by",
     "how long will it take",
     "how long would it take",
     "how long does it take",
     "how long to get",
     "how long to drive",
+    "how long from",
     "drive time",
+    "driving time",
     "travel time",
     "how far is",
     "how far away",
@@ -279,8 +292,23 @@ function isDepartureQuestion(message) {
     "how is traffic",
     "what's traffic",
     "whats traffic",
+    "am i going to be late",
+    "going to be late",
   ];
   if (phrases.some((p) => msg.includes(p))) return true;
+
+  // "from home" / "from the shop" combined with any travel context
+  const fromKnown =
+    msg.includes("from home") ||
+    msg.includes("from my house") ||
+    msg.includes("from the shop") ||
+    msg.includes("from shop");
+  if (
+    fromKnown &&
+    /\b(to|drive|driving|long|far|appointment|job|next|meeting|event|going|traffic)\b/.test(msg)
+  ) {
+    return true;
+  }
 
   if (
     msg.includes("traffic") &&
@@ -290,6 +318,13 @@ function isDepartureQuestion(message) {
   }
 
   return false;
+}
+
+function detectOrigin(message) {
+  const msg = message.toLowerCase();
+  if (msg.includes("from the shop") || msg.includes("from shop")) return SHOP_ADDRESS;
+  if (msg.includes("from home") || msg.includes("from my house")) return HOME_ADDRESS;
+  return HOME_ADDRESS;
 }
 
 /* ---------------- CALENDAR ---------------- */
@@ -606,10 +641,14 @@ No markdown. Be concise.`,
 
     // DEPARTURE
     if (isDepartureQuestion(message)) {
-      console.log("[chat] departure detected for message:", message);
+      const origin = detectOrigin(message);
+      console.log("[chat] departure detected; origin:", origin, "message:", message);
       let data;
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/departure`);
+        const params = new URLSearchParams({ origin });
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BASE_URL}/api/departure?${params.toString()}`
+        );
         data = await res.json();
         console.log("[chat] departure response:", JSON.stringify(data));
         if (!res.ok && !data?.error) {
@@ -618,7 +657,7 @@ No markdown. Be concise.`,
       } catch (fetchErr) {
         console.log("[chat] departure fetch threw:", fetchErr.message);
         return Response.json({
-          reply: `I couldn't reach the maps service: ${fetchErr.message}`,
+          reply: "I'm having trouble reaching Google Maps right now. Try again in a minute.",
         });
       }
 
@@ -628,8 +667,9 @@ No markdown. Be concise.`,
         });
       }
       if (data.error) {
+        console.log("[chat] departure surfaced error:", data.error);
         return Response.json({
-          reply: `I couldn't check the drive time: ${data.error}`,
+          reply: "I'm having trouble reaching Google Maps right now. Try again in a minute.",
         });
       }
 
@@ -716,6 +756,8 @@ Rules:
           role: "system",
           content: `You are Jess, Brad's executive assistant.
 
+${KNOWN_LOCATIONS_CONTEXT}
+
 Memory:
 ${memoryText}
 
@@ -724,7 +766,8 @@ Rules:
 - Be direct and concise
 - No fluff
 - No markdown formatting
-- Act like a real assistant`,
+- Act like a real assistant
+- NEVER estimate drive times, distances, or traffic. If Brad asks about travel time, drive time, traffic, or when to leave, tell him to ask "how long to get to my next appointment" so I can pull live data from Google Maps.`,
         },
         ...history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: message },

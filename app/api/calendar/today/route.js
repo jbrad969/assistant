@@ -14,10 +14,10 @@ function getGoogleClient() {
   return client;
 }
 
-function getTodayRange() {
-  const now = new Date();
+function getDateRange(dateString) {
+  const date = dateString ? new Date(dateString) : new Date();
 
-  const start = new Date(now);
+  const start = new Date(date);
   start.setHours(0, 0, 0, 0);
 
   const end = new Date(start);
@@ -29,12 +29,15 @@ function getTodayRange() {
   };
 }
 
-export async function GET() {
+export async function GET(req) {
   try {
+    const { searchParams } = new URL(req.url);
+    const date = searchParams.get("date");
+
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
 
-    const { timeMin, timeMax } = getTodayRange();
+    const { timeMin, timeMax } = getDateRange(date);
 
     const result = await calendar.events.list({
       calendarId: "primary",
@@ -42,24 +45,15 @@ export async function GET() {
       timeMax,
       singleEvents: true,
       orderBy: "startTime",
-      maxResults: 20,
     });
 
     const events = (result.data.items || []).map((event) => ({
-      id: event.id,
-      title: event.summary || "Untitled event",
+      title: event.summary || "Untitled",
       start: event.start?.dateTime || event.start?.date,
-      end: event.end?.dateTime || event.end?.date,
-      location: event.location || "",
-      description: event.description || "",
-      link: event.htmlLink || "",
     }));
 
     return Response.json({ events });
   } catch (error) {
-    return Response.json(
-      { error: error.message || "Calendar error" },
-      { status: 500 }
-    );
+    return Response.json({ error: error.message }, { status: 500 });
   }
 }

@@ -18,24 +18,20 @@ export async function POST(req) {
       return Response.json({ reply: "Please type a message." });
     }
 
-    // 1. Pull current memory from Supabase
     const { data: memories, error: readError } = await supabase
       .from("memory")
-      .select("content")
+      .select("id, content")
       .order("created_at", { ascending: true });
 
     if (readError) {
-      return Response.json({
-        reply: "Supabase read error: " + readError.message,
-      });
+      return Response.json({ reply: "Supabase read error: " + readError.message });
     }
 
     const memoryText =
       memories && memories.length > 0
-        ? memories.map((m) => `- ${m.content}`).join("\n")
+        ? memories.map((m) => `ID: ${m.id} | ${m.content}`).join("\n")
         : "No saved facts yet.";
 
-    // 2. Extract a clean fact from Brad's message
     const factCheck = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -44,55 +40,66 @@ export async function POST(req) {
           content: `
 You extract personal facts about Brad from messy user messages.
 
-Return ONE clean fact if the message contains a fact.
-Return EXACTLY NONE if there is no fact.
+Return JSON only.
 
-Examples:
-"my dogs name is frank" -> "Brad's dog's name is Frank"
-"my dog's name is frank" -> "Brad's dog's name is Frank"
-"my dog name is frank" -> "Brad's dog's name is Frank"
-"dog is frank" -> "Brad's dog's name is Frank"
-"i have a dog named frank" -> "Brad's dog's name is Frank"
-"my favorite color is blue" -> "Brad's favorite color is Blue"
-"my fav color is blue" -> "Brad's favorite color is Blue"
-"i live in phoenix" -> "Brad lives in Phoenix"
+Existing memory:
+${memoryText}
+
+Schema:
+{
+  "action": "none" | "insert" | "update",
+  "id": "existing memory id or null",
+  "content": "clean fact or null"
+}
 
 Rules:
+- If the message contains no useful personal fact, action = "none".
+- If the fact is new, action = "insert".
+- If the fact updates/replaces an existing fact, action = "update" and include the existing id.
+- Do not create duplicates.
 - Be forgiving with grammar and spelling.
-- Capitalize names and values.
-- Do not answer the user.
-- Only return the fact text or NONE.
+
+Examples:
+"my dogs name is frank" -> insert "Brad's dog's name is Frank"
+"my favorite color is blue" -> insert "Brad's favorite color is Blue"
+"my favorite color is red now" -> update existing favorite color fact
           `,
         },
         { role: "user", content: message },
       ],
+      response_format: { type: "json_object" },
     });
 
-    const fact = factCheck.choices[0].message.content.trim();
+    const memoryAction = JSON.parse(factCheck.choices[0].message.content);
 
-    // 3. Save the fact BEFORE answering
-    if (fact && fact.toUpperCase() !== "NONE") {
+    if (memoryAction.action === "insert" && memoryAction.content) {
       const { error: insertError } = await supabase
         .from("memory")
-        .insert([{ content: fact }]);
+        .insert([{ content: memoryAction.content }]);
 
       if (insertError) {
-        return Response.json({
-          reply: "Supabase insert error: " + insertError.message,
-        });
+        return Response.json({ reply: "Supabase insert error: " + insertError.message });
       }
     }
 
-    // 4. Pull memory again so the new fact is included immediately
+    if (memoryAction.action === "update" && memoryAction.id && memoryAction.content) {
+      const { error: updateError } = await supabase
+        .from("memory")
+        .update({ content: memoryAction.content })
+        .eq("id", memoryAction.id);
+
+      if (updateError) {
+        return Response.json({ reply: "Supabase update error: " + updateError.message });
+      }
+    }
+
     const { data: updatedMemories, error: secondReadError } = await supabase
       .from("memory")
       .select("content")
       .order("created_at", { ascending: true });
 
     if (secondReadError) {
-      return Response.json({
-        reply: "Supabase second read error: " + secondReadError.message,
-      });
+      return Response.json({ reply: "Supabase second read error: " + secondReadError.message });
     }
 
     const updatedMemoryText =
@@ -100,7 +107,6 @@ Rules:
         ? updatedMemories.map((m) => `- ${m.content}`).join("\n")
         : "No saved facts yet.";
 
-    // 5. Ask Jess with memory
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -109,19 +115,13 @@ Rules:
           content: `
 You are Jess, Brad's AI assistant.
 
-You have stored facts about Brad.
-
 Stored facts:
 ${updatedMemoryText}
 
 Rules:
 - Treat stored facts as true.
 - Use stored facts to answer directly.
-- "dog", "dogs", and "dog's" mean the same thing.
-- If Brad asks about his dog, look for Brad's dog's name in stored facts.
-- If Brad asks about his favorite color, look for Brad's favorite color in stored facts.
-- Do not say you don't know if the answer is in stored facts.
-- Never invent facts that are not in stored facts.
+- Never invent facts.
 - Be concise and helpful.
           `,
         },
@@ -129,9 +129,9 @@ Rules:
       ],
     });
 
-    const reply = completion.choices[0].message.content;
-
-    return Response.json({ reply });
+    return Response.json({
+      reply: completion.choices[0].message.content,
+    });
   } catch (err) {
     return Response.json(
       { reply: "Server error: " + err.message },

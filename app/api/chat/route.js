@@ -1,77 +1,153 @@
-import { google } from "googleapis";
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 const TIME_ZONE = "America/Phoenix";
 
-function getGoogleClient() {
-  const client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
-  );
+function getNextDay(dayIndex) {
+  const today = new Date();
+  const result = new Date(today);
 
-  client.setCredentials({
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-  });
+  const diff = (dayIndex + 7 - today.getDay()) % 7 || 7;
+  result.setDate(today.getDate() + diff);
 
-  return client;
+  return result;
 }
 
-function getDateRange(dateString) {
-  const date = dateString ? new Date(dateString) : new Date();
+function detectDate(message) {
+  const msg = message.toLowerCase();
+  const today = new Date();
 
-  const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
+  if (msg.includes("tomorrow")) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 1);
+    return d;
+  }
 
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
-
-  return {
-    timeMin: start.toISOString(),
-    timeMax: end.toISOString(),
+  const days = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
   };
+
+  for (const day in days) {
+    if (msg.includes(day)) {
+      return getNextDay(days[day]);
+    }
+  }
+
+  return today;
 }
 
-function formatTime(dateString) {
-  if (!dateString) return "All day";
-
-  return new Date(dateString).toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
+function formatDateLabel(date) {
+  return date.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
     timeZone: TIME_ZONE,
   });
 }
 
-export async function GET(req) {
+function isCalendarQuestion(message) {
+  const msg = message.toLowerCase();
+
+  return (
+    msg.includes("schedule") ||
+    msg.includes("calendar") ||
+    msg.includes("today") ||
+    msg.includes("tomorrow") ||
+    msg.includes("monday") ||
+    msg.includes("tuesday") ||
+    msg.includes("wednesday") ||
+    msg.includes("thursday") ||
+    msg.includes("friday") ||
+    msg.includes("saturday") ||
+    msg.includes("sunday") ||
+    msg.includes("morning") ||
+    msg.includes("afternoon") ||
+    msg.includes("evening")
+  );
+}
+
+async function getCalendarForDate(date) {
+  const iso = date.toISOString();
+
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(
+      iso
+    )}`
+  );
+
+  const data = await res.json();
+
+  if (data.error) {
+    return {
+      label: formatDateLabel(date),
+      text: `Calendar error: ${data.error}`,
+    };
+  }
+
+  if (!data.events || data.events.length === 0) {
+    return {
+      label: formatDateLabel(date),
+      text: "No events scheduled.",
+    };
+  }
+
+  const text = data.events
+    .map((event) => {
+      const location = event.location ? ` — ${event.location}` : "";
+      return `${event.time} — ${event.title}${location}`;
+    })
+    .join("\n");
+
+  return {
+    label: formatDateLabel(date),
+    text,
+  };
+}
+
+export async function POST(req) {
   try {
-    const { searchParams } = new URL(req.url);
-    const date = searchParams.get("date");
+    const { message } = await req.json();
 
-    const auth = getGoogleClient();
-    const calendar = google.calendar({ version: "v3", auth });
+    if (isCalendarQuestion(message)) {
+      const date = detectDate(message);
+      const schedule = await getCalendarForDate(date);
 
-    const { timeMin, timeMax } = getDateRange(date);
+      return Response.json({
+        reply: `${schedule.label} Schedule\n\n${schedule.text}`,
+      });
+    }
 
-    const result = await calendar.events.list({
-      calendarId: "primary",
-      timeMin,
-      timeMax,
-      timeZone: TIME_ZONE,
-      singleEvents: true,
-      orderBy: "startTime",
-      maxResults: 50,
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Jess, Brad's AI assistant. Be direct, concise, practical, and helpful.",
+        },
+        {
+          role: "user",
+          content: message,
+        },
+      ],
     });
 
-    const events = (result.data.items || []).map((event) => ({
-      title: event.summary || "Untitled event",
-      start: event.start?.dateTime || event.start?.date,
-      end: event.end?.dateTime || event.end?.date,
-      time: formatTime(event.start?.dateTime || event.start?.date),
-      location: event.location || "",
-    }));
-
-    return Response.json({ events });
+    return Response.json({
+      reply: completion.choices[0].message.content,
+    });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json({
+      reply: "Jess had an issue.",
+      error: error.message,
+    });
   }
 }

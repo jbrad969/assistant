@@ -19,7 +19,6 @@ async function getMemory() {
     .from("memory")
     .select("id, content")
     .order("created_at", { ascending: true });
-
   return data || [];
 }
 
@@ -53,11 +52,6 @@ Rules:
 - Do not save questions.
 - Do not duplicate.
 - Update if changed.
-
-Examples:
-"my dogs name is frank" -> insert
-"my favorite color is blue" -> insert
-"my favorite color is red now" -> update
         `,
       },
       { role: "user", content: message },
@@ -102,32 +96,21 @@ function getDetectedDates(message) {
   }
 
   const days = {
-    sunday: 0,
-    monday: 1,
-    tuesday: 2,
-    wednesday: 3,
-    thursday: 4,
-    friday: 5,
-    saturday: 6,
+    sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
+    thursday: 4, friday: 5, saturday: 6,
   };
 
   for (const day in days) {
-    if (msg.includes(day)) {
-      dates.push(getNextDay(days[day]));
-    }
+    if (msg.includes(day)) dates.push(getNextDay(days[day]));
   }
 
   if (dates.length === 0) dates.push(today);
-
   return dates;
 }
 
 function formatDateLabel(date) {
   return date.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "short",
-    day: "numeric",
-    timeZone: TIME_ZONE,
+    weekday: "long", month: "short", day: "numeric", timeZone: TIME_ZONE,
   });
 }
 
@@ -135,37 +118,25 @@ function formatDateLabel(date) {
 
 function isCalendarQuestion(message) {
   const msg = message.toLowerCase();
-
   return (
-    msg.includes("schedule") ||
-    msg.includes("calendar") ||
-    msg.includes("today") ||
-    msg.includes("tomorrow") ||
-    msg.includes("monday") ||
-    msg.includes("tuesday") ||
-    msg.includes("wednesday") ||
-    msg.includes("thursday") ||
-    msg.includes("friday") ||
-    msg.includes("saturday") ||
-    msg.includes("sunday") ||
-    msg.includes("what do i have")
+    msg.includes("schedule") || msg.includes("calendar") ||
+    msg.includes("today") || msg.includes("tomorrow") ||
+    msg.includes("monday") || msg.includes("tuesday") ||
+    msg.includes("wednesday") || msg.includes("thursday") ||
+    msg.includes("friday") || msg.includes("saturday") ||
+    msg.includes("sunday") || msg.includes("what do i have")
   );
 }
 
 async function getCalendarForDate(date) {
   const iso = date.toISOString();
-
   const res = await fetch(
     `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`
   );
-
   const data = await res.json();
 
   if (!data.events || data.events.length === 0) {
-    return {
-      label: formatDateLabel(date),
-      text: "No events scheduled.",
-    };
+    return { label: formatDateLabel(date), text: "No events scheduled." };
   }
 
   const text = data.events
@@ -175,10 +146,61 @@ async function getCalendarForDate(date) {
     })
     .join("\n");
 
-  return {
-    label: formatDateLabel(date),
-    text,
-  };
+  return { label: formatDateLabel(date), text };
+}
+
+/* ---------------- EMAIL ---------------- */
+
+function isEmailQuestion(message) {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("email") || msg.includes("inbox") ||
+    msg.includes("unread") || msg.includes("messages") ||
+    msg.includes("did i get") || msg.includes("any emails")
+  );
+}
+
+async function getEmails(all = false) {
+  const limit = all ? "50" : "5";
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_BASE_URL}/api/email?limit=${limit}&all=${all}`
+  );
+  const data = await res.json();
+  return data.emails || [];
+}
+
+/* ---------------- QUOTE ---------------- */
+
+function isQuoteRequest(message) {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("roof quote") || msg.includes("quote for") ||
+    msg.includes("need a quote") || msg.includes("request a quote") ||
+    msg.includes("send a quote")
+  );
+}
+
+async function extractQuoteDetails(message) {
+  const result = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `Extract roof quote details from the message. Return JSON:
+{
+  "customerName": "full name or null",
+  "customerEmail": "email or null",
+  "customerAddress": "full address or null",
+  "roofMaterial": "Tile" | "Shingle" | "Flat" | null,
+  "notes": "any notes or null"
+}
+Only return Tile, Shingle, or Flat for roofMaterial. If unclear, return null.`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+  return JSON.parse(result.choices[0].message.content);
 }
 
 /* ---------------- MAIN ---------------- */
@@ -197,7 +219,72 @@ export async function POST(req) {
         ? updatedMemory.map((m) => `- ${m.content}`).join("\n")
         : "";
 
-    // CALENDAR — fetch data then let GPT narrate it
+    // QUOTE REQUEST
+    if (isQuoteRequest(message)) {
+      const extracted = await extractQuoteDetails(message);
+
+      if (!extracted.customerName || !extracted.customerAddress || !extracted.roofMaterial) {
+        return Response.json({
+          reply: "I need a few more details for that quote. Can you give me the customer's full name, address, and roof material (Tile, Shingle, or Flat)?",
+        });
+      }
+
+      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/quote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(extracted),
+      });
+
+      const data = await res.json();
+
+      if (data.success) {
+        return Response.json({
+          reply: `Done — quote request sent to T&K Roofing for ${extracted.customerName} at ${extracted.customerAddress}. They usually respond in 15-30 minutes. I'll keep an eye on your inbox.`,
+        });
+      } else {
+        return Response.json({
+          reply: `Something went wrong submitting the quote: ${data.error}`,
+        });
+      }
+    }
+
+    // EMAIL
+    if (isEmailQuestion(message)) {
+      const all = message.toLowerCase().includes("all");
+      const emails = await getEmails(all);
+
+      if (emails.length === 0) {
+        return Response.json({ reply: "No unread emails right now." });
+      }
+
+      const emailContext = emails
+        .map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nPreview: ${e.body.slice(0, 200)}`)
+        .join("\n\n");
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `You are Jess, Brad's executive assistant. 
+Summarize these unread emails naturally and conversationally.
+For each one mention who it's from and what it's about in plain English.
+Flag anything urgent or from tnkroofing.com as a quote response.
+No markdown. Be concise.`,
+          },
+          {
+            role: "user",
+            content: `Here are Brad's unread emails:\n\n${emailContext}`,
+          },
+        ],
+      });
+
+      return Response.json({
+        reply: completion.choices[0].message.content,
+      });
+    }
+
+    // CALENDAR
     if (isCalendarQuestion(message)) {
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendarForDate));
@@ -211,20 +298,14 @@ export async function POST(req) {
         messages: [
           {
             role: "system",
-            content: `
-You are Jess, Brad's executive assistant.
-
-Memory:
-${memoryText}
-
+            content: `You are Jess, Brad's executive assistant.
 Rules:
 - Be direct and conversational, like a real assistant briefing their boss
 - Summarize the schedule naturally, don't just list it robotically
 - Mention the time and title of each event
 - If there's a location, mention it naturally
 - No markdown formatting
-- Keep it tight — Brad is busy
-            `,
+- Keep it tight — Brad is busy`,
           },
           {
             role: "user",
@@ -238,14 +319,13 @@ Rules:
       });
     }
 
-    // NORMAL CHAT (USES MEMORY + HISTORY)
+    // NORMAL CHAT
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content: `
-You are Jess, Brad's executive assistant.
+          content: `You are Jess, Brad's executive assistant.
 
 Memory:
 ${memoryText}
@@ -255,13 +335,9 @@ Rules:
 - Be direct and concise
 - No fluff
 - No markdown formatting
-- Act like a real assistant
-          `,
+- Act like a real assistant`,
         },
-        ...history.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
+        ...history.map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: message },
       ],
     });

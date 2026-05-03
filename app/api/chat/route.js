@@ -12,6 +12,8 @@ const supabase = createClient(
 
 const TIME_ZONE = "America/Phoenix";
 
+/* ---------------- MEMORY ---------------- */
+
 async function getMemory() {
   const { data } = await supabase
     .from("memory")
@@ -47,35 +49,36 @@ Return JSON only:
 }
 
 Rules:
-- Save personal facts, preferences, business facts, names, important details.
-- Do not save random questions.
-- Do not duplicate existing facts.
-- If Brad changes something, update the old memory.
-- Be forgiving with spelling.
+- Save personal facts, preferences, names, important details.
+- Do not save questions.
+- Do not duplicate.
+- Update if changed.
 
 Examples:
-"my dogs name is frank" -> insert "Brad's dog's name is Frank"
-"my favorite color is blue" -> insert "Brad's favorite color is Blue"
-"my favorite color is red now" -> update old favorite color memory
+"my dogs name is frank" -> insert
+"my favorite color is blue" -> insert
+"my favorite color is red now" -> update
         `,
       },
       { role: "user", content: message },
     ],
   });
 
-  const memoryAction = JSON.parse(result.choices[0].message.content);
+  const action = JSON.parse(result.choices[0].message.content);
 
-  if (memoryAction.action === "insert" && memoryAction.content) {
-    await supabase.from("memory").insert([{ content: memoryAction.content }]);
+  if (action.action === "insert" && action.content) {
+    await supabase.from("memory").insert([{ content: action.content }]);
   }
 
-  if (memoryAction.action === "update" && memoryAction.id && memoryAction.content) {
+  if (action.action === "update" && action.id && action.content) {
     await supabase
       .from("memory")
-      .update({ content: memoryAction.content })
-      .eq("id", memoryAction.id);
+      .update({ content: action.content })
+      .eq("id", action.id);
   }
 }
+
+/* ---------------- DATE LOGIC ---------------- */
 
 function getNextDay(dayIndex) {
   const today = new Date();
@@ -90,9 +93,7 @@ function getDetectedDates(message) {
   const today = new Date();
   const dates = [];
 
-  if (msg.includes("today")) {
-    dates.push(new Date(today));
-  }
+  if (msg.includes("today")) dates.push(new Date(today));
 
   if (msg.includes("tomorrow")) {
     const d = new Date(today);
@@ -116,9 +117,7 @@ function getDetectedDates(message) {
     }
   }
 
-  if (dates.length === 0) {
-    dates.push(today);
-  }
+  if (dates.length === 0) dates.push(today);
 
   return dates;
 }
@@ -131,6 +130,8 @@ function formatDateLabel(date) {
     timeZone: TIME_ZONE,
   });
 }
+
+/* ---------------- CALENDAR ---------------- */
 
 function isCalendarQuestion(message) {
   const msg = message.toLowerCase();
@@ -147,12 +148,7 @@ function isCalendarQuestion(message) {
     msg.includes("friday") ||
     msg.includes("saturday") ||
     msg.includes("sunday") ||
-    msg.includes("morning") ||
-    msg.includes("afternoon") ||
-    msg.includes("evening") ||
-    msg.includes("what do i have") ||
-    msg.includes("next appointment") ||
-    msg.includes("next meeting")
+    msg.includes("what do i have")
   );
 }
 
@@ -166,13 +162,6 @@ async function getCalendarForDate(date) {
   );
 
   const data = await res.json();
-
-  if (data.error) {
-    return {
-      label: formatDateLabel(date),
-      text: `Calendar error: ${data.error}`,
-    };
-  }
 
   if (!data.events || data.events.length === 0) {
     return {
@@ -194,10 +183,13 @@ async function getCalendarForDate(date) {
   };
 }
 
+/* ---------------- MAIN ---------------- */
+
 export async function POST(req) {
   try {
     const { message } = await req.json();
 
+    // MEMORY UPDATE
     const currentMemory = await getMemory();
     await saveOrUpdateMemory(message, currentMemory);
 
@@ -205,21 +197,21 @@ export async function POST(req) {
     const memoryText =
       updatedMemory.length > 0
         ? updatedMemory.map((m) => `- ${m.content}`).join("\n")
-        : "No saved memory yet.";
+        : "";
 
+    // CALENDAR (NO AI — DIRECT RESPONSE)
     if (isCalendarQuestion(message)) {
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendarForDate));
 
       const reply = schedules
-        .map((schedule) => `${schedule.label} Schedule\n\n${schedule.text}`)
-        .join("\n\n---\n\n");
+        .map((s) => `${s.label}\n\n${s.text}`)
+        .join("\n\n");
 
       return Response.json({ reply });
     }
 
-    const todaySchedule = await getCalendarForDate(new Date());
-
+    // NORMAL CHAT (USES MEMORY)
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -231,19 +223,12 @@ You are Jess, Brad's executive assistant.
 Memory:
 ${memoryText}
 
-Today's calendar:
-${todaySchedule.label} Schedule
-${todaySchedule.text}
-
 Rules:
-- Use memory for personal questions.
-- Use calendar only when relevant.
-- Never say you do not have access to memory if memory is provided.
-- Never say you do not have calendar access if calendar data is provided.
-- Be direct, concise, and practical.
-- No markdown unless Brad asks for it.
-- No bold formatting.
-- Act like a real assistant, not an AI.
+- Use memory for personal questions
+- Be direct and concise
+- No fluff
+- No markdown formatting
+- Act like a real assistant
           `,
         },
         { role: "user", content: message },

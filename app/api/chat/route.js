@@ -1,91 +1,68 @@
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
 export async function POST(req) {
   try {
     const { message } = await req.json();
 
-    const historyRes = await fetch(
-      `${process.env.SUPABASE_URL}/rest/v1/messages?select=role,content&order=created_at.asc`,
-      {
-        headers: {
-          apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-        },
-      }
-    );
+    // 1. Get past memory
+    const { data: memories } = await supabase
+      .from("memory")
+      .select("content")
+      .order("created_at", { ascending: true });
 
-    if (!historyRes.ok) {
-      const errorText = await historyRes.text();
-      return Response.json(
-        { error: "Supabase read failed: " + errorText },
-        { status: 500 }
-      );
-    }
+    const memoryText = memories?.map((m) => m.content).join("\n") || "";
 
-    const history = await historyRes.json();
-
+    // 2. Ask OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content:
-            "You are Jess, Brad's AI assistant. You remember past conversations and answer clearly.",
+          content: `
+You are Jess, Brad's AI assistant.
+
+You have access to stored memory about Brad.
+
+IMPORTANT RULES:
+- Treat stored memory as FACT.
+- Do NOT ask for confirmation if the answer exists in memory.
+- Answer confidently using memory when possible.
+- Only say you don't know if memory truly does not contain the answer.
+
+Memory:
+${memoryText}
+          `,
         },
-        ...history,
-        { role: "user", content: message },
+        {
+          role: "user",
+          content: message,
+        },
       ],
     });
 
     const reply = completion.choices[0].message.content;
 
-    const saveUser = await fetch(`${process.env.SUPABASE_URL}/rest/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-      body: JSON.stringify({ role: "user", content: message }),
-    });
-
-    if (!saveUser.ok) {
-      const errorText = await saveUser.text();
-      return Response.json(
-        { error: "Supabase user save failed: " + errorText },
-        { status: 500 }
-      );
-    }
-
-    const saveAssistant = await fetch(
-      `${process.env.SUPABASE_URL}/rest/v1/messages`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-        },
-        body: JSON.stringify({ role: "assistant", content: reply }),
-      }
-    );
-
-    if (!saveAssistant.ok) {
-      const errorText = await saveAssistant.text();
-      return Response.json(
-        { error: "Supabase assistant save failed: " + errorText },
-        { status: 500 }
-      );
-    }
+    // 3. Save new memory (simple version)
+    await supabase.from("memory").insert([
+      { content: `User: ${message}` },
+      { content: `Jess: ${reply}` },
+    ]);
 
     return Response.json({ reply });
-  } catch (error) {
+  } catch (err) {
+    console.error(err);
     return Response.json(
-      { error: error.message || "Unknown server error" },
+      { reply: "Jess had an issue." },
       { status: 500 }
     );
   }

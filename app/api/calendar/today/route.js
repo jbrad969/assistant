@@ -19,11 +19,18 @@ function getGoogleClient() {
 function getDateRange(dateString) {
   const date = dateString ? new Date(dateString) : new Date();
 
-  const start = new Date(date);
-  start.setHours(0, 0, 0, 0);
+  // Resolve the Phoenix-local Y-M-D for the given moment, regardless of server timezone.
+  // en-CA formats as YYYY-MM-DD which we can concatenate directly.
+  const phoenixDate = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: TIME_ZONE,
+  }).format(date);
 
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  // Phoenix is fixed UTC-7 (never observes DST). Midnight Phoenix == 07:00 UTC of the same date.
+  const start = new Date(`${phoenixDate}T07:00:00Z`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
 
   return {
     timeMin: start.toISOString(),

@@ -815,7 +815,8 @@ Rules:
 - Mention the time and title of each event
 - If there's a location, mention it naturally
 - No markdown formatting
-- Keep it tight — Brad is busy`,
+- Keep it tight — Brad is busy
+- When reading calendar events, NEVER assume Brad is the host or that the event location is his home. Any address in a calendar event is always a DESTINATION Brad is traveling TO, never his home address.`,
         messages: [
           {
             role: "user",

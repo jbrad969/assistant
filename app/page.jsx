@@ -216,6 +216,7 @@ const styles = `
     border-radius: 16px;
     font-size: 15px;
     line-height: 1.6;
+    white-space: pre-wrap;
   }
 
   .bubble.user {
@@ -459,8 +460,36 @@ export default function Page() {
     setMemories(data.memories || []);
   }
 
+  function stopListening() {
+    if (!isListeningRef.current && !isListening) return;
+    isListeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch (e) {}
+    setIsListening(false);
+  }
+
+  function formatMessage(text) {
+    if (!text) return text;
+    const timeRegex = /\b(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\b/g;
+    const matches = [...text.matchAll(timeRegex)];
+    if (matches.length < 2) return text;
+
+    const firstIdx = matches[0].index;
+    const intro = text.slice(0, firstIdx).trim();
+
+    const bullets = matches.map((m, i) => {
+      const start = m.index;
+      const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+      const segment = text.slice(start, end).trim().replace(/[,;]\s*$/, "");
+      return `• ${segment}`;
+    });
+
+    return intro ? `${intro}\n\n${bullets.join("\n")}` : bullets.join("\n");
+  }
+
   async function sendMessage() {
     if (!input.trim() || loading) return;
+
+    stopListening();
 
     const userText = input;
     setMessages((prev) => [...prev, { role: "user", content: userText }]);
@@ -746,7 +775,7 @@ export default function Page() {
                 {msg.role === "user" ? "BRAD" : "JESS"}
               </div>
               <div className={`bubble ${msg.role}`}>
-                {msg.content}
+                {msg.role === "assistant" ? formatMessage(msg.content) : msg.content}
               </div>
             </div>
           ))}

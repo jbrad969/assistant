@@ -9,21 +9,22 @@ const TIME_ZONE = "America/Phoenix";
 function getNextDay(dayIndex) {
   const today = new Date();
   const result = new Date(today);
-
   const diff = (dayIndex + 7 - today.getDay()) % 7 || 7;
   result.setDate(today.getDate() + diff);
-
   return result;
 }
 
-function detectDate(message) {
+function getDetectedDates(message) {
   const msg = message.toLowerCase();
   const today = new Date();
+  const dates = [];
+
+  if (msg.includes("today")) dates.push(new Date(today));
 
   if (msg.includes("tomorrow")) {
     const d = new Date(today);
     d.setDate(d.getDate() + 1);
-    return d;
+    dates.push(d);
   }
 
   const days = {
@@ -38,11 +39,13 @@ function detectDate(message) {
 
   for (const day in days) {
     if (msg.includes(day)) {
-      return getNextDay(days[day]);
+      dates.push(getNextDay(days[day]));
     }
   }
 
-  return today;
+  if (dates.length === 0) dates.push(today);
+
+  return dates;
 }
 
 function formatDateLabel(date) {
@@ -118,12 +121,14 @@ export async function POST(req) {
     const { message } = await req.json();
 
     if (isCalendarQuestion(message)) {
-      const date = detectDate(message);
-      const schedule = await getCalendarForDate(date);
+      const dates = getDetectedDates(message);
+      const schedules = await Promise.all(dates.map(getCalendarForDate));
 
-      return Response.json({
-        reply: `${schedule.label} Schedule\n\n${schedule.text}`,
-      });
+      const reply = schedules
+        .map((schedule) => `${schedule.label} Schedule\n\n${schedule.text}`)
+        .join("\n\n---\n\n");
+
+      return Response.json({ reply });
     }
 
     const completion = await client.chat.completions.create({

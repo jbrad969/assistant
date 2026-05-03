@@ -14,15 +14,15 @@ export async function POST(req) {
   try {
     const { message } = await req.json();
 
-    // 1. Get past memory
+    // 1. Get memory (facts only)
     const { data: memories } = await supabase
       .from("memory")
-      .select("content")
-      .order("created_at", { ascending: true });
+      .select("content");
 
-    const memoryText = memories?.map((m) => m.content).join("\n") || "";
+    const memoryText =
+      memories?.map((m) => `- ${m.content}`).join("\n") || "";
 
-    // 2. Ask OpenAI
+    // 2. Ask AI
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -31,15 +31,15 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's AI assistant.
 
-You have access to stored memory about Brad.
+You have stored facts about Brad.
 
-IMPORTANT RULES:
-- Treat stored memory as FACT.
-- Do NOT ask for confirmation if the answer exists in memory.
-- Answer confidently using memory when possible.
-- Only say you don't know if memory truly does not contain the answer.
+RULES:
+- Facts are ALWAYS correct.
+- NEVER guess.
+- If the answer is not in memory, say you don't know.
+- Do NOT invent answers.
 
-Memory:
+Facts:
 ${memoryText}
           `,
         },
@@ -52,11 +52,37 @@ ${memoryText}
 
     const reply = completion.choices[0].message.content;
 
-    // 3. Save new memory (simple version)
-    await supabase.from("memory").insert([
-      { content: `User: ${message}` },
-      { content: `Jess: ${reply}` },
-    ]);
+    // 3. Extract fact from user message
+    const factCheck = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `
+Extract a clear fact from the user's message if it contains one.
+
+Examples:
+"my dog's name is frank" → "Dog name: Frank"
+"my favorite color is blue" → "Favorite color: Blue"
+
+If no fact, return "NONE"
+          `,
+        },
+        {
+          role: "user",
+          content: message,
+        },
+      ],
+    });
+
+    const fact = factCheck.choices[0].message.content;
+
+    // 4. Save ONLY real facts
+    if (fact && fact !== "NONE") {
+      await supabase.from("memory").insert([
+        { content: fact },
+      ]);
+    }
 
     return Response.json({ reply });
   } catch (err) {

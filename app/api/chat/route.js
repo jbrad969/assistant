@@ -541,11 +541,29 @@ async function getEmailsBySearch(search, limit = 5, fullBody = false) {
 
 function isEmailQuestion(message) {
   const msg = message.toLowerCase();
+  const readTriggers = [
+    "read my emails",
+    "check my emails",
+    "any emails",
+    "any unread",
+    "what emails",
+    "show my emails",
+    "check my inbox",
+    "read my inbox",
+  ];
+  return readTriggers.some((trigger) => msg.includes(trigger));
+}
+
+function isEmailSend(message) {
+  const msg = message.toLowerCase();
   return (
-    msg.includes("email") || msg.includes("eamil") || msg.includes("gmail") ||
-    msg.includes("inbox") || msg.includes("unread") || msg.includes("messages") ||
-    msg.includes("did i get") || msg.includes("any mail") ||
-    msg.includes("check mail") || msg.includes("read my")
+    msg.includes("send an email") ||
+    msg.includes("email nicole") ||
+    msg.includes("email her") ||
+    msg.includes("email him") ||
+    msg.includes("send her an email") ||
+    msg.includes("write an email") ||
+    msg.includes("draft an email")
   );
 }
 
@@ -670,6 +688,67 @@ If the email does not contain ${desc}, return {"value": null}.`,
     user: `Extract ${desc} from this email:\n\n${(emailBody || "").slice(0, 4000)}`,
   });
   return parseJsonFromClaude(raw);
+}
+
+async function extractEmailToSend(message, history = []) {
+  const recentHistory = history.slice(-6);
+  const conversationContext = recentHistory.length
+    ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
+    : "(no prior turns)";
+
+  const raw = await claudeJson({
+    maxTokens: 768,
+    system: `Brad wants to send an email. Extract the parts.
+Return ONLY a JSON object, no preamble:
+{
+  "to": "exact email address (name@domain.com) if known, else null",
+  "recipientName": "person's name if no email address is known" | null,
+  "subject": "email subject line" | null,
+  "body": "the email body Brad wants to send" | null
+}
+
+If Brad gives a name like "Nicole" without an email address, leave "to" null and put the name in "recipientName".
+If Brad dictates the body, capture it. If the body is implied from the conversation, draft a short professional email body.`,
+    user: `Recent conversation:\n${conversationContext}\n\nCurrent request: "${message}"`,
+  });
+  return parseJsonFromClaude(raw);
+}
+
+async function handleEmailSend(ctx) {
+  if (!isEmailSend(ctx.message)) return null;
+
+  const draft = await extractEmailToSend(ctx.message, ctx.history);
+  if (!draft) {
+    return reply("I need a recipient and what to say. Tell me the email address, subject, and body.");
+  }
+
+  if (!draft.to) {
+    const who = draft.recipientName ? `${draft.recipientName}'s` : "the recipient's";
+    return reply(`I need ${who} email address — what is it?`);
+  }
+
+  if (!draft.subject || !draft.body) {
+    return reply("What should the subject and body say?");
+  }
+
+  const res = await fetch(`${BASE_URL}/api/email`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ to: draft.to, subject: draft.subject, body: draft.body }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    console.log("[chat] email send failed:", data?.error || res.status);
+    return reply("I had trouble sending that email, please try again.");
+  }
+
+  try {
+    await insertMemoryWithCap(`[LOG] Sent email to ${draft.to} on ${ctx.today}: ${draft.subject}`);
+  } catch (memErr) {
+    console.log("[chat] couldn't log sent-email memory:", memErr.message);
+  }
+
+  return reply(`Done — emailed ${draft.to}: "${draft.subject}".`);
 }
 
 async function handleEmailToCalendar(ctx) {
@@ -1296,9 +1375,10 @@ const INTENT_HANDLERS = [
   handleReminder,        // "remind me to leave for BNI" — must beat departure
   handleQuote,           // "send a quote" — narrow trigger
   handleEmailToCalendar, // "find email from X and update calendar"
+  handleEmailSend,       // "email Nicole", "send an email", "draft an email"
   handleEmailRead,       // "read me that email" (uses history)
   handleEmailSearch,     // "emails from Nicole"
-  handleEmail,           // generic "any unread emails"
+  handleEmail,           // strict triggers only: "any emails", "check my inbox", etc.
   handleCalendarWrite,   // "add/move/cancel an event" (falls through on action=none)
   handleArrivalTarget,   // "I need to be at the shop at 8:45" — beats departure
   handleDeparture,       // "when should I leave"

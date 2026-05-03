@@ -50,6 +50,36 @@ function sortEvents(events) {
   });
 }
 
+function addMinutes({ date, time }, minutes) {
+  const [hh, mm] = time.split(":").map(Number);
+  let total = hh * 60 + mm + minutes;
+  let dayOffset = 0;
+  while (total >= 24 * 60) {
+    total -= 24 * 60;
+    dayOffset += 1;
+  }
+  while (total < 0) {
+    total += 24 * 60;
+    dayOffset -= 1;
+  }
+  let endDate = date;
+  if (dayOffset !== 0) {
+    const d = new Date(`${date}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + dayOffset);
+    endDate = d.toISOString().slice(0, 10);
+  }
+  const newH = Math.floor(total / 60);
+  const newM = total % 60;
+  return {
+    date: endDate,
+    time: `${String(newH).padStart(2, "0")}:${String(newM).padStart(2, "0")}`,
+  };
+}
+
+function buildDateTime({ date, time }) {
+  return { dateTime: `${date}T${time}:00`, timeZone: TIME_ZONE };
+}
+
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
@@ -71,6 +101,7 @@ export async function GET(req) {
     });
 
     let events = (result.data.items || []).map((event) => ({
+      id: event.id,
       title: event.summary || "Untitled event",
       start: event.start?.dateTime || event.start?.date,
       end: event.end?.dateTime || event.end?.date,
@@ -90,6 +121,93 @@ export async function GET(req) {
       events,
       text: formatted.join("\n"), // <-- CLEAN MULTI-LINE OUTPUT
     });
+  } catch (error) {
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function POST(req) {
+  try {
+    const { title, start, end, durationMinutes, location, description } = await req.json();
+
+    if (!title || !start?.date || !start?.time) {
+      return Response.json(
+        { error: "title, start.date, and start.time are required" },
+        { status: 400 }
+      );
+    }
+
+    const finalEnd = end?.date && end?.time ? end : addMinutes(start, durationMinutes || 60);
+
+    const auth = getGoogleClient();
+    const calendar = google.calendar({ version: "v3", auth });
+
+    const result = await calendar.events.insert({
+      calendarId: "primary",
+      requestBody: {
+        summary: title,
+        location: location || undefined,
+        description: description || undefined,
+        start: buildDateTime(start),
+        end: buildDateTime(finalEnd),
+      },
+    });
+
+    return Response.json({
+      success: true,
+      eventId: result.data.id,
+      htmlLink: result.data.htmlLink,
+    });
+  } catch (error) {
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req) {
+  try {
+    const { eventId } = await req.json();
+    if (!eventId) {
+      return Response.json({ error: "eventId is required" }, { status: 400 });
+    }
+
+    const auth = getGoogleClient();
+    const calendar = google.calendar({ version: "v3", auth });
+
+    await calendar.events.delete({ calendarId: "primary", eventId });
+
+    return Response.json({ success: true });
+  } catch (error) {
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function PATCH(req) {
+  try {
+    const { eventId, title, start, end, durationMinutes, location } = await req.json();
+    if (!eventId) {
+      return Response.json({ error: "eventId is required" }, { status: 400 });
+    }
+
+    const requestBody = {};
+    if (title) requestBody.summary = title;
+    if (location !== undefined) requestBody.location = location || null;
+    if (start?.date && start?.time) requestBody.start = buildDateTime(start);
+    if (end?.date && end?.time) {
+      requestBody.end = buildDateTime(end);
+    } else if (start?.date && start?.time && durationMinutes) {
+      requestBody.end = buildDateTime(addMinutes(start, durationMinutes));
+    }
+
+    const auth = getGoogleClient();
+    const calendar = google.calendar({ version: "v3", auth });
+
+    const result = await calendar.events.patch({
+      calendarId: "primary",
+      eventId,
+      requestBody,
+    });
+
+    return Response.json({ success: true, eventId: result.data.id });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

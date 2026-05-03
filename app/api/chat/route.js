@@ -14,7 +14,7 @@ export async function POST(req) {
   try {
     const { message } = await req.json();
 
-    // 1. Get memory (facts only)
+    // 1. Load memory (facts only)
     const { data: memories } = await supabase
       .from("memory")
       .select("content");
@@ -22,7 +22,7 @@ export async function POST(req) {
     const memoryText =
       memories?.map((m) => `- ${m.content}`).join("\n") || "";
 
-    // 2. Ask AI
+    // 2. Ask AI (with memory)
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -52,20 +52,29 @@ ${memoryText}
 
     const reply = completion.choices[0].message.content;
 
-    // 3. Extract fact from user message
+    // 3. Extract fact (SMART version)
     const factCheck = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
           content: `
-Extract a clear fact from the user's message if it contains one.
+You extract facts from user messages.
+
+Be flexible with spelling and grammar.
 
 Examples:
 "my dog's name is frank" → "Dog name: Frank"
+"my dogs name is frank" → "Dog name: Frank"
+"dog is frank" → "Dog name: Frank"
+"i have a dog named frank" → "Dog name: Frank"
 "my favorite color is blue" → "Favorite color: Blue"
 
-If no fact, return "NONE"
+Rules:
+- Normalize messy input
+- Extract ONLY clear personal facts
+- Capitalize values properly
+- If no clear fact, return EXACTLY: NONE
           `,
         },
         {
@@ -75,9 +84,9 @@ If no fact, return "NONE"
       ],
     });
 
-    const fact = factCheck.choices[0].message.content;
+    const fact = factCheck.choices[0].message.content.trim();
 
-    // 4. Save ONLY real facts
+    // 4. Save ONLY valid facts
     if (fact && fact !== "NONE") {
       await supabase.from("memory").insert([
         { content: fact },

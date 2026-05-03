@@ -3,84 +3,81 @@
 import { useState } from "react";
 
 export default function Page() {
-  const [message, setMessage] = useState("");
-  const [response, setResponse] = useState("");
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hey Brad — I’m Jess. What do you need?" },
+  ]);
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function sendMessage() {
-    if (!message.trim()) return;
+    if (!input.trim() || loading) return;
 
+    const userMessage = { role: "user", content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput("");
     setLoading(true);
-    setResponse("");
 
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ message }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: input }),
       });
 
       const data = await res.json();
 
-      if (!res.ok) {
-        setResponse(data.error || "Jess had an error.");
-      } else {
-        setResponse(data.reply || "Jess did not return a reply.");
-      }
-    } catch (error) {
-      setResponse("Jess could not connect. Try again.");
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: data.reply || "Jess had an issue." },
+      ]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Jess could not connect. Try again." },
+      ]);
     }
 
     setLoading(false);
   }
 
   return (
-    <main style={{ padding: 40, maxWidth: 700 }}>
+    <main style={{ maxWidth: 800, margin: "0 auto", padding: 24 }}>
       <h1>Jess AI 🚀</h1>
-      <p>Brad’s AI assistant is running.</p>
 
-      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-        <input
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="Ask Jess something..."
-          style={{
-            flex: 1,
-            padding: 12,
-            fontSize: 16,
-          }}
-        />
-
-        <button
-          onClick={sendMessage}
-          disabled={loading}
-          style={{
-            padding: "12px 18px",
-            fontSize: 16,
-            cursor: loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading ? "Thinking..." : "Send"}
-        </button>
+      <div style={{ marginTop: 24 }}>
+        {messages.map((msg, index) => (
+          <div
+            key={index}
+            style={{
+              marginBottom: 12,
+              padding: 14,
+              borderRadius: 10,
+              background: msg.role === "user" ? "#dff0ff" : "#f2f2f2",
+            }}
+          >
+            <strong>{msg.role === "user" ? "Brad" : "Jess"}:</strong>{" "}
+            {msg.content}
+          </div>
+        ))}
       </div>
 
-      {loading && <p style={{ marginTop: 20 }}>Jess is thinking...</p>}
+      {loading && <p>Jess is thinking...</p>}
 
-      {response && (
-        <div
-          style={{
-            marginTop: 24,
-            padding: 16,
-            background: "#f3f3f3",
-            borderRadius: 8,
-            whiteSpace: "pre-wrap",
+      <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") sendMessage();
           }}
-        >
-          {response}
-        </div>
-      )}
+          placeholder="Ask Jess something..."
+          style={{ flex: 1, padding: 12, fontSize: 16 }}
+        />
+
+        <button onClick={sendMessage} disabled={loading}>
+          Send
+        </button>
+      </div>
     </main>
   );
 }

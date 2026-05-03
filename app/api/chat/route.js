@@ -23,9 +23,9 @@ export async function POST(req) {
 Extract a clear personal fact from the user's message.
 
 Examples:
-"my dogs name is frank" -> "Dog name: Frank"
-"my dog's name is frank" -> "Dog name: Frank"
-"my favorite color is blue" -> "Favorite color: Blue"
+"my dogs name is frank" -> "Brad's dog's name is Frank"
+"my dog's name is frank" -> "Brad's dog's name is Frank"
+"my favorite color is blue" -> "Brad's favorite color is Blue"
 
 If no fact exists, return EXACTLY: NONE
           `,
@@ -42,10 +42,11 @@ If no fact exists, return EXACTLY: NONE
 
     const { data: memories } = await supabase
       .from("memory")
-      .select("content");
+      .select("content")
+      .order("created_at", { ascending: true });
 
     const memoryText =
-      memories?.map((m) => `- ${m.content}`).join("\n") || "";
+      memories?.map((m) => `- ${m.content}`).join("\n") || "No stored facts yet.";
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -55,12 +56,18 @@ If no fact exists, return EXACTLY: NONE
           content: `
 You are Jess, Brad's AI assistant.
 
-Use stored facts as truth.
-Never guess.
-If a fact exists in memory, answer directly.
+You have stored facts about Brad.
 
-Facts:
+Stored facts:
 ${memoryText}
+
+Rules:
+- Use the stored facts above as truth.
+- If Brad asks about his dog, use any stored fact about "Brad's dog's name".
+- "dog", "dogs", and "dog's" mean the same thing.
+- Answer directly when a stored fact answers the question.
+- Do not say you don't know when the answer is in stored facts.
+- Never invent facts not listed above.
           `,
         },
         { role: "user", content: message },

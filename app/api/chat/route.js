@@ -6,7 +6,6 @@ const client = new OpenAI({
 
 function detectDate(message) {
   const msg = message.toLowerCase();
-
   const today = new Date();
 
   if (msg.includes("tomorrow")) {
@@ -15,13 +14,21 @@ function detectDate(message) {
     return d;
   }
 
-  if (msg.includes("monday")) return getNextDay(1);
-  if (msg.includes("tuesday")) return getNextDay(2);
-  if (msg.includes("wednesday")) return getNextDay(3);
-  if (msg.includes("thursday")) return getNextDay(4);
-  if (msg.includes("friday")) return getNextDay(5);
-  if (msg.includes("saturday")) return getNextDay(6);
-  if (msg.includes("sunday")) return getNextDay(0);
+  const days = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+
+  for (const day in days) {
+    if (msg.includes(day)) {
+      return getNextDay(days[day]);
+    }
+  }
 
   return today;
 }
@@ -77,7 +84,7 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's assistant.
 
-Use this schedule to answer the user.
+Always use the provided schedule to answer questions about dates.
 
 Schedule:
 ${calendarData}

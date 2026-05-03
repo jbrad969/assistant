@@ -4,7 +4,7 @@ function getGmailClient() {
   const client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    "https://project-xsf5a.vercel.app/api/google/callback"
+    process.env.GOOGLE_REDIRECT_URI
   );
 
   client.setCredentials({

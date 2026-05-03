@@ -5,13 +5,25 @@ import { useEffect, useState } from "react";
 export default function MemoryPage() {
   const [memories, setMemories] = useState([]);
 
-  useEffect(() => {
-    async function loadMemory() {
-      const res = await fetch("/api/memory");
-      const data = await res.json();
-      setMemories(data.memories || []);
-    }
+  async function loadMemory() {
+    const res = await fetch("/api/memory");
+    const data = await res.json();
+    setMemories(data.memories || []);
+  }
 
+  async function deleteMemory(id) {
+    await fetch("/api/memory/delete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ id }),
+    });
+
+    loadMemory();
+  }
+
+  useEffect(() => {
     loadMemory();
   }, []);
 
@@ -29,9 +41,16 @@ export default function MemoryPage() {
             marginBottom: 12,
             borderRadius: 10,
             background: "#f2f2f2",
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 12,
           }}
         >
-          {memory.content}
+          <span>{memory.content}</span>
+
+          <button onClick={() => deleteMemory(memory.id)}>
+            Delete
+          </button>
         </div>
       ))}
     </main>

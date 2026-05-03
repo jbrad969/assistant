@@ -42,6 +42,14 @@ function formatTime(dateString) {
   });
 }
 
+function sortEvents(events) {
+  return events.sort((a, b) => {
+    const aTime = new Date(a.start).getTime();
+    const bTime = new Date(b.start).getTime();
+    return aTime - bTime;
+  });
+}
+
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
@@ -62,7 +70,7 @@ export async function GET(req) {
       maxResults: 50,
     });
 
-    const events = (result.data.items || []).map((event) => ({
+    let events = (result.data.items || []).map((event) => ({
       title: event.summary || "Untitled event",
       start: event.start?.dateTime || event.start?.date,
       end: event.end?.dateTime || event.end?.date,
@@ -70,7 +78,18 @@ export async function GET(req) {
       location: event.location || "",
     }));
 
-    return Response.json({ events });
+    events = sortEvents(events);
+
+    // 🔥 THIS IS THE IMPORTANT PART
+    const formatted = events.map((event) => {
+      const location = event.location ? ` — ${event.location}` : "";
+      return `${event.time} — ${event.title}${location}`;
+    });
+
+    return Response.json({
+      events,
+      text: formatted.join("\n"), // <-- CLEAN MULTI-LINE OUTPUT
+    });
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }

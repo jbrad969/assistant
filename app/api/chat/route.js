@@ -18,8 +18,7 @@ async function getMemory() {
     .select("id, content")
     .order("created_at", { ascending: true });
 
-  if (!data) return [];
-  return data;
+  return data || [];
 }
 
 async function saveOrUpdateMemory(message, currentMemory) {
@@ -86,14 +85,19 @@ function getNextDay(dayIndex) {
   return result;
 }
 
-function detectDate(message) {
+function getDetectedDates(message) {
   const msg = message.toLowerCase();
   const today = new Date();
+  const dates = [];
+
+  if (msg.includes("today")) {
+    dates.push(new Date(today));
+  }
 
   if (msg.includes("tomorrow")) {
     const d = new Date(today);
     d.setDate(d.getDate() + 1);
-    return d;
+    dates.push(d);
   }
 
   const days = {
@@ -107,10 +111,25 @@ function detectDate(message) {
   };
 
   for (const day in days) {
-    if (msg.includes(day)) return getNextDay(days[day]);
+    if (msg.includes(day)) {
+      dates.push(getNextDay(days[day]));
+    }
   }
 
-  return today;
+  if (dates.length === 0) {
+    dates.push(today);
+  }
+
+  return dates;
+}
+
+function formatDateLabel(date) {
+  return date.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    timeZone: TIME_ZONE,
+  });
 }
 
 function isCalendarQuestion(message) {
@@ -148,20 +167,31 @@ async function getCalendarForDate(date) {
 
   const data = await res.json();
 
-  if (!data.events || data.events.length === 0) {
-    return "No events scheduled.";
+  if (data.error) {
+    return {
+      label: formatDateLabel(date),
+      text: `Calendar error: ${data.error}`,
+    };
   }
 
-  return data.events
-    .map((e) => {
-      const location = e.location ? ` — ${e.location}` : "";
-      return `${e.time} — ${e.title}${location}`;
+  if (!data.events || data.events.length === 0) {
+    return {
+      label: formatDateLabel(date),
+      text: "No events scheduled.",
+    };
+  }
+
+  const text = data.events
+    .map((event) => {
+      const location = event.location ? ` — ${event.location}` : "";
+      return `${event.time} — ${event.title}${location}`;
     })
     .join("\n");
-}
 
-async function getTodayCalendar() {
-  return await getCalendarForDate(new Date());
+  return {
+    label: formatDateLabel(date),
+    text,
+  };
 }
 
 export async function POST(req) {
@@ -169,7 +199,6 @@ export async function POST(req) {
     const { message } = await req.json();
 
     const currentMemory = await getMemory();
-
     await saveOrUpdateMemory(message, currentMemory);
 
     const updatedMemory = await getMemory();
@@ -178,14 +207,18 @@ export async function POST(req) {
         ? updatedMemory.map((m) => `- ${m.content}`).join("\n")
         : "No saved memory yet.";
 
-    let calendarContext = "";
-
     if (isCalendarQuestion(message)) {
-      const date = detectDate(message);
-      calendarContext = await getCalendarForDate(date);
-    } else {
-      calendarContext = await getTodayCalendar();
+      const dates = getDetectedDates(message);
+      const schedules = await Promise.all(dates.map(getCalendarForDate));
+
+      const reply = schedules
+        .map((schedule) => `${schedule.label} Schedule\n\n${schedule.text}`)
+        .join("\n\n---\n\n");
+
+      return Response.json({ reply });
     }
+
+    const todaySchedule = await getCalendarForDate(new Date());
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -195,54 +228,22 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's executive assistant.
 
-You have access to:
-
-MEMORY:
+Memory:
 ${memoryText}
 
-CALENDAR:
-${calendarContext}
+Today's calendar:
+${todaySchedule.label} Schedule
+${todaySchedule.text}
 
 Rules:
-
-1. If the user asks about their schedule:
-- DO NOT rewrite or reformat the schedule
-- DO NOT add markdown (no **, no bullets)
-- DO NOT summarize unless asked
-- JUST return the schedule exactly as provided
-- Optionally add a short title like:
-  "Tomorrow" or "Monday"
-
-2. If the user asks a personal question:
-- Use MEMORY
-- Answer directly
-
-3. Be concise:
-- No filler
-- No “your schedule includes”
-- No explanations unless asked
-
-4. Tone:
-- Professional
-- Direct
-- Like a real assistant, not an AI
-`
-
-MEMORY:
-${memoryText}
-
-TODAY / REQUESTED CALENDAR:
-${calendarContext}
-
-Rules:
-- Use memory for personal facts.
-- Use calendar for schedule questions.
-- If Brad asks about his day, summarize clearly.
-- If there is a next event, mention it when helpful.
-- Never say you don't have calendar access if calendar data is provided.
-- Be direct, practical, and concise.
-- Think ahead like an executive assistant.
-- Suggest next steps only when useful.
+- Use memory for personal questions.
+- Use calendar only when relevant.
+- Never say you do not have access to memory if memory is provided.
+- Never say you do not have calendar access if calendar data is provided.
+- Be direct, concise, and practical.
+- No markdown unless Brad asks for it.
+- No bold formatting.
+- Act like a real assistant, not an AI.
           `,
         },
         { role: "user", content: message },

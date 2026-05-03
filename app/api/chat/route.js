@@ -18,12 +18,16 @@ async function getTodayCalendar() {
 
     const formatted = data.events
       .map((e) => {
-        const time = e.start
-          ? new Date(e.start).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : "All day";
+        if (!e.start) return e.title;
+
+        const date = new Date(e.start);
+
+        const time = date.toLocaleTimeString("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: true,
+          timeZone: "America/Phoenix", // 🔥 FIXED TIMEZONE
+        });
 
         return `${time} — ${e.title}`;
       })
@@ -57,7 +61,7 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's AI assistant.
 
-If calendar data is provided, use it to answer clearly.
+When given a schedule, list events clearly with correct times.
 
 Calendar:
 ${calendarContext}

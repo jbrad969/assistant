@@ -1,54 +1,49 @@
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 
-const client = new OpenAI({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-let conversationMemory = [];
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 export async function POST(req) {
   const { message } = await req.json();
 
-  conversationMemory.push({
+  await supabase.from("messages").insert({
     role: "user",
     content: message,
   });
 
-  const completion = await client.chat.completions.create({
+  const { data: previousMessages } = await supabase
+    .from("messages")
+    .select("role, content")
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  const memory = (previousMessages || []).reverse();
+
+  const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
       {
         role: "system",
-        content: `
-You are Jess, Brad's personal AI assistant.
-
-You help Brad manage his day, business, schedule, leads, reminders, and decisions.
-
-Be:
-- direct
-- practical
-- concise
-- proactive
-
-Brad values speed, clarity, and useful next steps.
-
-Remember the conversation context when replying.
-        `,
+        content:
+          "You are Jess, Brad's personal AI assistant. Be direct, practical, concise, and proactive. Help Brad with his day, business, schedule, leads, reminders, and decisions.",
       },
-      ...conversationMemory,
+      ...memory,
     ],
   });
 
   const reply = completion.choices[0].message.content;
 
-  conversationMemory.push({
+  await supabase.from("messages").insert({
     role: "assistant",
     content: reply,
   });
 
-  conversationMemory = conversationMemory.slice(-20);
-
-  return Response.json({
-    reply,
-  });
+  return Response.json({ reply });
 }

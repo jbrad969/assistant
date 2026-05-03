@@ -20,6 +20,11 @@ function toAnthropicHistory(history) {
     .map((m) => ({ role: m.role, content: m.content }));
 }
 
+function cleanResponse(text) {
+  if (!text) return text;
+  return text.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "").trim();
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -38,18 +43,116 @@ Never assume Brad is hosting an event just because the location shows a Scottsda
 
 /* ---------------- MEMORY ---------------- */
 
-async function getMemory() {
+const MEMORY_CAP = 500;
+const INJECTION_CAP = 40;
+const RECENT_NONCORE_CAP = 20;
+
+const STOPWORDS = new Set([
+  "the","a","an","and","or","but","for","to","of","in","on","at","is","are","was","were",
+  "be","been","being","have","has","had","do","does","did","will","would","could","should",
+  "may","might","must","can","i","you","he","she","it","we","they","what","who","where",
+  "when","why","how","this","that","these","those","my","your","his","her","its","our",
+  "their","me","him","us","them","with","from","by","up","out","over","into","then","than",
+  "so","as","also","just","only","too","very","much","many","some","all","any","no","not",
+  "yes","ok","okay","please","thanks","thank","let","get","got","ask","asked","tell","told",
+]);
+
+function extractKeywords(message) {
+  if (!message) return [];
+  return message
+    .toLowerCase()
+    .split(/\W+/)
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+}
+
+function isCoreMemory(m) {
+  return m?.content?.startsWith("[CORE]");
+}
+
+function stripTag(content) {
+  return content.replace(/^\[(?:CORE|LOG)\]\s*/, "");
+}
+
+async function insertMemoryWithCap(content) {
+  const { count } = await supabase
+    .from("memory")
+    .select("*", { count: "exact", head: true });
+
+  if ((count ?? 0) >= MEMORY_CAP) {
+    const { data: oldest } = await supabase
+      .from("memory")
+      .select("id")
+      .not("content", "ilike", "[CORE]%")
+      .order("created_at", { ascending: true })
+      .limit(1);
+
+    if (oldest && oldest[0]) {
+      await supabase.from("memory").delete().eq("id", oldest[0].id);
+    } else {
+      console.log("[memory] cap reached but no non-CORE memories to evict");
+    }
+  }
+
+  await supabase.from("memory").insert([{ content }]);
+}
+
+async function getCoreMemory() {
   const { data } = await supabase
     .from("memory")
     .select("id, content")
+    .ilike("content", "[CORE]%")
     .order("created_at", { ascending: true });
   return data || [];
+}
+
+async function getInjectionMemory(message) {
+  const { data } = await supabase
+    .from("memory")
+    .select("id, content, created_at")
+    .order("created_at", { ascending: false });
+  const all = data || [];
+
+  const core = all.filter(isCoreMemory);
+  const nonCore = all.filter((m) => !isCoreMemory(m));
+
+  const keywords = extractKeywords(message);
+  const matchesKeyword = (m) =>
+    keywords.length > 0 &&
+    keywords.some((k) => m.content.toLowerCase().includes(k));
+
+  const result = new Map();
+
+  // 1. All CORE memories (under-50 in practice; capped by INJECTION_CAP)
+  for (const m of core) {
+    if (result.size >= INJECTION_CAP) break;
+    result.set(m.id, m);
+  }
+
+  // 2. Non-CORE memories whose content matches a keyword from Brad's message
+  for (const m of nonCore) {
+    if (result.size >= INJECTION_CAP) break;
+    if (result.has(m.id)) continue;
+    if (matchesKeyword(m)) result.set(m.id, m);
+  }
+
+  // 3. 20 most-recent non-CORE memories (already sorted desc by created_at)
+  let recentCount = 0;
+  for (const m of nonCore) {
+    if (result.size >= INJECTION_CAP) break;
+    if (recentCount >= RECENT_NONCORE_CAP) break;
+    if (!result.has(m.id)) {
+      result.set(m.id, m);
+      recentCount += 1;
+    }
+  }
+
+  return Array.from(result.values());
 }
 
 async function saveOrUpdateMemory(message, currentMemory) {
   const memoryText =
     currentMemory.length > 0
-      ? currentMemory.map((m) => `ID: ${m.id} | ${m.content}`).join("\n")
+      ? currentMemory.map((m) => `ID: ${m.id} | ${stripTag(m.content)}`).join("\n")
       : "No memory yet.";
 
   const result = await openai.chat.completions.create({
@@ -59,7 +162,7 @@ async function saveOrUpdateMemory(message, currentMemory) {
       {
         role: "system",
         content: `
-You manage Jess's long-term memory for Brad.
+You manage Jess's long-term memory for Brad. The memories below are personal facts (CORE).
 
 Existing memory:
 ${memoryText}
@@ -72,10 +175,10 @@ Return JSON only:
 }
 
 Rules:
-- Save personal facts, preferences, names, important details.
-- Do not save questions.
-- Do not duplicate.
-- Update if changed.
+- Save personal facts, preferences, names, addresses, key people, company info.
+- Do not save questions, action logs, or transient details.
+- Do not duplicate — use update if an existing fact has changed.
+- Content must be the bare fact, no tag prefix (the system tags it automatically).
         `,
       },
       { role: "user", content: message },
@@ -85,13 +188,22 @@ Rules:
   const action = JSON.parse(result.choices[0].message.content);
 
   if (action.action === "insert" && action.content) {
-    await supabase.from("memory").insert([{ content: action.content }]);
+    const tagged = action.content.startsWith("[CORE]")
+      ? action.content
+      : `[CORE] ${action.content}`;
+    await insertMemoryWithCap(tagged);
   }
 
   if (action.action === "update" && action.id && action.content) {
+    const existing = currentMemory.find((m) => String(m.id) === String(action.id));
+    const existingTag =
+      existing?.content.match(/^\[(?:CORE|LOG)\]/)?.[0] || "[CORE]";
+    const tagged = action.content.startsWith("[")
+      ? action.content
+      : `${existingTag} ${action.content}`;
     await supabase
       .from("memory")
-      .update({ content: action.content })
+      .update({ content: tagged })
       .eq("id", action.id);
   }
 }
@@ -713,14 +825,22 @@ export async function POST(req) {
   try {
     const { message, history = [] } = await req.json();
 
-    // MEMORY UPDATE
-    const currentMemory = await getMemory();
-    await saveOrUpdateMemory(message, currentMemory);
+    const today = new Date().toLocaleDateString("en-US", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: TIME_ZONE,
+    });
 
-    const updatedMemory = await getMemory();
+    // MEMORY UPDATE
+    const coreMemoryForDedup = await getCoreMemory();
+    await saveOrUpdateMemory(message, coreMemoryForDedup);
+
+    const injectionMemory = await getInjectionMemory(message);
     const memoryText =
-      updatedMemory.length > 0
-        ? updatedMemory.map((m) => `- ${m.content}`).join("\n")
+      injectionMemory.length > 0
+        ? injectionMemory.map((m) => `- ${stripTag(m.content)}`).join("\n")
         : "";
 
     // QUOTE REQUEST
@@ -836,6 +956,13 @@ export async function POST(req) {
         });
       }
 
+      try {
+        const memoryContent = `[LOG] Updated ${event.title} ${req.field} to ${info.value} on ${today}`;
+        await insertMemoryWithCap(memoryContent);
+      } catch (memErr) {
+        console.log("[chat] couldn't save update memory:", memErr.message);
+      }
+
       return Response.json({
         reply: `Done — updated "${event.title}" ${req.field} to ${info.value} (from ${req.personName}'s email).`,
       });
@@ -906,7 +1033,7 @@ No markdown. Be concise.`,
         ],
       });
 
-      return Response.json({ reply: completion.content?.[0]?.text || "" });
+      return Response.json({ reply: cleanResponse(completion.content?.[0]?.text || "") });
     }
 
     // EMAIL
@@ -939,7 +1066,7 @@ No markdown. Be concise.`,
       });
 
       return Response.json({
-        reply: completion.content?.[0]?.text || "",
+        reply: cleanResponse(completion.content?.[0]?.text || ""),
       });
     }
 
@@ -1154,7 +1281,7 @@ Brad asked: "${message}"`,
         ],
       });
 
-      return Response.json({ reply: completion.content?.[0]?.text || "" });
+      return Response.json({ reply: cleanResponse(completion.content?.[0]?.text || "") });
     }
 
     // CALENDAR
@@ -1170,6 +1297,7 @@ Brad asked: "${message}"`,
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system: `You are Jess, Brad's executive assistant.
+Today is ${today}. Always use this as your reference for current date. Never reference events from wrong years.
 Rules:
 - Be direct and conversational, like a real assistant briefing their boss
 - Summarize the schedule naturally, don't just list it robotically
@@ -1187,7 +1315,7 @@ Rules:
       });
 
       return Response.json({
-        reply: completion.content?.[0]?.text || "",
+        reply: cleanResponse(completion.content?.[0]?.text || ""),
       });
     }
 
@@ -1196,6 +1324,8 @@ Rules:
       model: CLAUDE_MODEL,
       max_tokens: 1024,
       system: `You are Jess, Brad's executive assistant.
+
+Today is ${today}. Always use this as your reference for current date. Never reference events from wrong years.
 
 ${KNOWN_LOCATIONS_CONTEXT}
 
@@ -1228,7 +1358,7 @@ Brad is busy. Every unnecessary question wastes his time.`,
     });
 
     return Response.json({
-      reply: completion.content?.[0]?.text || "",
+      reply: cleanResponse(completion.content?.[0]?.text || ""),
     });
   } catch (error) {
     return Response.json({

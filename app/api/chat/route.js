@@ -14,7 +14,32 @@ export async function POST(req) {
   try {
     const { message } = await req.json();
 
-    // 1. Load memory (facts only)
+    const factCheck = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `
+Extract a clear personal fact from the user's message.
+
+Examples:
+"my dogs name is frank" -> "Dog name: Frank"
+"my dog's name is frank" -> "Dog name: Frank"
+"my favorite color is blue" -> "Favorite color: Blue"
+
+If no fact exists, return EXACTLY: NONE
+          `,
+        },
+        { role: "user", content: message },
+      ],
+    });
+
+    const fact = factCheck.choices[0].message.content.trim();
+
+    if (fact !== "NONE") {
+      await supabase.from("memory").insert([{ content: fact }]);
+    }
+
     const { data: memories } = await supabase
       .from("memory")
       .select("content");
@@ -22,7 +47,6 @@ export async function POST(req) {
     const memoryText =
       memories?.map((m) => `- ${m.content}`).join("\n") || "";
 
-    // 2. Ask AI (with memory)
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -31,73 +55,24 @@ export async function POST(req) {
           content: `
 You are Jess, Brad's AI assistant.
 
-You have stored facts about Brad.
-
-RULES:
-- Facts are ALWAYS correct.
-- NEVER guess.
-- If the answer is not in memory, say you don't know.
-- Do NOT invent answers.
+Use stored facts as truth.
+Never guess.
+If a fact exists in memory, answer directly.
 
 Facts:
 ${memoryText}
           `,
         },
-        {
-          role: "user",
-          content: message,
-        },
+        { role: "user", content: message },
       ],
     });
 
     const reply = completion.choices[0].message.content;
 
-    // 3. Extract fact (SMART version)
-    const factCheck = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `
-You extract facts from user messages.
-
-Be flexible with spelling and grammar.
-
-Examples:
-"my dog's name is frank" → "Dog name: Frank"
-"my dogs name is frank" → "Dog name: Frank"
-"dog is frank" → "Dog name: Frank"
-"i have a dog named frank" → "Dog name: Frank"
-"my favorite color is blue" → "Favorite color: Blue"
-
-Rules:
-- Normalize messy input
-- Extract ONLY clear personal facts
-- Capitalize values properly
-- If no clear fact, return EXACTLY: NONE
-          `,
-        },
-        {
-          role: "user",
-          content: message,
-        },
-      ],
-    });
-
-    const fact = factCheck.choices[0].message.content.trim();
-
-    // 4. Save ONLY valid facts
-    if (fact && fact !== "NONE") {
-      await supabase.from("memory").insert([
-        { content: fact },
-      ]);
-    }
-
     return Response.json({ reply });
   } catch (err) {
-    console.error(err);
     return Response.json(
-      { reply: "Jess had an issue." },
+      { reply: "Jess had an issue: " + err.message },
       { status: 500 }
     );
   }

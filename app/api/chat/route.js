@@ -197,16 +197,45 @@ export async function POST(req) {
         ? updatedMemory.map((m) => `- ${m.content}`).join("\n")
         : "";
 
-    // CALENDAR (NO AI — DIRECT RESPONSE)
+    // CALENDAR — fetch data then let GPT narrate it
     if (isCalendarQuestion(message)) {
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendarForDate));
 
-      const reply = schedules
-        .map((s) => `${s.label}\n\n${s.text}`)
+      const calendarContext = schedules
+        .map((s) => `${s.label}:\n${s.text}`)
         .join("\n\n");
 
-      return Response.json({ reply });
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `
+You are Jess, Brad's executive assistant.
+
+Memory:
+${memoryText}
+
+Rules:
+- Be direct and conversational, like a real assistant briefing their boss
+- Summarize the schedule naturally, don't just list it robotically
+- Mention the time and title of each event
+- If there's a location, mention it naturally
+- No markdown formatting
+- Keep it tight — Brad is busy
+            `,
+          },
+          {
+            role: "user",
+            content: `Here is Brad's calendar data:\n\n${calendarContext}\n\nHis question was: "${message}"`,
+          },
+        ],
+      });
+
+      return Response.json({
+        reply: completion.choices[0].message.content,
+      });
     }
 
     // NORMAL CHAT (USES MEMORY + HISTORY)

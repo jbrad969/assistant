@@ -1,143 +1,51 @@
 import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
 
-const client = new OpenAI({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const TIME_ZONE = "America/Phoenix";
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-function getNextDay(dayIndex) {
-  const today = new Date();
-  const result = new Date(today);
-  const diff = (dayIndex + 7 - today.getDay()) % 7 || 7;
-  result.setDate(today.getDate() + diff);
-  return result;
-}
+async function getMemory() {
+  const { data, error } = await supabase
+    .from("memory")
+    .select("content");
 
-function getDetectedDates(message) {
-  const msg = message.toLowerCase();
-  const today = new Date();
-  const dates = [];
+  if (error || !data) return "";
 
-  if (msg.includes("today")) dates.push(new Date(today));
-
-  if (msg.includes("tomorrow")) {
-    const d = new Date(today);
-    d.setDate(d.getDate() + 1);
-    dates.push(d);
-  }
-
-  const days = {
-    sunday: 0,
-    monday: 1,
-    tuesday: 2,
-    wednesday: 3,
-    thursday: 4,
-    friday: 5,
-    saturday: 6,
-  };
-
-  for (const day in days) {
-    if (msg.includes(day)) {
-      dates.push(getNextDay(days[day]));
-    }
-  }
-
-  if (dates.length === 0) dates.push(today);
-
-  return dates;
-}
-
-function formatDateLabel(date) {
-  return date.toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "short",
-    day: "numeric",
-    timeZone: TIME_ZONE,
-  });
-}
-
-function isCalendarQuestion(message) {
-  const msg = message.toLowerCase();
-
-  return (
-    msg.includes("schedule") ||
-    msg.includes("calendar") ||
-    msg.includes("today") ||
-    msg.includes("tomorrow") ||
-    msg.includes("monday") ||
-    msg.includes("tuesday") ||
-    msg.includes("wednesday") ||
-    msg.includes("thursday") ||
-    msg.includes("friday") ||
-    msg.includes("saturday") ||
-    msg.includes("sunday") ||
-    msg.includes("morning") ||
-    msg.includes("afternoon") ||
-    msg.includes("evening")
-  );
-}
-
-async function getCalendarForDate(date) {
-  const iso = date.toISOString();
-
-  const res = await fetch(
-    `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(
-      iso
-    )}`
-  );
-
-  const data = await res.json();
-
-  if (data.error) {
-    return {
-      label: formatDateLabel(date),
-      text: `Calendar error: ${data.error}`,
-    };
-  }
-
-  if (!data.events || data.events.length === 0) {
-    return {
-      label: formatDateLabel(date),
-      text: "No events scheduled.",
-    };
-  }
-
-  const text = data.events
-    .map((event) => {
-      const location = event.location ? ` — ${event.location}` : "";
-      return `${event.time} — ${event.title}${location}`;
-    })
-    .join("\n");
-
-  return {
-    label: formatDateLabel(date),
-    text,
-  };
+  return data.map((m) => m.content).join("\n");
 }
 
 export async function POST(req) {
   try {
     const { message } = await req.json();
 
-    if (isCalendarQuestion(message)) {
-      const dates = getDetectedDates(message);
-      const schedules = await Promise.all(dates.map(getCalendarForDate));
+    const memory = await getMemory();
 
-      const reply = schedules
-        .map((schedule) => `${schedule.label} Schedule\n\n${schedule.text}`)
-        .join("\n\n---\n\n");
-
-      return Response.json({ reply });
-    }
-
-    const completion = await client.chat.completions.create({
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content:
-            "You are Jess, Brad's AI assistant. Be direct, concise, practical, and helpful.",
+          content: `
+You are Jess, Brad's AI assistant.
+
+You have access to Brad's personal memory.
+
+Memory:
+${memory}
+
+Use this memory to answer personal questions like:
+- dog's name
+- preferences
+- personal info
+
+Be confident and direct.
+          `,
         },
         {
           role: "user",

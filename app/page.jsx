@@ -12,8 +12,8 @@ export default function Page() {
   async function sendMessage() {
     if (!input.trim() || loading) return;
 
-    const userMessage = { role: "user", content: input };
-    setMessages((prev) => [...prev, userMessage]);
+    const userText = input;
+    setMessages((prev) => [...prev, { role: "user", content: userText }]);
     setInput("");
     setLoading(true);
 
@@ -21,19 +21,22 @@ export default function Page() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: input }),
+        body: JSON.stringify({ message: userText }),
       });
 
       const data = await res.json();
 
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: data.reply || "Jess had an issue." },
+        {
+          role: "assistant",
+          content: data.reply || data.error || "Jess had an issue.",
+        },
       ]);
-    } catch {
+    } catch (error) {
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: data.error || "Jess could not connect. Try again." },
+        { role: "assistant", content: "Browser error: " + error.message },
       ]);
     }
 
@@ -44,22 +47,20 @@ export default function Page() {
     <main style={{ maxWidth: 800, margin: "0 auto", padding: 24 }}>
       <h1>Jess AI 🚀</h1>
 
-      <div style={{ marginTop: 24 }}>
-        {messages.map((msg, index) => (
-          <div
-            key={index}
-            style={{
-              marginBottom: 12,
-              padding: 14,
-              borderRadius: 10,
-              background: msg.role === "user" ? "#dff0ff" : "#f2f2f2",
-            }}
-          >
-            <strong>{msg.role === "user" ? "Brad" : "Jess"}:</strong>{" "}
-            {msg.content}
-          </div>
-        ))}
-      </div>
+      {messages.map((msg, index) => (
+        <div
+          key={index}
+          style={{
+            marginBottom: 12,
+            padding: 14,
+            borderRadius: 10,
+            background: msg.role === "user" ? "#dff0ff" : "#f2f2f2",
+          }}
+        >
+          <strong>{msg.role === "user" ? "Brad" : "Jess"}:</strong>{" "}
+          {msg.content}
+        </div>
+      ))}
 
       {loading && <p>Jess is thinking...</p>}
 

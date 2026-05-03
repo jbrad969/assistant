@@ -321,6 +321,51 @@ const styles = `
     opacity: 0.3;
     cursor: not-allowed;
   }
+
+  .mic-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid #2a2a2a;
+    color: #888;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    flex-shrink: 0;
+    padding: 0;
+  }
+
+  .mic-btn:hover {
+    background: #1a1a1a;
+    color: #fff;
+    border-color: #333;
+  }
+
+  .mic-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .mic-btn.listening {
+    background: #ff3b3b;
+    color: #fff;
+    border-color: #ff3b3b;
+    animation: mic-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes mic-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 0 rgba(255, 59, 59, 0.7);
+      transform: scale(1);
+    }
+    50% {
+      box-shadow: 0 0 0 10px rgba(255, 59, 59, 0);
+      transform: scale(1.05);
+    }
+  }
 `;
 
 export default function Page() {
@@ -333,7 +378,10 @@ export default function Page() {
   const [memories, setMemories] = useState([]);
   const [editingId, setEditingId] = useState(null);
   const [editingText, setEditingText] = useState("");
+  const [isListening, setIsListening] = useState(false);
   const bottomRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const voiceRef = useRef(null);
 
   async function loadMemory() {
     const res = await fetch("/api/memory");
@@ -357,10 +405,12 @@ export default function Page() {
       });
 
       const data = await res.json();
+      const reply = data.reply || "Jess had an issue.";
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: data.reply || "Jess had an issue." },
+        { role: "assistant", content: reply },
       ]);
+      speak(reply);
       loadMemory();
     } catch (error) {
       setMessages((prev) => [
@@ -393,6 +443,86 @@ export default function Page() {
   }
 
   useEffect(() => { loadMemory(); }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+
+      recognition.onresult = (event) => {
+        let transcript = "";
+        for (let i = 0; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+        }
+        setInput(transcript);
+      };
+      recognition.onend = () => setIsListening(false);
+      recognition.onerror = () => setIsListening(false);
+
+      recognitionRef.current = recognition;
+    }
+
+    function pickVoice() {
+      const voices = window.speechSynthesis?.getVoices() || [];
+      if (!voices.length) return;
+      const preferred = [
+        "Google US English",
+        "Samantha",
+        "Microsoft Aria Online (Natural) - English (United States)",
+        "Microsoft Jenny Online (Natural) - English (United States)",
+        "Microsoft Zira - English (United States)",
+        "Microsoft Zira Desktop - English (United States)",
+      ];
+      let voice = voices.find((v) => preferred.includes(v.name));
+      if (!voice) voice = voices.find((v) => /female|samantha|zira|aria|jenny/i.test(v.name));
+      if (!voice) voice = voices.find((v) => v.lang?.startsWith("en"));
+      voiceRef.current = voice || voices[0];
+    }
+    pickVoice();
+    if (window.speechSynthesis) {
+      window.speechSynthesis.onvoiceschanged = pickVoice;
+    }
+
+    return () => {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    };
+  }, []);
+
+  function speak(text) {
+    if (typeof window === "undefined" || !window.speechSynthesis || !text) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    if (voiceRef.current) utterance.voice = voiceRef.current;
+    utterance.rate = 1;
+    utterance.pitch = 1.05;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function toggleListening() {
+    if (!recognitionRef.current) {
+      alert("Voice input isn't supported in this browser. Try Chrome or Edge.");
+      return;
+    }
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    setInput("");
+    try {
+      recognitionRef.current.start();
+      setIsListening(true);
+    } catch (e) {
+      setIsListening(false);
+    }
+  }
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -514,8 +644,22 @@ export default function Page() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-              placeholder="Ask Jess..."
+              placeholder={isListening ? "Listening..." : "Ask Jess..."}
             />
+            <button
+              type="button"
+              className={`mic-btn ${isListening ? "listening" : ""}`}
+              onClick={toggleListening}
+              aria-label={isListening ? "Stop listening" : "Start voice input"}
+              title={isListening ? "Stop listening" : "Start voice input"}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+                <line x1="8" y1="23" x2="16" y2="23" />
+              </svg>
+            </button>
             <button
               className="send-btn"
               onClick={sendMessage}

@@ -606,14 +606,17 @@ No markdown. Be concise.`,
 
     // DEPARTURE
     if (isDepartureQuestion(message)) {
+      console.log("[chat] departure detected for message:", message);
       let data;
       try {
         const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/departure`);
         data = await res.json();
+        console.log("[chat] departure response:", JSON.stringify(data));
         if (!res.ok && !data?.error) {
           data = { error: `departure API returned status ${res.status}` };
         }
       } catch (fetchErr) {
+        console.log("[chat] departure fetch threw:", fetchErr.message);
         return Response.json({
           reply: `I couldn't reach the maps service: ${fetchErr.message}`,
         });
@@ -643,21 +646,23 @@ No markdown. Be concise.`,
           {
             role: "system",
             content: `You are Jess, Brad's executive assistant.
-Narrate departure timing naturally and conversationally — like a real assistant briefing him.
-Mention drive time, traffic delay (only if it's adding meaningful time), and where he's going.
-If he needs to leave now or in under a couple minutes, lead with that urgency.
-Keep it tight. No markdown.`,
+Narrate departure timing naturally — like a real assistant briefing him.
+USE THESE EXACT NUMBERS — do not estimate, recompute, or do math. Use the values verbatim.
+
+Rules:
+- Lead with WHEN to leave, using "Friendly departure time" verbatim (e.g., "right now", "in 12 minutes", "tomorrow at 8:35 AM").
+- State the drive time in minutes. State the traffic delay only if it is 5 minutes or more.
+- Mention the destination by event title and/or location.
+- One or two sentences. No markdown. No bullet lists.`,
           },
           {
             role: "user",
             content: `Departure data:
 - Next event: "${data.event.title}" at ${eventTimeLabel} at ${data.event.location}
+- Friendly departure time: ${data.friendlyDepartureTime}
 - Drive time with current traffic: ${data.driveTimeMinutes} minutes
 - Traffic delay vs normal: ${data.trafficDelayMinutes} minutes
 - Distance: ${data.distance || "unknown"}
-- Buffer time: ${data.bufferMinutes} minutes
-- Needs to leave now: ${data.needsToLeaveNow}
-- Minutes until he should leave: ${data.minutesUntilDeparture}
 - Origin: ${data.origin}
 
 Brad asked: "${message}"`,

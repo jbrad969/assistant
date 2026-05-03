@@ -19,6 +19,7 @@ export async function GET(req) {
     }
 
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    console.log("[maps] GOOGLE_MAPS_API_KEY present:", !!apiKey);
     if (!apiKey) {
       return Response.json(
         { error: "GOOGLE_MAPS_API_KEY is not configured" },
@@ -37,8 +38,10 @@ export async function GET(req) {
     });
 
     const url = `https://maps.googleapis.com/maps/api/distancematrix/json?${params.toString()}`;
+    console.log("[maps] requesting:", url.replace(apiKey, "***"));
     const res = await fetch(url);
     const data = await res.json();
+    console.log("[maps] status:", data.status, "element:", data.rows?.[0]?.elements?.[0]?.status);
 
     if (data.status !== "OK") {
       return Response.json(

@@ -290,11 +290,14 @@ function isDepartureQuestion(message) {
     "should i leave",
     "what time should i leave",
     "what time do i leave",
+    "time should i leave",
     "do i need to leave",
     "time to leave",
     "leave now",
     "leave for",
     "leave by",
+    "leave my house",
+    "how long until",
     "how long will it take",
     "how long would it take",
     "how long does it take",
@@ -314,8 +317,19 @@ function isDepartureQuestion(message) {
     "whats traffic",
     "am i going to be late",
     "going to be late",
+    "make it to",
+    "get there on time",
+    "get there in time",
   ];
   if (phrases.some((p) => msg.includes(p))) return true;
+
+  // "next appointment" / "next event" + any travel word always triggers
+  if (
+    /\bnext (appointment|event|meeting|job|stop)\b/.test(msg) &&
+    /\b(leave|get|drive|long|time|far|until)\b/.test(msg)
+  ) {
+    return true;
+  }
 
   // "from home" / "from the shop" combined with any travel context
   const fromKnown =
@@ -675,7 +689,7 @@ No markdown. Be concise.`,
       } catch (fetchErr) {
         console.log("[chat] departure fetch threw:", fetchErr.message);
         return Response.json({
-          reply: "I'm having trouble reaching Google Maps right now. Try again in a minute.",
+          reply: "I'm having trouble reaching Google Maps right now - try again in a moment.",
         });
       }
 
@@ -687,7 +701,7 @@ No markdown. Be concise.`,
       if (data.error) {
         console.log("[chat] departure surfaced error:", data.error);
         return Response.json({
-          reply: "I'm having trouble reaching Google Maps right now. Try again in a minute.",
+          reply: "I'm having trouble reaching Google Maps right now - try again in a moment.",
         });
       }
 

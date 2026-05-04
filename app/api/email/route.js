@@ -43,24 +43,29 @@ function decodeBody(payload) {
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
-    const limit = searchParams.get("limit") || "5";
+    const explicitLimit = searchParams.get("limit");
     const all = searchParams.get("all") === "true";
     const search = searchParams.get("search");
     const fullBody = searchParams.get("full") === "true";
     const recent = searchParams.get("recent") === "true";
 
+    // Search defaults to 20 (Brad usually wants historical context), inbox/recent
+    // peeks default to 5. Caller can always override via ?limit=.
+    const defaultLimit = search ? 20 : 5;
+    const limit = explicitLimit ? parseInt(explicitLimit) : defaultLimit;
+
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
-    // Default query is now in:inbox so "last email" / "recent email" requests
-    // return the newest message regardless of read state. recent=true forces
-    // the same behavior even if a caller passes other flags.
-    const query = search || (recent ? "in:inbox" : "in:inbox");
+    // Default query is in:inbox so peeks return the newest message regardless of
+    // read state. When the caller passes a search term we run it directly so it
+    // hits ALL mail (read + unread, all folders) — not just the inbox.
+    const query = search || "in:inbox";
 
     const listRes = await gmail.users.messages.list({
       userId: "me",
       q: query,
-      maxResults: all ? 50 : parseInt(limit),
+      maxResults: all ? 50 : limit,
     });
 
     const messages = listRes.data.messages || [];

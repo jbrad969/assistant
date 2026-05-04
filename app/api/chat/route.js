@@ -67,7 +67,10 @@ function isEmailRead(msg) {
     /\bany\s+emails?\s+from\b/.test(m) ||
     /\blast\s+emails?\b/.test(m) ||
     /\brecent\s+emails?\b/.test(m) ||
-    /\bwhat\s+emails?\b/.test(m)
+    /\bwhat\s+emails?\b/.test(m) ||
+    /\breach(?:ed)?\s+out\b/.test(m) ||
+    /\bemailed\s+(?:me|us)\b/.test(m) ||
+    /\bcontacted\s+(?:me|us)\b/.test(m)
   );
 }
 
@@ -722,21 +725,41 @@ export async function POST(req) {
 
     // 4. EMAIL READ
     if (isEmailRead(msg)) {
-      const searchMatch = msg.match(/from\s+(\w+)/);
-      const search = searchMatch ? `from:${searchMatch[1]}` : null;
-      const all = msg.includes("all");
       const lower = msg.toLowerCase();
+
+      // Person-specific search. "X reached out / emailed / contacted" → messages
+      // SENT by X (from + cc). Generic "from X" / "emails about X" widens to
+      // include messages where X was a recipient too.
+      const STOP = ["i", "you", "we", "they", "he", "she", "me", "us", "someone", "anyone", "the", "a"];
+      const reachMatch =
+        lower.match(/when\s+did\s+(\w+)\s+(?:last\s+)?(?:reach(?:ed)?\s+out|email(?:ed)?|message(?:d)?|contact(?:ed)?)/) ||
+        lower.match(/\b(\w+)\s+(?:last\s+)?(?:reached\s+out|emailed|messaged|contacted)\b/);
+      const fromMatch = msg.match(/\bfrom\s+(\w+)/i);
+
+      let search = null;
+      let searchedName = null;
+      if (reachMatch && !STOP.includes(reachMatch[1].toLowerCase())) {
+        searchedName = reachMatch[1];
+        search = `from:${searchedName} OR cc:${searchedName}`;
+      } else if (fromMatch && !STOP.includes(fromMatch[1].toLowerCase())) {
+        searchedName = fromMatch[1];
+        search = `from:${searchedName} OR cc:${searchedName} OR to:${searchedName}`;
+      }
+
+      const all = msg.includes("all");
       const recent =
         /\blast\s+emails?\b/.test(lower) ||
         /\bmost\s+recent\s+emails?\b/.test(lower) ||
         /\brecent\s+emails?\b/.test(lower) ||
         /\bwhat\s+did\s+i\s+just\s+get\b/.test(lower);
-      const limit = recent ? 1 : all ? 20 : 5;
+      // For person searches we want history, so fetch up to 20. For "last email"
+      // / "recent email" peeks we only need 1.
+      const limit = recent ? 1 : search ? 20 : all ? 20 : 5;
       const emails = await getEmails(search, limit, recent);
       if (emails.length === 0) {
         return Response.json({
-          reply: search
-            ? `No emails found from ${searchMatch[1]}.`
+          reply: searchedName
+            ? `No emails involving ${searchedName} found.`
             : recent
               ? "No emails in your inbox."
               : "No unread emails.",

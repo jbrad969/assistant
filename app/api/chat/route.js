@@ -889,14 +889,21 @@ async function handleCalendarRead(ctx) {
 
   const calendarContext = schedules
     .map((s) => {
-      const eventList =
-        s.events?.map((e) =>
-          `${e.time} — ${e.title}${e.location ? ` at ${e.location}` : ""}${
-            e.attendees?.length > 0
-              ? ` (attendees: ${e.attendees.map((a) => a.email).filter(Boolean).join(", ")})`
-              : ""
-          }`
-        ).join("\n") || s.text || "No events scheduled.";
+      if (!s.events || s.events.length === 0) {
+        return `${s.label}:\nNo events scheduled.`;
+      }
+      const eventList = s.events
+        .map((e) => {
+          const lines = [`${e.time} — ${e.title}`];
+          // Explicit "location: ..." line so Claude can read the field by name. Empty = "(none)".
+          lines.push(`  location: ${e.location && e.location.trim() ? e.location : "(none)"}`);
+          if (e.attendees?.length) {
+            const emails = e.attendees.map((a) => a.email).filter(Boolean).join(", ");
+            if (emails) lines.push(`  attendees: ${emails}`);
+          }
+          return lines.join("\n");
+        })
+        .join("\n");
       return `${s.label}:\n${eventList}`;
     })
     .join("\n\n");
@@ -913,6 +920,8 @@ Summarize the schedule naturally — time, title, and location. No markdown. Bri
 Calendar event locations are DESTINATIONS Brad is going to, never his home.
 Only mention events that appear in the Calendar data block below. If a day shows "No events scheduled.", say exactly that — never invent events.
 Show ALL events exactly as listed — if two events share the same start time (e.g. two 9:00 AM events), include BOTH separately. Never merge or hide same-time events.
+
+LOCATION RULE — When you need a location from a calendar event, it will be provided in the event data as 'location: [address]'. If location is empty (shown as 'location: (none)'), say "I don't see a location in that calendar event." NEVER invent or guess a location. NEVER. Use the address verbatim — never paraphrase, abbreviate, or substitute a venue name for the full address.
 
 When attendee emails are provided in the calendar data, use them exactly as shown. Never guess or construct email addresses. Nicole's emails for the Weekly Meeting are nicole@nerconsultingllc.com and nicole@solarfixaz.com.
 
@@ -1232,30 +1241,58 @@ async function handleDeparture(ctx) {
 
   const origin = detectOrigin(ctx.message);
   const dctx = await extractDepartureContext(ctx.message, ctx.history);
+  console.log("[chat] departure detected; origin:", origin, "ctx:", JSON.stringify(dctx));
 
-  // Fast path: history already has destination + time. Skip calendar lookup.
-  if (dctx.knownLocation && dctx.knownArrivalTime) {
-    const arrivalIso = buildPhoenixIsoFromTimeToday(dctx.knownArrivalTime);
-    const maps = await callMapsForDeparture({ origin, destination: dctx.knownLocation, arrivalIso });
+  // RULE — when Brad names a specific event, ALWAYS re-fetch the canonical event from the
+  // calendar API. Never use Claude's paraphrased "knownLocation" from history (it might be
+  // truncated like "Rudy's BBQ" instead of "Rudy's BBQ, 15257 N Northsight Blvd, Scottsdale, AZ 85260").
+  if (dctx.eventReference) {
+    const matches = await findEventByCriteria({ title: dctx.eventReference });
+    if (matches.length === 0) {
+      return reply(`I don't see a "${dctx.eventReference}" event on your calendar in the next 7 days.`);
+    }
+    // Pick the soonest future match.
+    const upcoming = matches
+      .filter((e) => new Date(e.start).getTime() > Date.now())
+      .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+    const event = upcoming[0] || matches[0];
+
+    if (!event.location || !event.location.trim()) {
+      return reply(
+        `I don't see a location in the "${event.title}" calendar event. What address should I route to?`
+      );
+    }
+
+    // Use Brad's explicit knownArrivalTime if he stated one, else the event's actual start.
+    const arrivalIso = dctx.knownArrivalTime
+      ? buildPhoenixIsoFromTimeToday(dctx.knownArrivalTime)
+      : new Date(event.start).toISOString();
+
+    const maps = await callMapsForDeparture({
+      origin,
+      destination: event.location, // canonical from calendar API; never modified
+      arrivalIso,
+    });
     if (maps.error) {
-      console.log("[chat] departure (history) maps error:", maps.error);
+      console.log("[chat] departure (named event) maps error:", maps.error);
       return reply("I'm having trouble reaching Google Maps right now - try again in a moment.");
     }
+
     const arrivalMs = new Date(arrivalIso).getTime();
     const driveMin = maps.driveTimeMinutes;
     const trafficMin = maps.trafficDelayMinutes;
     const departureMs = arrivalMs - (driveMin + 10) * 60 * 1000;
     const friendly = formatFriendlyDeparture(departureMs, Date.now());
     const trafficNote = trafficMin >= 5 ? ` Traffic is adding about ${trafficMin} minutes.` : "";
-    const eventLabel = dctx.eventReference ? `the ${dctx.eventReference}` : dctx.knownLocation;
-    return reply(`Leave ${friendly} to make ${eventLabel} — ${driveMin} minutes drive.${trafficNote}`);
+    return reply(
+      `Leave ${friendly} to make "${event.title}" at ${event.location} — ${driveMin} minutes drive.${trafficNote}`
+    );
   }
 
-  // Slow path: hit /api/departure (calendar + maps).
+  // No specific event — fall back to /api/departure (next-event lookup).
   let data;
   try {
     const params = new URLSearchParams({ origin });
-    if (dctx.eventReference) params.set("eventQuery", dctx.eventReference);
     const res = await fetch(`${BASE_URL}/api/departure?${params.toString()}`);
     data = await res.json();
     if (!res.ok && !data?.error) data = { error: `departure API returned ${res.status}` };

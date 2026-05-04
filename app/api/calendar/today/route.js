@@ -227,6 +227,22 @@ export async function POST(req) {
   }
 }
 
+async function logTokenScopes(auth) {
+  try {
+    const tokenResponse = await auth.getAccessToken();
+    const accessToken =
+      typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
+    if (accessToken) {
+      const tokenInfo = await auth.getTokenInfo(accessToken);
+      console.log("Token scopes:", tokenInfo.scopes);
+    } else {
+      console.log("Token scopes: (no access token resolved)");
+    }
+  } catch (e) {
+    console.log("Token info check failed:", e.message);
+  }
+}
+
 export async function DELETE(req) {
   try {
     const { eventId } = await req.json();
@@ -234,14 +250,35 @@ export async function DELETE(req) {
       return Response.json({ error: "eventId is required" }, { status: 400 });
     }
 
+    console.log("Attempting DELETE for event ID:", eventId);
+    console.log("Calendar ID: primary");
+
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
+    await logTokenScopes(auth);
 
-    await calendar.events.delete({ calendarId: "primary", eventId });
+    const deleteResult = await calendar.events.delete({
+      calendarId: "primary",
+      eventId,
+    });
+    console.log(
+      "DELETE result:",
+      JSON.stringify({ status: deleteResult.status, statusText: deleteResult.statusText, data: deleteResult.data })
+    );
 
     return Response.json({ success: true });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    console.log(
+      "DELETE FAILED:",
+      error.message,
+      "| code:", error.code,
+      "| errors:", JSON.stringify(error.errors),
+      "| response:", JSON.stringify(error.response?.data)
+    );
+    return Response.json(
+      { error: error.message, code: error.code, details: error.errors || error.response?.data },
+      { status: 500 }
+    );
   }
 }
 
@@ -252,27 +289,52 @@ export async function PATCH(req) {
       return Response.json({ error: "eventId is required" }, { status: 400 });
     }
 
-    const requestBody = {};
-    if (title) requestBody.summary = title;
-    if (location !== undefined) requestBody.location = location || null;
-    if (start?.date && start?.time) requestBody.start = buildDateTime(start);
+    const updateBody = {};
+    if (title) updateBody.summary = title;
+    if (location !== undefined) updateBody.location = location || null;
+    if (start?.date && start?.time) updateBody.start = buildDateTime(start);
     if (end?.date && end?.time) {
-      requestBody.end = buildDateTime(end);
+      updateBody.end = buildDateTime(end);
     } else if (start?.date && start?.time && durationMinutes) {
-      requestBody.end = buildDateTime(addMinutes(start, durationMinutes));
+      updateBody.end = buildDateTime(addMinutes(start, durationMinutes));
     }
+
+    console.log("Attempting PATCH for event ID:", eventId);
+    console.log("PATCH body:", JSON.stringify(updateBody));
 
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
+    await logTokenScopes(auth);
 
-    const result = await calendar.events.patch({
+    const patchResult = await calendar.events.patch({
       calendarId: "primary",
       eventId,
-      requestBody,
+      requestBody: updateBody,
     });
+    console.log(
+      "PATCH result:",
+      JSON.stringify({
+        status: patchResult.status,
+        statusText: patchResult.statusText,
+        id: patchResult.data?.id,
+        updated: patchResult.data?.updated,
+        start: patchResult.data?.start,
+        end: patchResult.data?.end,
+      })
+    );
 
-    return Response.json({ success: true, eventId: result.data.id });
+    return Response.json({ success: true, eventId: patchResult.data.id });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    console.log(
+      "PATCH FAILED:",
+      error.message,
+      "| code:", error.code,
+      "| errors:", JSON.stringify(error.errors),
+      "| response:", JSON.stringify(error.response?.data)
+    );
+    return Response.json(
+      { error: error.message, code: error.code, details: error.errors || error.response?.data },
+      { status: 500 }
+    );
   }
 }

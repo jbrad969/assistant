@@ -20,7 +20,17 @@ const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
 const HOME_ADDRESS = "4139 East Desert Sands Place Chandler AZ";
 const SHOP_ADDRESS = "4211 East Elwood Street Phoenix AZ";
 
-const DAYS_PATTERN = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+const DAYS_PATTERN = /\b(today|tomorrow|sunday|sun|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat)\b/i;
+
+const DAY_NAME_TO_INDEX = [
+  { regex: /\bsunday\b|\bsun\b/i,                     idx: 0 },
+  { regex: /\bmonday\b|\bmon\b/i,                     idx: 1 },
+  { regex: /\btuesday\b|\btues\b|\btue\b/i,           idx: 2 },
+  { regex: /\bwednesday\b|\bwed\b/i,                  idx: 3 },
+  { regex: /\bthursday\b|\bthurs\b|\bthur\b|\bthu\b/i, idx: 4 },
+  { regex: /\bfriday\b|\bfri\b/i,                     idx: 5 },
+  { regex: /\bsaturday\b|\bsat\b/i,                   idx: 6 },
+];
 
 const NO_GUESS_EMAIL_RULE = `NEVER guess or make up email addresses. NEVER. If you don't have the exact email address from the API data, say exactly this: 'I can see Nicole's emails but I need you to confirm her email address - I don't want to guess.' Do not attempt to construct or guess any email address under any circumstances.`;
 
@@ -107,13 +117,12 @@ function getDetectedDates(message) {
   const msg = message.toLowerCase();
   const today = new Date();
   const dates = [];
-  if (msg.includes("today")) dates.push(new Date(today));
-  if (msg.includes("tomorrow")) {
+  if (/\btoday\b/i.test(msg)) dates.push(new Date(today));
+  if (/\btomorrow\b/i.test(msg)) {
     const d = new Date(today); d.setDate(d.getDate() + 1); dates.push(d);
   }
-  const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
-  for (const day in days) {
-    if (msg.includes(day)) dates.push(getNextDay(days[day]));
+  for (const { regex, idx } of DAY_NAME_TO_INDEX) {
+    if (regex.test(msg)) dates.push(getNextDay(idx));
   }
   if (dates.length === 0) dates.push(today);
   return dates;
@@ -653,34 +662,6 @@ async function handleQuote(ctx) {
 
 /* ---------------- CALENDAR READ ---------------- */
 
-async function getCalendarForDate(date) {
-  const iso = date.toISOString();
-  try {
-    const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`);
-    const data = await res.json();
-    if (!res.ok || data.error) {
-      console.log("[chat] calendar fetch error for", iso, "->", data.error || `status ${res.status}`);
-      return { label: formatDateLabel(date), error: true, details: data.error || `status ${res.status}` };
-    }
-    if (!data.events || data.events.length === 0) {
-      return { label: formatDateLabel(date), text: "No events scheduled." };
-    }
-    const text = data.events
-      .map((e) => {
-        const loc = e.location ? ` — ${e.location}` : "";
-        const invited = e.attendees && e.attendees.length
-          ? ` — invited: ${e.attendees.join(", ")}`
-          : "";
-        return `${e.time} — ${e.title}${loc}${invited}`;
-      })
-      .join("\n");
-    return { label: formatDateLabel(date), text };
-  } catch (e) {
-    console.log("[chat] calendar fetch threw for", iso, "->", e.message);
-    return { label: formatDateLabel(date), error: true, details: e.message };
-  }
-}
-
 async function handleCalendarRead(ctx) {
   if (!isCalendarRead(ctx.message)) return null;
 
@@ -693,15 +674,54 @@ async function handleCalendarRead(ctx) {
   }
 
   const dates = getDetectedDates(ctx.message);
-  const schedules = await Promise.all(dates.map(getCalendarForDate));
+  console.log("[chat] calendar dates resolved:", dates.map((d) => d.toISOString()));
 
-  // If any day failed, refuse to narrate — never let Claude fill the gap with invented events.
+  const schedules = await Promise.all(
+    dates.map(async (date) => {
+      const iso = date.toISOString();
+      const url = `${process.env.NEXT_PUBLIC_BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`;
+      console.log("Fetching calendar:", url);
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        console.log("Calendar response:", JSON.stringify(data).slice(0, 800));
+        if (!res.ok || data.error) {
+          return {
+            label: formatDateLabel(date),
+            error: true,
+            details: data.error || `status ${res.status}`,
+          };
+        }
+        return { label: formatDateLabel(date), data };
+      } catch (e) {
+        console.log("Calendar fetch threw:", e.message);
+        return { label: formatDateLabel(date), error: true, details: e.message };
+      }
+    })
+  );
+
+  // If any day failed, refuse to narrate — never let Claude invent events.
   if (schedules.some((s) => s.error)) {
     console.log("[chat] calendar narration skipped due to API error(s)");
     return reply(CALENDAR_FAILURE_REPLY);
   }
 
-  const calendarContext = schedules.map((s) => `${s.label}:\n${s.text}`).join("\n\n");
+  const calendarContext = schedules
+    .map((s) => {
+      const events = s.data?.events || [];
+      if (events.length === 0) return `${s.label}:\nNo events scheduled.`;
+      const text = events
+        .map((e) => {
+          const loc = e.location ? ` — ${e.location}` : "";
+          const invited = e.attendees && e.attendees.length
+            ? ` — invited: ${e.attendees.join(", ")}`
+            : "";
+          return `${e.time} — ${e.title}${loc}${invited}`;
+        })
+        .join("\n");
+      return `${s.label}:\n${text}`;
+    })
+    .join("\n\n");
 
   const text = await claudeNarrate({
     system: `You are Jess, Brad's executive assistant.

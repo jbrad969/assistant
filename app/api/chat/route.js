@@ -38,7 +38,53 @@ const ANTI_HALLUCINATION_RULE = `RULE #1 - NEVER HALLUCINATE: If the API returns
 
 const MEMORY_VS_CALENDAR_RULE = `IMPORTANT: Calendar events come from the Google Calendar API and are always accurate. Memory is for personal facts about Brad only (addresses, preferences, people). NEVER use memory to modify or override what the calendar API returns. If the calendar says the Weekly Meeting is at 9:00 AM with attendees nicole@nerconsultingllc.com and nicole@solarfixaz.com, that is the truth - do not change it based on memory.`;
 
+const JESS_RULES = `JESS RULES (NON-NEGOTIABLE):
+RULE 1 — NEVER ASK "When and what should I remind you about?". If a reminder request lacks an explicit time or topic, scan the recent conversation. If the time and topic appear there, use them. Only ask Brad for clarification if the conversation has zero relevant context.
+RULE 2 — NEVER HALLUCINATE. If data isn't in the API response, say "I don't have that information" and stop. Never invent events, emails, times, names, or addresses.
+RULE 3 — USE CONVERSATION HISTORY. Before doing anything, scan the last 10 messages for relevant context. If Brad references something already discussed, use it. Never ask for info already in the conversation.
+RULE 4 — REMINDERS NEED A BUFFER. When setting a reminder tied to a departure or meeting time, default to 15 minutes before that time unless Brad specifies otherwise.
+RULE 5 — CHAINED ACTIONS. When Brad asks for multiple things in one message (move meeting + send email + set reminder), do ALL of them in sequence and confirm each. Never do one and forget the others.
+RULE 6 — CALENDAR IS SOURCE OF TRUTH. Never modify or override calendar data with memory or assumptions.
+RULE 7 — EMAIL ADDRESSES. Only use email addresses from the calendar attendees array or actual Gmail messages. Never construct or guess.`;
+
 const CALENDAR_FAILURE_REPLY = "I'm having trouble loading your calendar right now. Please try again in a moment.";
+
+function extractReminderBufferMinutes(message) {
+  const m = message.match(/(\d+)\s*(?:min|minutes?|m)\s+(?:before|prior|ahead|early)/i);
+  return m ? parseInt(m[1], 10) : 15;
+}
+
+function mentionsRemindMe(message) {
+  return /\bremind me\b/i.test(message) ||
+    /\bset (?:a |the )?reminder\b/i.test(message) ||
+    /\bdon'?t (?:let me )?forget\b/i.test(message);
+}
+
+function subtractMinutesFromPhoenixIso(phoenixIso, minutes) {
+  // phoenixIso = "YYYY-MM-DDTHH:MM:00-07:00"
+  const ms = new Date(phoenixIso).getTime() - minutes * 60 * 1000;
+  const date = new Date(ms);
+  // Re-emit in Phoenix-local YYYY-MM-DD HH:MM
+  const phoenixDate = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIME_ZONE,
+  }).format(date);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone: TIME_ZONE,
+  }).formatToParts(date);
+  const hh = parts.find((p) => p.type === "hour")?.value || "00";
+  const mm = parts.find((p) => p.type === "minute")?.value || "00";
+  return `${phoenixDate}T${hh}:${mm}:00-07:00`;
+}
+
+async function saveReminder({ message, phoenixIso }) {
+  const res = await fetch(`${BASE_URL}/api/reminders`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, remind_at: phoenixIso }),
+  });
+  const data = await res.json();
+  return { ok: res.ok && !data.error, data };
+}
 
 /* ============================================================================
  * 2. SHARED HELPERS
@@ -424,7 +470,10 @@ function isQuote(message) {
 
 function isCalendarWrite(message) {
   const m = message.toLowerCase();
-  if (m.includes("remind me") || m.includes("set reminder") || m.includes("don't forget") || m.includes("dont forget")) return false;
+  // No "remind me" exclusion — when both intents are present we want write to win so the
+  // move/add/delete actually happens, and the move handler chains the reminder save itself.
+  // Pure reminder intents (message starts with "remind me") are kept by isReminder via the
+  // cross-check there.
   const writeVerb = /\b(add|create|delete|remove|move|reschedule|cancel|book)\b/.test(m) || m.includes("set up");
   const calendarContext =
     /\b(meeting|appointment|event|call|lunch|dinner|breakfast|coffee|standup|interview)\b/.test(m) ||
@@ -453,15 +502,19 @@ function isDeparture(message) {
 
 function isReminder(message) {
   const m = message.toLowerCase();
-  return (
+  const hasReminderPhrase =
     m.includes("remind me") ||
     m.includes("set a reminder") ||
     m.includes("set reminder") ||
     m.includes("don't forget") ||
     m.includes("dont forget") ||
     m.includes("don't let me forget") ||
-    m.includes("dont let me forget")
-  );
+    m.includes("dont let me forget");
+  if (!hasReminderPhrase) return false;
+  // RULE 5: when message ALSO contains a calendar write action, defer to handleCalendarWrite
+  // which will chain a reminder save itself.
+  if (isCalendarWrite(message)) return false;
+  return true;
 }
 
 function isCalendarRead(message) {
@@ -915,7 +968,27 @@ async function handleCalendarWrite(ctx) {
     const oldTimeLabel = event.time;
     const newTimeLabel = format12Hour(newTime);
     const dayLabel = formatDateLabel(new Date(`${newDate}T12:00:00`));
-    const confirmation = `Done — moved "${event.title}" to ${newTimeLabel} on ${dayLabel} (was ${oldTimeLabel}).`;
+    let confirmation = `Done — moved "${event.title}" to ${newTimeLabel} on ${dayLabel} (was ${oldTimeLabel}).`;
+
+    // RULE 5 — chained reminder: if Brad said "remind me ..." in the same message, save a
+    // reminder for the new event time minus the requested buffer (default 15 min).
+    if (mentionsRemindMe(ctx.message)) {
+      const buffer = extractReminderBufferMinutes(ctx.message);
+      const eventStartIso = `${newDate}T${newTime}:00-07:00`;
+      const remindIso = subtractMinutesFromPhoenixIso(eventStartIso, buffer);
+      const remindResult = await saveReminder({
+        message: `${event.title} starts in ${buffer} minutes`,
+        phoenixIso: remindIso,
+      });
+      if (remindResult.ok) {
+        const remindLabel = new Date(remindIso).toLocaleTimeString("en-US", {
+          hour: "numeric", minute: "2-digit", hour12: true, timeZone: TIME_ZONE,
+        });
+        confirmation += ` Reminder set for ${remindLabel} (${buffer} min before).`;
+      } else {
+        confirmation += ` (Couldn't save the reminder — ${remindResult.data?.error || "please try again"}.)`;
+      }
+    }
 
     // If Brad named a specific person ("move the meeting with Nicole..."), auto-draft an
     // email to them so they can be notified. Email is taken from the event's attendee list
@@ -1064,26 +1137,33 @@ Brad asked: "${ctx.message}"`,
 
 /* ---------------- REMINDER ---------------- */
 
-async function extractReminder(message) {
+async function extractReminder(message, history = []) {
   const currentPhoenix = new Date().toLocaleString("en-US", {
     timeZone: TIME_ZONE,
     weekday: "long", year: "numeric", month: "long", day: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: false,
   });
+  const recentHistory = history.slice(-10);
+  const conversationContext = recentHistory.length
+    ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
+    : "(no prior turns)";
+
   const raw = await claudeJson({
     maxTokens: 384,
-    system: `Extract reminder details from Brad's message.
-Current Phoenix local date/time: ${currentPhoenix}. America/Phoenix is UTC-7 with no DST.
+    system: `Extract reminder details. Current Phoenix local date/time: ${currentPhoenix}. America/Phoenix is UTC-7 with no DST.
+
+If Brad's CURRENT message lacks a time or topic, look at the recent conversation. If the time and topic are already there (e.g. assistant just said "BNI is at 11:45 AM" and Brad now says "remind me about that"), reconstruct {message, remindAt} from history. Only return null fields when the conversation truly has zero relevant context.
 
 Return ONLY JSON, no preamble:
 {"message": "what to remind Brad about (concise)" | null, "remindAt": "YYYY-MM-DD HH:MM in 24-hour Phoenix local time" | null}
 
-Resolve relative times against the current Phoenix date/time above.
+Time resolution against current Phoenix time:
 - "in 30 minutes" -> add 30 min
 - "tomorrow at 3pm" -> next day, 15:00
 - "Wednesday at 10am" -> next Wednesday, 10:00
-- "tonight at 8" -> today, 20:00`,
-    user: message,
+- "tonight at 8" -> today, 20:00
+If Brad says "remind me 15 min before X" and X has a time in history, set remindAt = (X's time minus 15 minutes).`,
+    user: `Recent conversation:\n${conversationContext}\n\nCurrent reminder request: "${message}"`,
   });
   return parseJsonFromClaude(raw);
 }
@@ -1091,15 +1171,33 @@ Resolve relative times against the current Phoenix date/time above.
 async function handleReminder(ctx) {
   if (!isReminder(ctx.message)) return null;
 
-  const reminder = await extractReminder(ctx.message);
+  const reminder = await extractReminder(ctx.message, ctx.history);
+  // RULE 1: never ask "When and what should I remind you about?" if the conversation already has the answer.
+  // We only ask when BOTH the current message and the last 10 turns of history are silent on time AND topic.
   if (!reminder?.message || !reminder?.remindAt) {
-    return reply("When and what should I remind you about?");
+    const ctxBlob = ctx.history.slice(-10).map((m) => m.content || "").join(" ").toLowerCase();
+    const hasContextualTime = /\b\d{1,2}(?::\d{2})?\s*(am|pm)\b/i.test(ctxBlob) || /\b\d{1,2}:\d{2}\b/.test(ctxBlob);
+    const hasContextualTopic = ctxBlob.length > 30; // any meaningful prior content
+    if (hasContextualTime && hasContextualTopic) {
+      return reply("I don't have that information — tell me the time and topic and I'll save it.");
+    }
+    return reply("Tell me what to remind you about and when, and I'll save it.");
   }
 
-  const phoenixIso = `${reminder.remindAt.replace(" ", "T")}:00-07:00`;
-  const remindDate = new Date(phoenixIso);
+  let phoenixIso = `${reminder.remindAt.replace(" ", "T")}:00-07:00`;
+  let remindDate = new Date(phoenixIso);
   if (Number.isNaN(remindDate.getTime())) {
     return reply("I had trouble saving that reminder, please try again.");
+  }
+
+  // RULE 4 — when the reminder is about leaving/heading-out for something, default to 15
+  // minutes before the supplied time (Brad can override with "remind me X min before").
+  const isDepartureReminder = /\b(leave|head out|head over|depart|get going|head to|drive to)\b/i.test(reminder.message);
+  if (isDepartureReminder) {
+    const buffer = extractReminderBufferMinutes(ctx.message);
+    phoenixIso = subtractMinutesFromPhoenixIso(phoenixIso, buffer);
+    remindDate = new Date(phoenixIso);
+    console.log(`Applied ${buffer}-minute departure buffer; remindAt now ${phoenixIso}`);
   }
 
   console.log(`Saving reminder: "${reminder.message}" at ${phoenixIso}`);
@@ -1135,6 +1233,8 @@ async function handleNormalChat(ctx) {
     max_tokens: 1024,
     system: `You are Jess, Brad's executive assistant.
 
+${JESS_RULES}
+
 ${ANTI_HALLUCINATION_RULE}
 
 ${MEMORY_VS_CALENDAR_RULE}
@@ -1146,7 +1246,7 @@ Today: ${ctx.today}
 Memory:
 ${ctx.memoryText}
 
-Rules:
+Operational rules:
 - Take action first, ask questions never
 - Use conversation history - never ask for info already discussed
 - Never guess drive times or traffic - call Google Maps only

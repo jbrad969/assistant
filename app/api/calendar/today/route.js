@@ -108,6 +108,24 @@ export async function GET(req) {
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
 
+    // Print the actual scopes attached to this refresh token so we can verify
+    // it has https://www.googleapis.com/auth/calendar (or .readonly) on it.
+    try {
+      const accessTokenResponse = await auth.getAccessToken();
+      const accessToken =
+        typeof accessTokenResponse === "string"
+          ? accessTokenResponse
+          : accessTokenResponse?.token;
+      if (accessToken) {
+        const tokenInfo = await auth.getTokenInfo(accessToken);
+        console.log("Token scopes:", tokenInfo.scopes);
+      } else {
+        console.log("Token scopes: (no access token resolved)");
+      }
+    } catch (e) {
+      console.log("Token info check failed:", e.message);
+    }
+
     const { timeMin, timeMax } = getDateRange(date, days);
     console.log("Fetching calendar for:", { timeMin, timeMax, date });
 
@@ -119,9 +137,14 @@ export async function GET(req) {
       singleEvents: true,
       orderBy: "startTime",
       maxResults: days > 1 ? 250 : 50,
+      fields: "items(id,summary,start,end,location,description,attendees,organizer)",
     });
 
     console.log("Calendar API returned", (result.data.items || []).length, "raw items");
+    console.log("FULL FIRST EVENT:", JSON.stringify(result.data.items?.[0], null, 2));
+    console.log("RAW EVENT ATTENDEES:", JSON.stringify(result.data.items?.[0]?.attendees));
+    console.log("RAW EVENT ORGANIZER:", JSON.stringify(result.data.items?.[0]?.organizer));
+    console.log("RAW EVENT KEYS:", JSON.stringify(Object.keys(result.data.items?.[0] || {})));
 
     let events = (result.data.items || []).map((event) => ({
       id: event.id,

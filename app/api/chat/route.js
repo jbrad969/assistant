@@ -64,7 +64,10 @@ function isEmailRead(msg) {
     /\bany\s+(?:unread\s+|new\s+)?emails?\b/.test(m) ||
     /\bunread\s+emails?\b/.test(m) ||
     /\bemails?\s+from\b/.test(m) ||
-    /\bany\s+emails?\s+from\b/.test(m)
+    /\bany\s+emails?\s+from\b/.test(m) ||
+    /\blast\s+emails?\b/.test(m) ||
+    /\brecent\s+emails?\b/.test(m) ||
+    /\bwhat\s+emails?\b/.test(m)
   );
 }
 
@@ -166,6 +169,11 @@ ABSOLUTE RULES:
 
 TOOLS YOU HAVE:
 You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.
+
+You can both READ and SEND emails via Gmail.
+- To read: fetch unread emails from /api/email
+- To send: draft first, get approval, then send
+Never say you cannot read emails. You absolutely can.
 
 CRITICAL: Read the ENTIRE conversation history before responding. The history contains everything Brad has told you. If Brad references something from earlier in the conversation, it is in your history - find it and use it. Never ask for information that appears anywhere in the conversation history.`;
 }

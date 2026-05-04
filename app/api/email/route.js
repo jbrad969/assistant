@@ -72,16 +72,30 @@ export async function GET(req) {
         });
 
         const headers = detail.data.payload?.headers || [];
-        const subject = headers.find((h) => h.name === "Subject")?.value || "No subject";
-        const from = headers.find((h) => h.name === "From")?.value || "Unknown";
-        const date = headers.find((h) => h.name === "Date")?.value || "";
+        const headerVal = (name) =>
+          headers.find((h) => (h.name || "").toLowerCase() === name.toLowerCase())?.value || "";
+        const subject = headerVal("Subject") || "No subject";
+        const from = headerVal("From") || "Unknown";
+        const to = headerVal("To");
+        const date = headerVal("Date");
         const decoded = decodeBody(detail.data.payload);
         const body = fullBody ? decoded.slice(0, 8000) : decoded.slice(0, 500);
+
+        // Parse the bare email address out of the From header (e.g. "Nicole Reid <nreid@solarfixaz.com>" -> "nreid@solarfixaz.com").
+        let fromEmail = "";
+        const angle = from.match(/<([^>]+@[^>]+)>/);
+        if (angle) fromEmail = angle[1].trim();
+        else {
+          const bare = from.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+          if (bare) fromEmail = bare[0];
+        }
 
         return {
           id: msg.id,
           subject,
-          from,
+          from,        // raw "Name <email@domain.com>" header value
+          fromEmail,   // parsed bare email address — never null on real Gmail rows
+          to,
           date,
           body,
           internalDate: detail.data.internalDate || "0",

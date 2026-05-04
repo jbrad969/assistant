@@ -22,6 +22,8 @@ const SHOP_ADDRESS = "4211 East Elwood Street Phoenix AZ";
 
 const DAYS_PATTERN = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
 
+const NO_GUESS_EMAIL_RULE = `NEVER guess or make up email addresses. NEVER. If you don't have the exact email address from the API data, say exactly this: 'I can see Nicole's emails but I need you to confirm her email address - I don't want to guess.' Do not attempt to construct or guess any email address under any circumstances.`;
+
 /* ============================================================================
  * 2. SHARED HELPERS
  * ========================================================================== */
@@ -503,14 +505,17 @@ async function handleEmailRead(ctx) {
   }
 
   const ctxText = emails
-    .map((e, i) => `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${(e.body || "").slice(0, 250)}`)
+    .map((e, i) => `${i + 1}. From: ${e.from}\nFrom email: ${e.fromEmail || "(unknown)"}\nSubject: ${e.subject}\nDate: ${e.date}\nPreview: ${(e.body || "").slice(0, 250)}`)
     .join("\n\n");
 
   const text = await claudeNarrate({
     system: `You are Jess, Brad's executive assistant.
 Summarize these emails naturally and conversationally — who they're from and what they're about.
 Flag anything urgent or from tnkroofing.com as a quote response.
-No markdown. Be concise. One or two sentences per email.`,
+No markdown. Be concise. One or two sentences per email.
+
+${NO_GUESS_EMAIL_RULE}
+If Brad asks for an email address, ONLY use the "From email" value shown for that sender.`,
     user: `Brad asked: "${ctx.message}"\n\n${scopeLabel} emails:\n\n${ctxText}`,
   });
   return reply(text);
@@ -535,7 +540,10 @@ Return ONLY a JSON object, no preamble:
   "body": "the email body (sign as Brad)"
 }
 If Brad gave a name like "Nicole" without an email, leave "to" null and put the name in "recipientName".
-If Brad didn't dictate the body, draft a short professional one based on the request and conversation context.`,
+If Brad didn't dictate the body, draft a short professional one based on the request and conversation context.
+
+${NO_GUESS_EMAIL_RULE}
+The "to" field must be either an email address that appeared verbatim in the conversation (or that Brad explicitly typed in this turn) or null. Never invent a domain, never guess a username pattern, never construct an address from a name.`,
     user: `Recent conversation:\n${conversationContext}\n\nCurrent request: "${message}"`,
   });
   return parseJsonFromClaude(raw);
@@ -638,7 +646,13 @@ async function getCalendarForDate(date) {
     return { label: formatDateLabel(date), text: "No events scheduled." };
   }
   const text = data.events
-    .map((e) => `${e.time} — ${e.title}${e.location ? ` — ${e.location}` : ""}`)
+    .map((e) => {
+      const loc = e.location ? ` — ${e.location}` : "";
+      const invited = e.attendees && e.attendees.length
+        ? ` — invited: ${e.attendees.join(", ")}`
+        : "";
+      return `${e.time} — ${e.title}${loc}${invited}`;
+    })
     .join("\n");
   return { label: formatDateLabel(date), text };
 }
@@ -662,7 +676,10 @@ async function handleCalendarRead(ctx) {
     system: `You are Jess, Brad's executive assistant.
 Today is ${ctx.today}. Use it as the reference for the current date — never reference events from wrong years.
 Summarize the schedule naturally — time, title, and location. No markdown. Brief.
-Calendar event locations are DESTINATIONS Brad is going to, never his home.`,
+Calendar event locations are DESTINATIONS Brad is going to, never his home.
+
+${NO_GUESS_EMAIL_RULE}
+If Brad asks for an email address from a calendar invite, ONLY return what appears in the "invited:" list below — copy it verbatim. If a person isn't in that list, say you don't have their address.`,
     user: `Calendar data:\n\n${calendarContext}\n\nBrad asked: "${ctx.message}"`,
   });
   return reply(text);
@@ -975,7 +992,9 @@ Rules:
 - Never re-search calendar if data already in conversation
 - For email drafts: show first, wait for approval
 - Strip all XML tags from final response
-- Keep responses direct and brief`,
+- Keep responses direct and brief
+
+${NO_GUESS_EMAIL_RULE}`,
     messages: [
       ...toAnthropicHistory(ctx.history),
       { role: "user", content: ctx.message },

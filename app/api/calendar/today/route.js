@@ -116,6 +116,13 @@ export async function GET(req) {
       end: event.end?.dateTime || event.end?.date,
       time: formatTime(event.start?.dateTime || event.start?.date),
       location: event.location || "",
+      organizer: event.organizer
+        ? { email: event.organizer.email || "", name: event.organizer.displayName || "" }
+        : null,
+      attendees: (event.attendees || []).map((a) => a.email).filter(Boolean),
+      attendeeDetails: (event.attendees || [])
+        .filter((a) => a.email)
+        .map((a) => ({ email: a.email, name: a.displayName || "" })),
     }));
 
     if (searchTitle) {

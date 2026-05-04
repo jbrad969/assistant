@@ -17,25 +17,29 @@ function getGoogleClient() {
 }
 
 function getDateRange(dateString, days = 1) {
+  const timeZone = "America/Phoenix";
+
+  // Parse the target date
   const date = dateString ? new Date(dateString) : new Date();
 
-  // Resolve the Phoenix-local Y-M-D for the given moment, regardless of server timezone.
-  // en-CA formats as YYYY-MM-DD which we can concatenate directly.
-  const phoenixDate = new Intl.DateTimeFormat("en-CA", {
+  // Get the date parts in Phoenix timezone
+  const phoenixStr = date.toLocaleDateString("en-US", {
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-    timeZone: TIME_ZONE,
-  }).format(date);
+  });
+  const [month, day, year] = phoenixStr.split("/");
 
-  // Phoenix is fixed UTC-7 (never observes DST). Midnight Phoenix == 07:00 UTC of the same date.
-  const start = new Date(`${phoenixDate}T07:00:00Z`);
-  const end = new Date(start.getTime() + days * 24 * 60 * 60 * 1000);
+  // Build start of that day in Phoenix time (UTC-7, no DST)
+  const startDate = new Date(`${year}-${month}-${day}T00:00:00-07:00`);
+  const timeMin = startDate.toISOString();
 
-  return {
-    timeMin: start.toISOString(),
-    timeMax: end.toISOString(),
-  };
+  // End is N days later at 23:59:59 Phoenix (single-day default matches user's spec exactly).
+  const endMs = startDate.getTime() + days * 24 * 60 * 60 * 1000 - 1000;
+  const timeMax = new Date(endMs).toISOString();
+
+  return { timeMin, timeMax };
 }
 
 function formatTime(dateString) {
@@ -105,7 +109,7 @@ export async function GET(req) {
     const calendar = google.calendar({ version: "v3", auth });
 
     const { timeMin, timeMax } = getDateRange(date, days);
-    console.log("Calendar window:", timeMin, "to", timeMax);
+    console.log("Fetching calendar for:", { timeMin, timeMax, date });
 
     const result = await calendar.events.list({
       calendarId: "primary",

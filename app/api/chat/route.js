@@ -85,11 +85,22 @@ function todayPhoenixLabel() {
 /* ---------------- DATE / TIME UTILITIES ---------------- */
 
 function getNextDay(dayIndex) {
-  const today = new Date();
-  const result = new Date(today);
-  const diff = (dayIndex + 7 - today.getDay()) % 7 || 7;
-  result.setDate(today.getDate() + diff);
-  return result;
+  // Resolve "next <weekday>" using Phoenix-local day-of-week, not the server's UTC day.
+  // Otherwise: at e.g. Phoenix Tue 9 PM (= UTC Wed 04:00) the server thinks today is Wednesday
+  // and getDay-based math returns the FOLLOWING Wednesday (7 days later) instead of tomorrow.
+  const now = new Date();
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const phoenixDayName = now.toLocaleDateString("en-US", { weekday: "long", timeZone: TIME_ZONE });
+  const phoenixDay = dayNames.indexOf(phoenixDayName);
+
+  // Today's date in Phoenix as YYYY-MM-DD (en-CA gives that format natively).
+  const phoenixDateStr = now.toLocaleDateString("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIME_ZONE,
+  });
+
+  const diff = (dayIndex + 7 - phoenixDay) % 7 || 7;
+  const startMs = new Date(`${phoenixDateStr}T00:00:00-07:00`).getTime();
+  return new Date(startMs + diff * 24 * 60 * 60 * 1000);
 }
 
 function getDetectedDates(message) {

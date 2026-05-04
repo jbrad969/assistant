@@ -66,16 +66,21 @@ export async function GET(req) {
     const queries = isSearch ? searches : [""];
 
     const listResults = await Promise.all(
-      queries.map((q) =>
-        gmail.users.messages.list({
-          userId: "me",
-          q,
-          maxResults: all ? 50 : limit,
-        }).catch((e) => {
+      queries.map(async (q) => {
+        console.log("Gmail search query:", q);
+        try {
+          const r = await gmail.users.messages.list({
+            userId: "me",
+            q,
+            maxResults: all ? 50 : limit,
+          });
+          console.log(`Gmail per-query result count for "${q}":`, (r.data.messages || []).length);
+          return r;
+        } catch (e) {
           console.log(`[/api/email GET] list failed for q="${q}":`, e.message);
           return { data: { messages: [] } };
-        })
-      )
+        }
+      })
     );
 
     // Dedupe by message id while preserving first-seen order.
@@ -89,6 +94,8 @@ export async function GET(req) {
         }
       }
     }
+
+    console.log("Gmail search results count:", messages.length);
 
     if (messages.length === 0) {
       return Response.json({ emails: [], text: "No emails found.", queries });

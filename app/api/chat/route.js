@@ -811,6 +811,7 @@ export async function POST(req) {
       let queries = null;
       if (searchedName) {
         queries = await buildEmailSearchQuery(searchedName);
+        console.log("Email search queries built:", JSON.stringify(queries));
       }
 
       const all = msg.includes("all");

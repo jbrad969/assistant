@@ -823,7 +823,10 @@ export async function POST(req) {
       // For multi-query person searches let the email route default to 50/query.
       // For "last/recent email" peeks limit to 1. Otherwise default to 5.
       const limit = recent ? 1 : queries ? null : all ? 20 : 5;
+      console.log("Fetching emails with queries:", JSON.stringify(queries));
       const rawEmails = await getEmails(queries, limit, recent);
+      console.log("Emails returned:", (rawEmails || []).length);
+      console.log("First email:", JSON.stringify((rawEmails || [])[0]));
 
       // ID VALIDATION: every email must carry a real Gmail message id. Anything
       // without one is fabricated/garbage and must be dropped before Claude
@@ -837,12 +840,13 @@ export async function POST(req) {
         console.log(`[email read] DROPPED ${dropped} email(s) missing a Gmail id`);
       }
 
-      // HARD GUARDRAIL: empty/missing results never reach Claude. Returning a
-      // factual reply directly prevents the model from inventing emails to
-      // satisfy Brad's question.
+      // HALLUCINATION HARD STOP: zero results NEVER reach Claude. The reply is
+      // the fixed string below — Claude is not invoked. This is the only way
+      // to guarantee the model cannot fabricate email content.
       if (emails.length === 0) {
+        const subject = searchedName ? `${searchedName} emails` : "your emails";
         return Response.json({
-          reply: `I searched for emails involving ${searchedName || "your inbox"} and found nothing. This could mean the emails are read/archived, or the search needs a different term. What else can I try?`,
+          reply: `I searched for ${subject} and the API returned nothing. I know they exist - there may be a technical issue. Try asking again.`,
         });
       }
 

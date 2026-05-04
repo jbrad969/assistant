@@ -207,12 +207,32 @@ export async function DELETE(req) {
 
     if (body.deleteAll) {
       console.log("[/api/reminders DELETE] deleteAll requested");
+
+      // Count first so we can confirm an exact number to Brad.
+      const { count: beforeCount, error: cErr } = await supabase
+        .from("reminders")
+        .select("*", { count: "exact", head: true });
+      if (cErr) console.log("[/api/reminders DELETE] count failed:", cErr.message);
+
+      // Delete EVERY row (not just triggered=false). Supabase requires a filter on .delete(),
+      // so use ".not('id', 'is', null)" — every row has a non-null id, so this matches all.
       const { error } = await supabase
         .from("reminders")
         .delete()
-        .eq("triggered", false);
+        .not("id", "is", null);
       if (error) throw error;
-      return Response.json({ success: true, message: "All reminders deleted" });
+
+      const { count: afterCount } = await supabase
+        .from("reminders")
+        .select("*", { count: "exact", head: true });
+
+      console.log(`[/api/reminders DELETE] deleted ${beforeCount ?? "?"} rows, ${afterCount ?? 0} remaining`);
+      return Response.json({
+        success: true,
+        deleted: (beforeCount ?? 0) - (afterCount ?? 0),
+        remaining: afterCount ?? 0,
+        message: "All reminders deleted",
+      });
     }
 
     if (body.id) {

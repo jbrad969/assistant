@@ -403,10 +403,19 @@ async function extractReminderDetails(message, history) {
     messages: [
       {
         role: "system",
-        content: `Extract reminder details. Today is ${todayIso}. Phoenix timezone is UTC-7 with no DST.
-Return JSON: { "message": "what to remind", "time": "ISO timestamp in UTC" }
-If day mentioned without year, use 2026. Convert Phoenix time to UTC by adding 7 hours.
-If the conversation already establishes time/topic for the reminder, reuse them.`,
+        content: `Extract reminder details. Today is ${todayIso}.
+
+Phoenix AZ timezone is always UTC-7 (no daylight saving time ever). To convert Phoenix time to UTC, add 7 hours. Wednesday May 6 2026 at 7:45 AM Phoenix = 2026-05-06T14:45:00Z. Always output the remind_at as a UTC ISO string.
+
+Examples:
+- "remind me Wednesday at 7:45 AM" -> {"time": "2026-05-06T14:45:00Z", ...}  (7:45 AM Phoenix = 14:45 UTC)
+- "remind me at 10 AM tomorrow" -> add 7 hours to Phoenix 10:00 -> "...T17:00:00Z"
+- "remind me at 8 PM tonight" -> Phoenix 20:00 -> next day 03:00 UTC ("...T03:00:00Z" of the next date)
+
+Return JSON: {"message": "what to remind Brad about (concise)", "time": "UTC ISO timestamp ending in Z"}
+
+If day mentioned without year, use 2026.
+If the conversation already establishes time/topic for the reminder, reuse them — do not ask.`,
       },
       {
         role: "user",
@@ -556,6 +565,21 @@ export async function POST(req) {
       if (result.error) {
         return Response.json({ reply: "I had trouble saving that reminder: " + result.error });
       }
+
+      // Verify by re-fetching: confirm the saved row actually shows up in the list.
+      const savedId = result.reminder?.id;
+      let verified = false;
+      try {
+        const all = await getReminders();
+        verified = !!savedId && all.some((r) => String(r.id) === String(savedId));
+      } catch (e) {
+        console.log("[chat] reminder verify fetch threw:", e.message);
+      }
+      if (!verified) {
+        console.log("[chat] reminder save returned success but row not found on verify");
+        return Response.json({ reply: "I had trouble saving that reminder, try again." });
+      }
+
       const displayTime = new Date(extracted.time).toLocaleString("en-US", {
         weekday: "long", hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
       });

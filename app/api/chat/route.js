@@ -930,22 +930,36 @@ When asked for a SPECIFIC named person's email from a calendar event, ONLY use t
 
 /* ---------------- CALENDAR WRITE (add / delete / move) ---------------- */
 
+// Single helper for hitting /api/calendar/today. Supports an optional multi-day window
+// and server-side title filter (the GET handler already understands `days` and `searchTitle`).
+async function getCalendarForDate(date, options = {}) {
+  const isoBase = typeof date === "string" ? date : (date instanceof Date ? date.toISOString() : new Date().toISOString());
+  const params = new URLSearchParams({ date: isoBase });
+  if (options.days) params.set("days", String(options.days));
+  if (options.searchTitle) params.set("searchTitle", options.searchTitle);
+  const res = await fetch(`${BASE_URL}/api/calendar/today?${params.toString()}`);
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    return { events: [], error: data?.error || `status ${res.status}` };
+  }
+  return { events: data.events || [], text: data.text || "" };
+}
+
 async function findEventByCriteria({ date, time, title }) {
   if (!date && !title) return [];
 
   // If a title fragment is given, search a 7-day window so events on other days are still findable.
   // Otherwise scope to the given date only.
-  let events;
-  if (title) {
-    events = await findEventsByTitleNext7Days(title);
-  } else {
-    const dateObj = new Date(`${date}T12:00:00`);
-    const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(dateObj.toISOString())}`);
-    const data = await res.json();
-    events = data.events || [];
+  const result = title
+    ? await getCalendarForDate(new Date(), { days: 7, searchTitle: title })
+    : await getCalendarForDate(new Date(`${date}T12:00:00`));
+
+  if (result.error) {
+    console.log("[chat] findEventByCriteria calendar fetch failed:", result.error);
+    return [];
   }
 
-  return events.filter((event) => {
+  return (result.events || []).filter((event) => {
     if (date && getPhoenixDate(event.start) !== date) return false;
     if (time && getPhoenixHHMM(event.start) !== time) return false;
     if (title && !(event.title || "").toLowerCase().includes(title.toLowerCase())) return false;

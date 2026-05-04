@@ -170,6 +170,12 @@ function cleanResponse(text) {
     .replace(/<\/?attempt_completion>/g, "")
     .replace(/<\/?function_calls>/g, "")
     .replace(/<\/?search_calendar>/g, "")
+    .replace(/<\/?create_reminder>/g, "")
+    .replace(/<\/?search_reminders>/g, "")
+    .replace(/<\/?delete_calendar_event>/g, "")
+    .replace(/<\/?google_maps_directions>/g, "")
+    .replace(/```json[\s\S]*?```/g, "")
+    .replace(/```[\s\S]*?```/g, "")
     .replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, "")
     .replace(/<[^>]+\/>/g, "")
     .trim();
@@ -558,32 +564,41 @@ export async function POST(req) {
     // 3. SET REMINDER
     if (isSetReminder(msg)) {
       const extracted = await extractReminderDetails(message, history);
+      console.log("Extracted reminder:", JSON.stringify(extracted));
+
       if (!extracted.time || !extracted.message) {
         return Response.json({ reply: "What time and what should I remind you about?" });
       }
+
       const result = await saveReminder(extracted.message, extracted.time);
+      console.log("Save result:", JSON.stringify(result));
+
       if (result.error) {
         return Response.json({ reply: "I had trouble saving that reminder: " + result.error });
       }
 
-      // Verify by re-fetching: confirm the saved row actually shows up in the list.
-      const savedId = result.reminder?.id;
-      let verified = false;
+      // Verify by re-fetching: match by id when available, fall back to message text.
+      let saved = null;
       try {
-        const all = await getReminders();
-        verified = !!savedId && all.some((r) => String(r.id) === String(savedId));
+        const verify = await getReminders();
+        const savedId = result.reminder?.id;
+        saved =
+          (savedId && verify.find((r) => String(r.id) === String(savedId))) ||
+          verify.find((r) => r.message === extracted.message);
       } catch (e) {
         console.log("[chat] reminder verify fetch threw:", e.message);
       }
-      if (!verified) {
+      if (!saved) {
         console.log("[chat] reminder save returned success but row not found on verify");
-        return Response.json({ reply: "I had trouble saving that reminder, try again." });
+        return Response.json({ reply: "I had trouble saving that reminder. Please try again." });
       }
 
       const displayTime = new Date(extracted.time).toLocaleString("en-US", {
         weekday: "long", hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
       });
-      return Response.json({ reply: `Done — I'll remind you ${displayTime}: ${extracted.message}` });
+      return Response.json({
+        reply: `Done — reminder set for ${displayTime}: ${extracted.message}`,
+      });
     }
 
     // 4. EMAIL READ

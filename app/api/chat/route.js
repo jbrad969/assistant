@@ -36,6 +36,8 @@ const NO_GUESS_EMAIL_RULE = `NEVER guess or make up email addresses. NEVER. If y
 
 const ANTI_HALLUCINATION_RULE = `RULE #1 - NEVER HALLUCINATE: If the API returns no data or an error, say you cannot access the information right now. NEVER invent appointments, email addresses, names, times, or any facts. If you don't have real data from an API call, say 'I don't have that information right now' and stop.`;
 
+const MEMORY_VS_CALENDAR_RULE = `IMPORTANT: Calendar events come from the Google Calendar API and are always accurate. Memory is for personal facts about Brad only (addresses, preferences, people). NEVER use memory to modify or override what the calendar API returns. If the calendar says the Weekly Meeting is at 9:00 AM with attendees nicole@nerconsultingllc.com and nicole@solarfixaz.com, that is the truth - do not change it based on memory.`;
+
 const CALENDAR_FAILURE_REPLY = "I'm having trouble loading your calendar right now. Please try again in a moment.";
 
 /* ============================================================================
@@ -726,10 +728,13 @@ async function handleCalendarRead(ctx) {
 
 ${ANTI_HALLUCINATION_RULE}
 
+${MEMORY_VS_CALENDAR_RULE}
+
 Today is ${ctx.today}. Use it as the reference for the current date — never reference events from wrong years.
 Summarize the schedule naturally — time, title, and location. No markdown. Brief.
 Calendar event locations are DESTINATIONS Brad is going to, never his home.
 Only mention events that appear in the Calendar data block below. If a day shows "No events scheduled.", say exactly that — never invent events.
+Show ALL events exactly as listed — if two events share the same start time (e.g. two 9:00 AM events), include BOTH separately. Never merge or hide same-time events.
 
 When attendee emails are provided in the calendar data, use them exactly as shown. Never guess or construct email addresses. Nicole's emails for the Weekly Meeting are nicole@nerconsultingllc.com and nicole@solarfixaz.com.
 
@@ -754,26 +759,44 @@ When asked for a SPECIFIC named person's email from a calendar event, ONLY use t
 
 async function findEventByCriteria({ date, time, title }) {
   if (!date && !title) return [];
-  const dateObj = date ? new Date(`${date}T12:00:00`) : new Date();
-  const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(dateObj.toISOString())}`);
-  const data = await res.json();
-  return (data.events || []).filter((event) => {
+
+  // If a title fragment is given, search a 7-day window so events on other days are still findable.
+  // Otherwise scope to the given date only.
+  let events;
+  if (title) {
+    events = await findEventsByTitleNext7Days(title);
+  } else {
+    const dateObj = new Date(`${date}T12:00:00`);
+    const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(dateObj.toISOString())}`);
+    const data = await res.json();
+    events = data.events || [];
+  }
+
+  return events.filter((event) => {
+    if (date && getPhoenixDate(event.start) !== date) return false;
     if (time && getPhoenixHHMM(event.start) !== time) return false;
     if (title && !(event.title || "").toLowerCase().includes(title.toLowerCase())) return false;
     return true;
   });
 }
 
-async function extractEventDetails(message, today) {
+async function extractEventDetails(message, today, history = []) {
+  const recentHistory = history.slice(-10);
+  const conversationContext = recentHistory.length
+    ? recentHistory.map((m) => `${m.role}: ${m.content}`).join("\n")
+    : "(no prior turns)";
+
   const raw = await claudeJson({
     maxTokens: 1024,
     system: `You convert natural-language calendar commands into JSON.
 Today is ${today} (America/Phoenix timezone).
 
+If Brad references an event by attendee or paraphrase ("the meeting with Nicole", "the BNI thing", "my call with Mike"), use the recent conversation to resolve it to an actual event title, date, and time visible in history. Prefer the exact event title shown in history.
+
 Return ONLY a JSON object, no preamble:
 {
   "action": "add" | "delete" | "move" | "none",
-  "title": "event title or null",
+  "title": "event title or null (use the history-known title when possible)",
   "date": "YYYY-MM-DD or null",
   "time": "HH:MM 24-hour or null",
   "newDate": "YYYY-MM-DD or null (only for move)",
@@ -789,15 +812,44 @@ Rules:
 - For "delete": at least one of date, time, or title must identify the event
 - For "move": (date+time OR title) identifies the event; provide newDate and/or newTime
 - If unclear or read-intent, return action "none"`,
-    user: message,
+    user: `Recent conversation:\n${conversationContext}\n\nCurrent request: "${message}"`,
   });
   return parseJsonFromClaude(raw, { action: "none" });
+}
+
+function extractPersonFromMessage(message) {
+  // "with Nicole", "to Nicole", "for Nicole" — capitalized first name.
+  const match = message.match(/\b(?:with|to|for|tell)\s+([A-Z][a-zA-Z]+)\b/);
+  return match ? match[1] : null;
+}
+
+function findAttendeeEmailInEvent(name, event) {
+  if (!event?.attendees || !name) return null;
+  const lower = name.toLowerCase();
+  const matches = event.attendees.filter(
+    (a) => a.email && a.email.toLowerCase().startsWith(lower)
+  );
+  if (matches.length === 0) return null;
+  // Prefer @solarfixaz.com when multiple addresses match the name.
+  const solar = matches.find((a) => a.email.toLowerCase().includes("@solarfixaz.com"));
+  return (solar || matches[0]).email;
+}
+
+function findAttendeeEmailInHistory(name, history) {
+  if (!name || !history?.length) return null;
+  const lower = name.toLowerCase();
+  const recent = history.slice(-10).map((m) => m.content || "").join("\n");
+  const emails = recent.match(/[\w.+-]+@[\w-]+\.[\w.-]+/g) || [];
+  const matches = emails.filter((e) => e.toLowerCase().startsWith(lower));
+  if (matches.length === 0) return null;
+  const solar = matches.find((e) => e.toLowerCase().includes("@solarfixaz.com"));
+  return solar || matches[0];
 }
 
 async function handleCalendarWrite(ctx) {
   if (!isCalendarWrite(ctx.message)) return null;
 
-  const details = await extractEventDetails(ctx.message, ctx.today);
+  const details = await extractEventDetails(ctx.message, ctx.today, ctx.history);
 
   if (details.action === "add") {
     if (!details.title || !details.date || !details.time) {
@@ -859,7 +911,46 @@ async function handleCalendarWrite(ctx) {
     });
     const data = await res.json();
     if (!data.success) return reply(`Couldn't move that event: ${data.error}`);
-    return reply(`Done — moved "${event.title}" to ${format12Hour(newTime)} on ${formatDateLabel(new Date(`${newDate}T12:00:00`))} (was ${event.time}).`);
+
+    const oldTimeLabel = event.time;
+    const newTimeLabel = format12Hour(newTime);
+    const dayLabel = formatDateLabel(new Date(`${newDate}T12:00:00`));
+    const confirmation = `Done — moved "${event.title}" to ${newTimeLabel} on ${dayLabel} (was ${oldTimeLabel}).`;
+
+    // If Brad named a specific person ("move the meeting with Nicole..."), auto-draft an
+    // email to them so they can be notified. Email is taken from the event's attendee list
+    // when available, otherwise from prior calendar context in conversation history.
+    // Never invent an address.
+    const personName = extractPersonFromMessage(ctx.message);
+    const attendeeEmail = personName
+      ? findAttendeeEmailInEvent(personName, event) ||
+        findAttendeeEmailInHistory(personName, ctx.history)
+      : null;
+
+    if (personName && attendeeEmail) {
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Moved ${event.title} from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}`
+        );
+      } catch (e) { console.log("[chat] couldn't save move memory:", e.message); }
+
+      return reply(`${confirmation}
+
+Draft email:
+To: ${attendeeEmail}
+Subject: Meeting moved to ${newTimeLabel}
+Body:
+Hi ${personName},
+
+I needed to reschedule our meeting from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}. Hope that still works for you — let me know if not.
+
+Best,
+Brad
+
+Send it?`);
+    }
+
+    return reply(confirmation);
   }
 
   return null; // action === "none" — fall through
@@ -1046,6 +1137,8 @@ async function handleNormalChat(ctx) {
 
 ${ANTI_HALLUCINATION_RULE}
 
+${MEMORY_VS_CALENDAR_RULE}
+
 Brad's home: ${HOME_ADDRESS}
 Brad's shop: ${SHOP_ADDRESS}
 Today: ${ctx.today}
@@ -1058,6 +1151,7 @@ Rules:
 - Use conversation history - never ask for info already discussed
 - Never guess drive times or traffic - call Google Maps only
 - Never re-search calendar if data already in conversation
+- If calendar data is in conversation history, use it directly — never reply "couldn't find that event" for something already listed in history
 - For email drafts: show first, wait for approval
 - Strip all XML tags from final response
 - Keep responses direct and brief

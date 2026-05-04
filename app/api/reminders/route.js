@@ -201,6 +201,40 @@ export async function POST(req) {
   return Response.json({ reminder: data?.[0], success: true });
 }
 
+export async function DELETE(req) {
+  try {
+    const body = await req.json().catch(() => ({}));
+
+    if (body.deleteAll) {
+      console.log("[/api/reminders DELETE] deleteAll requested");
+      const { error } = await supabase
+        .from("reminders")
+        .delete()
+        .eq("triggered", false);
+      if (error) throw error;
+      return Response.json({ success: true, message: "All reminders deleted" });
+    }
+
+    if (body.id) {
+      console.log("[/api/reminders DELETE] deleting id=", body.id);
+      const { error } = await supabase
+        .from("reminders")
+        .delete()
+        .eq("id", body.id);
+      if (error) throw error;
+      return Response.json({ success: true });
+    }
+
+    return Response.json(
+      { error: "Provide { deleteAll: true } or { id }" },
+      { status: 400 }
+    );
+  } catch (error) {
+    console.log("[/api/reminders DELETE] FAILED:", error.message, "| code:", error.code, "| details:", error.details);
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+}
+
 export async function PATCH(req) {
   const { id } = await req.json();
   if (!id) return Response.json({ error: "id required" }, { status: 400 });

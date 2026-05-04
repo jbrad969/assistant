@@ -1363,6 +1363,60 @@ If Brad says "remind me 15 min before X" and X has a time in history, set remind
   return parseJsonFromClaude(raw);
 }
 
+function isDeleteAllReminders(message) {
+  const m = message.toLowerCase();
+  // Require an explicit "all" / "every" qualifier so "delete my reminder" (singular,
+  // specific) doesn't accidentally wipe the whole table.
+  return /\b(delete|clear|remove|wipe)\s+(?:all|every)\s+(?:of\s+)?(?:my\s+)?reminders?\b/.test(m);
+}
+
+async function handleDeleteAllReminders(ctx) {
+  if (!isDeleteAllReminders(ctx.message)) return null;
+
+  // Count before so we can confirm an exact number to Brad.
+  let beforeCount = 0;
+  try {
+    const beforeRes = await fetch(`${BASE_URL}/api/reminders`);
+    const before = await beforeRes.json();
+    beforeCount = (before.reminders || []).length;
+  } catch (e) {
+    console.log("[chat] pre-delete count failed:", e.message);
+  }
+
+  const res = await fetch(`${BASE_URL}/api/reminders`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deleteAll: true }),
+  });
+  const data = await res.json();
+  console.log("Delete all reminders result:", JSON.stringify(data));
+
+  if (!res.ok || !data.success) {
+    return reply(`I had trouble deleting reminders: ${data?.error || `status ${res.status}`}`);
+  }
+
+  // Verify by re-fetching.
+  let afterCount = null;
+  try {
+    const afterRes = await fetch(`${BASE_URL}/api/reminders`);
+    const after = await afterRes.json();
+    afterCount = (after.reminders || []).length;
+  } catch (e) {
+    console.log("[chat] post-delete verify failed:", e.message);
+  }
+
+  const noun = beforeCount === 1 ? "reminder" : "reminders";
+  if (afterCount === 0) {
+    return reply(`Done — deleted all ${beforeCount} ${noun}. Your reminder list is now empty.`);
+  }
+  if (afterCount === null) {
+    return reply(`Done — deleted all ${beforeCount} ${noun}.`);
+  }
+  return reply(
+    `Deleted some, but ${afterCount} reminder${afterCount === 1 ? "" : "s"} still showing — something may have failed. Try again.`
+  );
+}
+
 function isRemindersListQuestion(message) {
   const m = message.toLowerCase();
   return (
@@ -1529,6 +1583,7 @@ ${NO_GUESS_EMAIL_RULE}`,
 const HANDLERS = [
   handleCompoundApproval,  // "send it" when prior turn queued BOTH a calendar move and an email
   handleEmailSendApproval, // "send it" when only a Draft email is pending
+  handleDeleteAllReminders,// "delete all reminders" / "clear all reminders" — destructive, narrow trigger
   handleRemindersList,     // "any reminders" / "what reminders are set" — read-only
   handleReminder,          // "remind me" — must beat departure / calendar
   handleQuote,             // narrow phrase triggers

@@ -431,9 +431,10 @@ async function buildEmailSearchQuery(personDescription) {
 Return JSON: {
   "queries": ["query1", "query2", "query3"]
 }
+Do not hardcode any email domain. Use only the name variations and from:/cc:/to: operators.
 Examples:
-- "Eric Brandley" -> ["from:Eric", "cc:Eric", "from:eric@solarfixaz.com OR cc:eric@solarfixaz.com", "Eric Brandley"]
-- "Nicole" -> ["from:Nicole", "cc:Nicole", "from:nicole@solarfixaz.com"]
+- "Eric Brandley" -> ["from:Eric", "cc:Eric", "from:Brandley OR cc:Brandley", "Eric Brandley"]
+- "Nicole" -> ["from:Nicole", "cc:Nicole", "to:Nicole", "Nicole"]
 Generate 3-4 different query variations to maximize chances of finding the emails.`,
         },
         {

@@ -24,6 +24,10 @@ const DAYS_PATTERN = /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday
 
 const NO_GUESS_EMAIL_RULE = `NEVER guess or make up email addresses. NEVER. If you don't have the exact email address from the API data, say exactly this: 'I can see Nicole's emails but I need you to confirm her email address - I don't want to guess.' Do not attempt to construct or guess any email address under any circumstances.`;
 
+const ANTI_HALLUCINATION_RULE = `RULE #1 - NEVER HALLUCINATE: If the API returns no data or an error, say you cannot access the information right now. NEVER invent appointments, email addresses, names, times, or any facts. If you don't have real data from an API call, say 'I don't have that information right now' and stop.`;
+
+const CALENDAR_FAILURE_REPLY = "I'm having trouble loading your calendar right now. Please try again in a moment.";
+
 /* ============================================================================
  * 2. SHARED HELPERS
  * ========================================================================== */
@@ -640,21 +644,30 @@ async function handleQuote(ctx) {
 
 async function getCalendarForDate(date) {
   const iso = date.toISOString();
-  const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`);
-  const data = await res.json();
-  if (!data.events || data.events.length === 0) {
-    return { label: formatDateLabel(date), text: "No events scheduled." };
+  try {
+    const res = await fetch(`${BASE_URL}/api/calendar/today?date=${encodeURIComponent(iso)}`);
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      console.log("[chat] calendar fetch error for", iso, "->", data.error || `status ${res.status}`);
+      return { label: formatDateLabel(date), error: true, details: data.error || `status ${res.status}` };
+    }
+    if (!data.events || data.events.length === 0) {
+      return { label: formatDateLabel(date), text: "No events scheduled." };
+    }
+    const text = data.events
+      .map((e) => {
+        const loc = e.location ? ` — ${e.location}` : "";
+        const invited = e.attendees && e.attendees.length
+          ? ` — invited: ${e.attendees.join(", ")}`
+          : "";
+        return `${e.time} — ${e.title}${loc}${invited}`;
+      })
+      .join("\n");
+    return { label: formatDateLabel(date), text };
+  } catch (e) {
+    console.log("[chat] calendar fetch threw for", iso, "->", e.message);
+    return { label: formatDateLabel(date), error: true, details: e.message };
   }
-  const text = data.events
-    .map((e) => {
-      const loc = e.location ? ` — ${e.location}` : "";
-      const invited = e.attendees && e.attendees.length
-        ? ` — invited: ${e.attendees.join(", ")}`
-        : "";
-      return `${e.time} — ${e.title}${loc}${invited}`;
-    })
-    .join("\n");
-  return { label: formatDateLabel(date), text };
 }
 
 async function handleCalendarRead(ctx) {
@@ -670,13 +683,24 @@ async function handleCalendarRead(ctx) {
 
   const dates = getDetectedDates(ctx.message);
   const schedules = await Promise.all(dates.map(getCalendarForDate));
+
+  // If any day failed, refuse to narrate — never let Claude fill the gap with invented events.
+  if (schedules.some((s) => s.error)) {
+    console.log("[chat] calendar narration skipped due to API error(s)");
+    return reply(CALENDAR_FAILURE_REPLY);
+  }
+
   const calendarContext = schedules.map((s) => `${s.label}:\n${s.text}`).join("\n\n");
 
   const text = await claudeNarrate({
     system: `You are Jess, Brad's executive assistant.
+
+${ANTI_HALLUCINATION_RULE}
+
 Today is ${ctx.today}. Use it as the reference for the current date — never reference events from wrong years.
 Summarize the schedule naturally — time, title, and location. No markdown. Brief.
 Calendar event locations are DESTINATIONS Brad is going to, never his home.
+Only mention events that appear in the Calendar data block below. If a day shows "No events scheduled.", say exactly that — never invent events.
 
 ${NO_GUESS_EMAIL_RULE}
 If Brad asks for an email address from a calendar invite, ONLY return what appears in the "invited:" list below — copy it verbatim. If a person isn't in that list, say you don't have their address.`,
@@ -978,6 +1002,9 @@ async function handleNormalChat(ctx) {
     model: CLAUDE_MODEL,
     max_tokens: 1024,
     system: `You are Jess, Brad's executive assistant.
+
+${ANTI_HALLUCINATION_RULE}
+
 Brad's home: ${HOME_ADDRESS}
 Brad's shop: ${SHOP_ADDRESS}
 Today: ${ctx.today}

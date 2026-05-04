@@ -94,10 +94,18 @@ export async function GET(req) {
     const days = Math.max(1, Math.min(30, parseInt(searchParams.get("days") || "1", 10)));
     const searchTitle = searchParams.get("searchTitle");
 
+    console.log("Calendar API called for date:", date, "days:", days, "searchTitle:", searchTitle);
+    console.log(
+      "Auth credentials present:",
+      !!process.env.GOOGLE_CLIENT_ID,
+      !!process.env.GOOGLE_REFRESH_TOKEN
+    );
+
     const auth = getGoogleClient();
     const calendar = google.calendar({ version: "v3", auth });
 
     const { timeMin, timeMax } = getDateRange(date, days);
+    console.log("Calendar window:", timeMin, "to", timeMax);
 
     const result = await calendar.events.list({
       calendarId: "primary",
@@ -108,6 +116,8 @@ export async function GET(req) {
       orderBy: "startTime",
       maxResults: days > 1 ? 250 : 50,
     });
+
+    console.log("Calendar API returned", (result.data.items || []).length, "raw items");
 
     let events = (result.data.items || []).map((event) => ({
       id: event.id,
@@ -143,7 +153,11 @@ export async function GET(req) {
       text: formatted.join("\n"), // <-- CLEAN MULTI-LINE OUTPUT
     });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    console.log("Calendar API FAILED:", error.message);
+    return Response.json(
+      { events: [], error: "Calendar API failed", details: error.message },
+      { status: 500 }
+    );
   }
 }
 

@@ -436,10 +436,13 @@ async function buildEmailSearchQuery(personDescription) {
 Return JSON: {
   "queries": ["query1", "query2", "query3"]
 }
-Do not hardcode any email domain. Use only the name variations and from:/cc:/to: operators.
+Rules:
+- Do not hardcode any email domain.
+- Never include in:inbox, is:unread, label:, or any other Gmail filter operator. Those over-restrict results.
+- Use only name variations with the from:, cc:, and to: operators, plus a bare-name query.
 Examples:
-- "Eric Brandley" -> ["from:Eric", "cc:Eric", "from:Brandley OR cc:Brandley", "Eric Brandley"]
-- "Nicole" -> ["from:Nicole", "cc:Nicole", "to:Nicole", "Nicole"]
+- "Eric Brandley" -> ["Eric Brandley", "from:Eric Brandley", "cc:Eric Brandley"]
+- "Nicole" -> ["Nicole", "from:Nicole", "cc:Nicole", "to:Nicole"]
 Generate 3-4 different query variations to maximize chances of finding the emails.`,
         },
         {

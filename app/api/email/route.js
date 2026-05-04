@@ -51,20 +51,19 @@ export async function GET(req) {
     const fullBody = searchParams.get("full") === "true";
     const recent = searchParams.get("recent") === "true";
 
-    // Multi-query search defaults to 50/query, single-query to 20, inbox/recent
-    // peeks to 5. Caller can always override via ?limit=.
+    // Searches default to 50 per query (Brad wants historical context); plain
+    // fetches default to 10. Caller can always override via ?limit=.
     const isSearch = searches.length > 0;
-    const isMulti = searches.length > 1;
-    const defaultLimit = isMulti ? 50 : isSearch ? 20 : 5;
+    const defaultLimit = isSearch ? 50 : 10;
     const limit = explicitLimit ? parseInt(explicitLimit) : defaultLimit;
 
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
-    // Default query is in:inbox so peeks return the newest message regardless of
-    // read state. When search terms are passed we run each directly so they hit
-    // ALL mail (read + unread, every folder) — not just the inbox.
-    const queries = isSearch ? searches : ["in:inbox"];
+    // No "in:inbox" or "is:unread" wrapping. An empty q searches ALL mail
+    // (newest first); search terms run literally so they match read + unread
+    // across every folder. Anything else over-restricts results.
+    const queries = isSearch ? searches : [""];
 
     const listResults = await Promise.all(
       queries.map((q) =>

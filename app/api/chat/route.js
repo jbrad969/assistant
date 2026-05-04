@@ -68,19 +68,23 @@ function isEmailRead(msg) {
 }
 
 function isEmailSend(msg) {
-  const m = msg.toLowerCase();
+  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
+  const approvalPhrases = [
+    "send it", "yes send", "yes send it", "send", "go", "go ahead",
+    "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
+  ];
+  const isApproval = approvalPhrases.some((p) => m === p || m.startsWith(p + " "));
+
   return (
+    isApproval ||
     m.includes("send an email") ||
     m.includes("send email") ||
     m.includes("email to") ||
-    /\bemail\s+(her|him|nicole|mike|john|sarah|yvonne)\b/.test(m) ||
+    /\bemail\s+(her|him|nicole|mike|john|sarah|yvonne|eric|brad)\b/.test(m) ||
     m.includes("draft an email") ||
     m.includes("draft email") ||
     m.includes("write an email") ||
-    m.includes("write email") ||
-    m.includes("send it") ||
-    m.includes("yes send") ||
-    m.includes("looks good")
+    m.includes("write email")
   );
 }
 
@@ -780,7 +784,9 @@ export async function POST(req) {
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
-        system: buildSystemPrompt(today, memoryText),
+        system:
+          buildSystemPrompt(today, memoryText) +
+          "\n\nCRITICAL: Do NOT claim you sent any email. Do NOT say 'sent' or 'email sent'. Only draft the email and show it to Brad. Say 'Here's what I'll send - shall I send it?' Never claim an action happened that you didn't execute.",
         messages: [
           ...history.map((m) => ({ role: m.role, content: m.content })),
           { role: "user", content: message },

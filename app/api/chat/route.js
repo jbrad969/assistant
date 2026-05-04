@@ -509,6 +509,33 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
+// Tolerant draft parser. Handles:
+//   - "To: x@y\nSubject: z\n\nbody..."
+//   - "To: x@y\nSubject: z\nBody:\nbody..."
+//   - "To: x@y\nSubject: z\nbody..."   (single newline before body)
+// Trailing markers like "Send it?" / "---" are stripped from the body.
+function parseEmailDraft(text) {
+  if (!text) return null;
+  const toMatch = text.match(/^\s*To:\s*(.+?)\s*$/im);
+  const subjMatch = text.match(/^\s*Subject:\s*(.+?)\s*$/im);
+  if (!toMatch || !subjMatch) return null;
+
+  const to = toMatch[1].trim().replace(/^[<"']|[>"']$/g, "");
+  const subject = subjMatch[1].trim();
+
+  // Body = everything after the Subject line, with optional "Body:" label removed,
+  // and any trailing approval marker cut. Do NOT split on bare blank lines — bodies
+  // legitimately contain paragraph breaks.
+  const subjEnd = subjMatch.index + subjMatch[0].length;
+  let bodyRaw = text.slice(subjEnd);
+  bodyRaw = bodyRaw.replace(/^\s*Body:\s*\n?/i, "");
+  bodyRaw = bodyRaw.split(/\n\s*(?:Send it\?|Shall I send|---)/i)[0];
+  bodyRaw = bodyRaw.replace(/\n*Send it\?\s*$/i, "").trim();
+
+  if (!to || !subject || !bodyRaw) return null;
+  return { to, subject, body: bodyRaw };
+}
+
 // True when every day-name Brad mentions in the current message already appears in the
 // last 10 turns of conversation — i.e. that day's schedule has been retrieved and Claude
 // can answer from history without re-calling /api/calendar/today.
@@ -710,26 +737,46 @@ export async function POST(req) {
     // 5. EMAIL SEND
     if (isEmailSend(msg)) {
       const lastAssistantMsg = history.filter((m) => m.role === "assistant").slice(-1)[0];
-      const isDraftApproval =
-        msg.includes("send it") || msg.includes("yes send") || msg.includes("looks good");
+      const lastContent = lastAssistantMsg?.content || "";
 
-      if (isDraftApproval && lastAssistantMsg?.content?.includes("To:")) {
-        // Parse To/Subject/Body from the prior draft and send.
-        const draftMatch = lastAssistantMsg.content.match(
-          /To:\s*([^\n]+)\nSubject:\s*([^\n]+)\n\n([\s\S]+?)(?:\n---|\n\nShall|\n\nSend it\?|$)/
-        );
-        if (draftMatch) {
-          const [, to, subject, body] = draftMatch;
-          const result = await sendEmail(to.trim(), subject.trim(), body.trim());
-          if (result.success) {
-            return Response.json({ reply: `Email sent to ${to.trim()}.` });
-          }
+      // Approval phrases — Brad confirming a draft we already showed.
+      const trimmed = msg.trim().replace(/[.!?]+$/, "");
+      const APPROVAL_PHRASES = [
+        "send it", "yes send", "yes send it", "send", "go", "go ahead",
+        "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
+      ];
+      const isDraftApproval = APPROVAL_PHRASES.some(
+        (p) => trimmed === p || trimmed.startsWith(p + " ")
+      );
+
+      // Detect that the prior assistant turn actually was a draft.
+      const lookedLikeDraft = /^\s*To:\s*\S+/im.test(lastContent) && /^\s*Subject:\s*\S+/im.test(lastContent);
+
+      if (isDraftApproval && lookedLikeDraft) {
+        const draft = parseEmailDraft(lastContent);
+        if (!draft) {
+          console.log("[email send] draft approval detected but parse failed; lastContent:\n", lastContent.slice(0, 400));
           return Response.json({
-            reply: "I had trouble sending that email: " + (result.error || "unknown"),
+            reply: "I had the draft but couldn't parse the To/Subject/Body cleanly. Tell me again who to send to, the subject, and the body.",
           });
         }
+
+        console.log("SENDING EMAIL to:", draft.to, "subject:", draft.subject);
+        const result = await sendEmail(draft.to, draft.subject, draft.body);
+        console.log("EMAIL SEND RESULT:", JSON.stringify(result));
+
+        if (result?.success === true) {
+          try {
+            await insertMemoryWithCap(`[LOG] Sent email to ${draft.to} on ${today}: ${draft.subject}`);
+          } catch (e) { console.log("[email send] couldn't log memory:", e.message); }
+          return Response.json({ reply: `Email sent to ${draft.to}.` });
+        }
+        return Response.json({
+          reply: "I couldn't send that email: " + (result?.error || "unknown error"),
+        });
       }
 
+      // Not an approval (or no draft visible) — have Claude draft a fresh one.
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,

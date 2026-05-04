@@ -135,13 +135,18 @@ export async function POST(req) {
       .replace(/\//g, "_")
       .replace(/=+$/, "");
 
-    await gmail.users.messages.send({
+    const sendResult = await gmail.users.messages.send({
       userId: "me",
       requestBody: { raw: encoded },
     });
+    console.log("[/api/email POST] gmail send id:", sendResult.data?.id, "threadId:", sendResult.data?.threadId);
 
-    return Response.json({ success: true });
+    return Response.json({ success: true, id: sendResult.data?.id, threadId: sendResult.data?.threadId });
   } catch (error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    console.log("[/api/email POST] FAILED:", error.message, "| code:", error.code, "| response:", JSON.stringify(error.response?.data));
+    return Response.json(
+      { success: false, error: error.message, code: error.code, details: error.response?.data },
+      { status: 500 }
+    );
   }
 }

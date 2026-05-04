@@ -513,31 +513,35 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
-// Tolerant draft parser. Handles:
-//   - "To: x@y\nSubject: z\n\nbody..."
-//   - "To: x@y\nSubject: z\nBody:\nbody..."
-//   - "To: x@y\nSubject: z\nbody..."   (single newline before body)
-// Trailing markers like "Send it?" / "---" are stripped from the body.
+// Parse a To/Subject/Body draft from an assistant message. Handles both plain
+// "To: ..." form and markdown-bold "**To:** ..." / "[email](mailto:email)" forms.
 function parseEmailDraft(text) {
   if (!text) return null;
-  const toMatch = text.match(/^\s*To:\s*(.+?)\s*$/im);
-  const subjMatch = text.match(/^\s*Subject:\s*(.+?)\s*$/im);
-  if (!toMatch || !subjMatch) return null;
+  // Strip markdown bold and convert markdown links "[label](url)" -> "label"
+  const cleaned = text
+    .replace(/\*\*/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+
+  const toMatch = cleaned.match(/To:\s*([^\n]+)/i);
+  const subjectMatch = cleaned.match(/Subject:\s*([^\n]+)/i);
+  const bodyMatch = cleaned.match(/Body:\s*([\s\S]+?)(?:\n\nWant|\n\nShall|\n\n---|\n\nSend|$)/i);
+
+  if (!toMatch || !subjectMatch) return null;
 
   const to = toMatch[1].trim().replace(/^[<"']|[>"']$/g, "");
-  const subject = subjMatch[1].trim();
+  const subject = subjectMatch[1].trim();
+  let body = bodyMatch ? bodyMatch[1].trim() : "";
 
-  // Body = everything after the Subject line, with optional "Body:" label removed,
-  // and any trailing approval marker cut. Do NOT split on bare blank lines — bodies
-  // legitimately contain paragraph breaks.
-  const subjEnd = subjMatch.index + subjMatch[0].length;
-  let bodyRaw = text.slice(subjEnd);
-  bodyRaw = bodyRaw.replace(/^\s*Body:\s*\n?/i, "");
-  bodyRaw = bodyRaw.split(/\n\s*(?:Send it\?|Shall I send|---)/i)[0];
-  bodyRaw = bodyRaw.replace(/\n*Send it\?\s*$/i, "").trim();
+  // If Claude's draft skipped the "Body:" label, fall back to "everything after Subject".
+  if (!body) {
+    const subjEnd = subjectMatch.index + subjectMatch[0].length;
+    let raw = cleaned.slice(subjEnd);
+    raw = raw.split(/\n\s*(?:Send it\?|Shall I send|---|Want me to send|Want to send)/i)[0];
+    body = raw.trim();
+  }
 
-  if (!to || !subject || !bodyRaw) return null;
-  return { to, subject, body: bodyRaw };
+  if (!to || !subject || !body) return null;
+  return { to, subject, body };
 }
 
 // True when every day-name Brad mentions in the current message already appears in the
@@ -753,8 +757,11 @@ export async function POST(req) {
         (p) => trimmed === p || trimmed.startsWith(p + " ")
       );
 
-      // Detect that the prior assistant turn actually was a draft.
-      const lookedLikeDraft = /^\s*To:\s*\S+/im.test(lastContent) && /^\s*Subject:\s*\S+/im.test(lastContent);
+      // Detect that the prior assistant turn actually was a draft. Tolerates markdown bold
+      // ("**To:**") and inline placement (no leading whitespace required).
+      const lookedLikeDraft =
+        /\*?\*?To:\*?\*?\s*\S+/im.test(lastContent) &&
+        /\*?\*?Subject:\*?\*?\s*\S+/im.test(lastContent);
 
       if (isDraftApproval && lookedLikeDraft) {
         const draft = parseEmailDraft(lastContent);

@@ -81,20 +81,22 @@ export async function GET(req) {
         const decoded = decodeBody(detail.data.payload);
         const body = fullBody ? decoded.slice(0, 8000) : decoded.slice(0, 500);
 
-        // Parse the bare email address out of the From header (e.g. "Nicole Reid <nreid@solarfixaz.com>" -> "nreid@solarfixaz.com").
-        let fromEmail = "";
-        const angle = from.match(/<([^>]+@[^>]+)>/);
-        if (angle) fromEmail = angle[1].trim();
-        else {
-          const bare = from.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
-          if (bare) fromEmail = bare[0];
-        }
+        // Parse the From header into a bare address and a display name.
+        // Examples:
+        //   "Eric Branley <eric@company.com>"   -> { fromEmail: "eric@company.com", fromName: "Eric Branley" }
+        //   "eric@company.com"                  -> { fromEmail: "eric@company.com", fromName: "eric@company.com" }
+        const fromHeader = from;
+        const emailMatch = fromHeader.match(/<([^>]+)>/) || fromHeader.match(/([^\s<]+@[^\s>]+)/);
+        const fromEmail = emailMatch ? emailMatch[1].trim() : fromHeader.trim();
+        const fromName =
+          fromHeader.replace(/<[^>]+>/, "").trim().replace(/^["']|["']$/g, "") || fromEmail;
 
         return {
           id: msg.id,
           subject,
-          from,        // raw "Name <email@domain.com>" header value
-          fromEmail,   // parsed bare email address — never null on real Gmail rows
+          from: fromHeader,        // full string e.g. "Eric Branley <eric@company.com>"
+          fromEmail,               // just eric@company.com
+          fromName,                // just Eric Branley (or the address if no display name)
           to,
           date,
           body,

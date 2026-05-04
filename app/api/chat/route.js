@@ -435,6 +435,67 @@ Only Tile/Shingle/Flat for roofMaterial. If unclear, null.`,
 }
 
 /* ============================================================================
+ * DEPARTURE HELPERS
+ * ========================================================================== */
+
+function detectDepartureOrigin(message) {
+  const m = message.toLowerCase();
+  if (m.includes("from the shop") || m.includes("from shop")) return SHOP;
+  if (m.includes("from home") || m.includes("from my house")) return HOME;
+  return HOME; // default
+}
+
+// Extract the event Brad is departing for. Requires an explicit travel-verb prefix so
+// "when do I need to leave" returns null and "leave for BNI" returns "BNI" (not "leave for BNI").
+function extractEventNameFromDeparture(message) {
+  const trigger = /\b(?:leave\s+(?:for|to)|leaving\s+(?:for|to)|head(?:ing)?\s+(?:for|to|over\s+to|out\s+(?:to|for))|go(?:ing)?\s+(?:to|over\s+to)|driv(?:e|ing)\s+(?:to|over\s+to)|get(?:ting)?\s+to)\s+(?:the\s+|my\s+)?([\w&'\-][\w &'\-]{0,40}?)(?:\s+meeting|\s+event|\s+appointment|\s+job|\s+at\b|\s+by\b|[?.,!]|$)/i;
+  const match = message.match(trigger);
+  if (!match) return null;
+  let candidate = match[1].trim();
+  candidate = candidate.replace(/^(the|my)\s+/i, "");
+  if (!candidate) return null;
+  if (/^next\b/i.test(candidate)) return null;
+  if (candidate.split(/\s+/).length > 5) return null;
+  return candidate;
+}
+
+// Scan the last 10 assistant messages for a "<eventName>... at <location>" pattern.
+// Returns the captured location string or null.
+function findEventLocationInHistory(eventName, history) {
+  if (!eventName) return null;
+  const needle = eventName.toLowerCase();
+  for (let i = history.length - 1; i >= 0; i--) {
+    const turn = history[i];
+    if (turn.role !== "assistant") continue;
+    const lines = (turn.content || "").split("\n");
+    for (const line of lines) {
+      const idx = line.toLowerCase().indexOf(needle);
+      if (idx === -1) continue;
+      const after = line.slice(idx + needle.length);
+      // Match " at <location>" up to "(attendees:" or end of line
+      const atMatch = after.match(/\s+at\s+([^(\n]+?)(?:\s+\(attendees|$)/i);
+      if (atMatch) return atMatch[1].trim().replace(/[.,;]\s*$/, "");
+    }
+  }
+  return null;
+}
+
+// Search the calendar by title across the next 7 days. Returns the soonest upcoming match.
+async function findUpcomingEventByTitle(eventName) {
+  const params = new URLSearchParams({ days: "7", searchTitle: eventName });
+  const res = await fetch(`${BASE_URL}/api/calendar/today?${params.toString()}`);
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    console.log(`[departure] calendar search by title failed: ${data?.error || res.status}`);
+    return null;
+  }
+  const events = (data.events || [])
+    .filter((e) => new Date(e.start).getTime() > Date.now())
+    .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+  return events[0] || null;
+}
+
+/* ============================================================================
  * POST HANDLER — intent dispatcher
  * ========================================================================== */
 
@@ -514,7 +575,7 @@ export async function POST(req) {
       }
       const emailContext = emails
         .map((e, i) =>
-          `${i + 1}. From: ${e.from}\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${(e.body || "").slice(0, 300)}`
+          `${i + 1}. From: ${e.from}\nEmail address: ${e.fromEmail || "(unknown)"}\nSender name: ${e.fromName || "(unknown)"}\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${(e.body || "").slice(0, 300)}`
         )
         .join("\n\n");
 
@@ -639,19 +700,66 @@ export async function POST(req) {
 
     // 9. DEPARTURE
     if (isDeparture(msg)) {
-      const origin = msg.includes("shop") || msg.includes("office") ? SHOP : HOME;
-      const dates = getDetectedDates(message);
-      const schedule = await getCalendar(dates[0]);
-      const events = schedule.events || [];
-      const eventWithLocation = events.find((e) => e.location && e.location.length > 0);
+      const origin = detectDepartureOrigin(message);
+      const eventName = extractEventNameFromDeparture(message);
+      console.log(`[departure] origin=${origin} eventName=${eventName || "(none)"}`);
 
-      if (!eventWithLocation) {
-        return Response.json({
-          reply: "I can see your calendar but none of the upcoming events have a location listed. What address are you heading to?",
-        });
+      let location = null;
+      let title = eventName;
+      let arrivalIso = null;
+      let arrivalTimeText = null;
+
+      if (eventName) {
+        // Step 1: scan conversation history for the event Brad named.
+        const histLocation = findEventLocationInHistory(eventName, history);
+        // Step 2: search the calendar by title across 7 days for the canonical event/start time.
+        const apiEvent = await findUpcomingEventByTitle(eventName);
+
+        if (!apiEvent && !histLocation) {
+          console.log(`[departure] no "${eventName}" found in history or calendar`);
+          return Response.json({
+            reply: `I don't see a "${eventName}" event on your calendar in the next 7 days.`,
+          });
+        }
+
+        // Prefer history's location if present (per spec); fall back to the calendar API's value.
+        location = histLocation || apiEvent?.location || null;
+        title = apiEvent?.title || eventName;
+        arrivalIso = apiEvent ? new Date(apiEvent.start).toISOString() : null;
+        arrivalTimeText = apiEvent?.time || null;
+
+        console.log(
+          `[departure] using location="${location}" (source=${histLocation ? "history" : "api"}) for "${title}"`
+        );
+
+        if (!location) {
+          return Response.json({
+            reply: `I see "${title}" on your calendar but no location is set. What address?`,
+          });
+        }
+      } else {
+        // No specific event named — fall back to next event with a location across 7 days.
+        const params = new URLSearchParams({ days: "7" });
+        const res = await fetch(`${BASE_URL}/api/calendar/today?${params.toString()}`);
+        const data = await res.json();
+        const upcoming = (data.events || [])
+          .filter((e) => e.location && new Date(e.start).getTime() > Date.now())
+          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+        if (upcoming.length === 0) {
+          return Response.json({
+            reply: "I can see your calendar but none of the upcoming events have a location listed. What address are you heading to?",
+          });
+        }
+        const ev = upcoming[0];
+        location = ev.location;
+        title = ev.title;
+        arrivalIso = new Date(ev.start).toISOString();
+        arrivalTimeText = ev.time;
+        console.log(`[departure] no event named; using next: "${title}" at "${location}"`);
       }
 
-      const maps = await getDriveTime(origin, eventWithLocation.location);
+      console.log(`[departure] calling Maps with origin="${origin}" destination="${location}"`);
+      const maps = await getDriveTime(origin, location);
       if (!maps) {
         return Response.json({
           reply: "I'm having trouble reaching Google Maps right now. Try again in a moment.",
@@ -659,15 +767,20 @@ export async function POST(req) {
       }
 
       const driveMinutes = maps.driveTimeMinutes;
-      const eventTime = new Date(eventWithLocation.start);
-      const departureTime = new Date(eventTime.getTime() - (driveMinutes + 10) * 60000);
-      const departureStr = departureTime.toLocaleTimeString("en-US", {
-        hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
-      });
+      let departureLine;
+      if (arrivalIso) {
+        const arrivalMs = new Date(arrivalIso).getTime();
+        const departureMs = arrivalMs - (driveMinutes + 10) * 60 * 1000;
+        const departureStr = new Date(departureMs).toLocaleTimeString("en-US", {
+          hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
+        });
+        departureLine = `Leave ${origin === HOME ? "home" : "the shop"} by ${departureStr} to make your ${arrivalTimeText} ${title} at ${location}. That's a ${driveMinutes}-minute drive with a 10-minute buffer.`;
+      } else {
+        // No arrivalIso (history-only path with no calendar match) — give a drive-time only answer.
+        departureLine = `It's ${driveMinutes} minutes from ${origin === HOME ? "home" : "the shop"} to ${location}.`;
+      }
 
-      return Response.json({
-        reply: `Leave ${origin === HOME ? "home" : "the shop"} by ${departureStr} to make your ${eventWithLocation.time} ${eventWithLocation.title} at ${eventWithLocation.location}. That's a ${driveMinutes}-minute drive with a 10-minute buffer.`,
-      });
+      return Response.json({ reply: departureLine });
     }
 
     // 10. NORMAL CHAT

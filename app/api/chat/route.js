@@ -160,7 +160,9 @@ ABSOLUTE RULES:
 10. Chain actions automatically
 
 TOOLS YOU HAVE:
-You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.`;
+You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.
+
+CRITICAL: Read the ENTIRE conversation history before responding. The history contains everything Brad has told you. If Brad references something from earlier in the conversation, it is in your history - find it and use it. Never ask for information that appears anywhere in the conversation history.`;
 }
 
 /* ============================================================================
@@ -507,6 +509,21 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
+// True when every day-name Brad mentions in the current message already appears in the
+// last 10 turns of conversation — i.e. that day's schedule has been retrieved and Claude
+// can answer from history without re-calling /api/calendar/today.
+function calendarAlreadyInHistory(message, history) {
+  const days = message.toLowerCase().match(/\b(today|tomorrow|sun|mon|tue|tues|wed|thu|thurs|fri|sat|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/g) || [];
+  if (days.length === 0) return false;
+  const recent = history.slice(-10).map((m) => m.content || "").join("\n").toLowerCase();
+  return days.every((d) => recent.includes(d));
+}
+
+function isExplicitCalendarRefresh(message) {
+  const m = message.toLowerCase();
+  return /\b(check (?:my )?calendar again|refresh|look again|any new events|re-?check|refetch)\b/.test(m);
+}
+
 // Scan the last 5 messages for a US street-style address. Returns the most recent match
 // (e.g. "2828 North PECO Drive", "15257 N Northsight Blvd", "5045 E Yale Street").
 function findRecentAddressInHistory(history) {
@@ -679,7 +696,13 @@ export async function POST(req) {
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system: buildSystemPrompt(today, memoryText),
-        messages: [{ role: "user", content: `Summarize these emails for Brad:\n\n${emailContext}` }],
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          {
+            role: "user",
+            content: `${message}\n\n--- Email data fetched for this turn ---\n${emailContext}`,
+          },
+        ],
       });
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
@@ -759,6 +782,23 @@ export async function POST(req) {
 
     // 8. CALENDAR READ
     if (isCalendarRead(msg)) {
+      // If the day Brad's asking about was already retrieved earlier in the conversation,
+      // skip the fetch — Claude can answer from history. Only re-fetch when Brad explicitly
+      // asks ("check my calendar again", "refresh", "any new events", etc.).
+      if (calendarAlreadyInHistory(message, history) && !isExplicitCalendarRefresh(message)) {
+        console.log("[calendar read] using cached calendar data from history; no fetch");
+        const cachedResponse = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 1024,
+          system: buildSystemPrompt(today, memoryText),
+          messages: [
+            ...history.map((m) => ({ role: m.role, content: m.content })),
+            { role: "user", content: message },
+          ],
+        });
+        return Response.json({ reply: cleanResponse(cachedResponse.content[0].text) });
+      }
+
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendar));
 
@@ -785,9 +825,10 @@ export async function POST(req) {
         max_tokens: 1024,
         system: buildSystemPrompt(today, memoryText),
         messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
           {
             role: "user",
-            content: `Brad asked: "${message}"\n\nCalendar data:\n${calendarContext}\n\nNarrate this naturally and briefly.`,
+            content: `${message}\n\n--- Calendar data fetched for this turn ---\n${calendarContext}`,
           },
         ],
       });

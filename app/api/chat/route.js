@@ -395,9 +395,10 @@ async function getDriveTime(origin, destination) {
   return data;
 }
 
-async function getEmails(search = null, limit = 5) {
+async function getEmails(search = null, limit = 5, recent = false) {
   const params = new URLSearchParams({ limit: String(limit) });
   if (search) params.append("search", search);
+  if (recent) params.append("recent", "true");
   const res = await fetch(`${BASE_URL}/api/email?${params.toString()}`);
   const data = await res.json();
   return data.emails || [];
@@ -724,10 +725,21 @@ export async function POST(req) {
       const searchMatch = msg.match(/from\s+(\w+)/);
       const search = searchMatch ? `from:${searchMatch[1]}` : null;
       const all = msg.includes("all");
-      const emails = await getEmails(search, all ? 20 : 5);
+      const lower = msg.toLowerCase();
+      const recent =
+        /\blast\s+emails?\b/.test(lower) ||
+        /\bmost\s+recent\s+emails?\b/.test(lower) ||
+        /\brecent\s+emails?\b/.test(lower) ||
+        /\bwhat\s+did\s+i\s+just\s+get\b/.test(lower);
+      const limit = recent ? 1 : all ? 20 : 5;
+      const emails = await getEmails(search, limit, recent);
       if (emails.length === 0) {
         return Response.json({
-          reply: search ? `No emails found from ${searchMatch[1]}.` : "No unread emails.",
+          reply: search
+            ? `No emails found from ${searchMatch[1]}.`
+            : recent
+              ? "No emails in your inbox."
+              : "No unread emails.",
         });
       }
       const emailContext = emails

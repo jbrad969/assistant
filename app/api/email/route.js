@@ -47,13 +47,19 @@ export async function GET(req) {
     const all = searchParams.get("all") === "true";
     const search = searchParams.get("search");
     const fullBody = searchParams.get("full") === "true";
+    const recent = searchParams.get("recent") === "true";
 
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
+    // Default query is now in:inbox so "last email" / "recent email" requests
+    // return the newest message regardless of read state. recent=true forces
+    // the same behavior even if a caller passes other flags.
+    const query = search || (recent ? "in:inbox" : "in:inbox");
+
     const listRes = await gmail.users.messages.list({
       userId: "me",
-      q: search || "is:unread",
+      q: query,
       maxResults: all ? 50 : parseInt(limit),
     });
 

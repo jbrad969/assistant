@@ -713,10 +713,21 @@ async function handleCalendarRead(ctx) {
       const text = events
         .map((e) => {
           const loc = e.location ? ` — ${e.location}` : "";
-          const invited = e.attendees && e.attendees.length
-            ? ` — invited: ${e.attendees.join(", ")}`
+          // Names line — always safe to read aloud.
+          const namesLine = e.attendees && e.attendees.length
+            ? `\n  invited: ${e.attendees.map((a) => a.name || a.email || "(unnamed)").join(", ")}`
             : "";
-          return `${e.time} — ${e.title}${loc}${invited}`;
+          // Emails line — only used when Brad explicitly asks. The system prompt enforces that.
+          const emailsLine = e.attendees && e.attendees.length
+            ? `\n  attendee emails (only mention if Brad asked): ${e.attendees
+                .filter((a) => a.email)
+                .map((a) => `${a.name || "?"} <${a.email}>`)
+                .join(", ") || "(none on file)"}`
+            : "";
+          const orgLine = e.organizer?.email
+            ? `\n  organizer: ${e.organizer.name || "?"} <${e.organizer.email}>`
+            : "";
+          return `${e.time} — ${e.title}${loc}${namesLine}${emailsLine}${orgLine}`;
         })
         .join("\n");
       return `${s.label}:\n${text}`;
@@ -733,8 +744,12 @@ Summarize the schedule naturally — time, title, and location. No markdown. Bri
 Calendar event locations are DESTINATIONS Brad is going to, never his home.
 Only mention events that appear in the Calendar data block below. If a day shows "No events scheduled.", say exactly that — never invent events.
 
+ATTENDEE NAMES vs EMAILS:
+- When summarizing a calendar event, you MAY include attendee NAMES from the "invited:" line.
+- DO NOT include attendee email addresses unless Brad specifically asks for them. If he just asks "what's on Wednesday", names are enough.
+
 ${NO_GUESS_EMAIL_RULE}
-If Brad asks for an email address from a calendar invite, ONLY return what appears in the "invited:" list below — copy it verbatim. If a person isn't in that list, say you don't have their address.`,
+When asked for someone's email address from a calendar event, ONLY use the exact email from the attendee emails line returned by the API. If the attendee emails line is empty or doesn't contain the person Brad named, say: "I can see [name] is on the invite but I cannot read their email address from the data - can you confirm it?" NEVER construct or guess an email address.`,
     user: `Calendar data:\n\n${calendarContext}\n\nBrad asked: "${ctx.message}"`,
   });
   return reply(text);

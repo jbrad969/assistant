@@ -405,13 +405,51 @@ async function getDriveTime(origin, destination) {
   return data;
 }
 
-async function getEmails(search = null, limit = 5, recent = false) {
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (search) params.append("search", search);
+async function getEmails(searchOrSearches = null, limit = null, recent = false) {
+  const params = new URLSearchParams();
+  if (limit != null) params.append("limit", String(limit));
+  if (Array.isArray(searchOrSearches)) {
+    for (const s of searchOrSearches) if (s) params.append("search", s);
+  } else if (searchOrSearches) {
+    params.append("search", searchOrSearches);
+  }
   if (recent) params.append("recent", "true");
   const res = await fetch(`${BASE_URL}/api/email?${params.toString()}`);
   const data = await res.json();
   return data.emails || [];
+}
+
+async function buildEmailSearchQuery(personDescription) {
+  try {
+    const result = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Build Gmail search queries for finding emails involving a person.
+Return JSON: {
+  "queries": ["query1", "query2", "query3"]
+}
+Examples:
+- "Eric Brandley" -> ["from:Eric", "cc:Eric", "from:eric@solarfixaz.com OR cc:eric@solarfixaz.com", "Eric Brandley"]
+- "Nicole" -> ["from:Nicole", "cc:Nicole", "from:nicole@solarfixaz.com"]
+Generate 3-4 different query variations to maximize chances of finding the emails.`,
+        },
+        {
+          role: "user",
+          content: `Find emails involving: ${personDescription}`,
+        },
+      ],
+    });
+    const parsed = JSON.parse(result.choices[0].message.content);
+    const queries = Array.isArray(parsed?.queries) ? parsed.queries.filter(Boolean) : [];
+    console.log(`[buildEmailSearchQuery] "${personDescription}" ->`, JSON.stringify(queries));
+    return queries.length > 0 ? queries : [`from:${personDescription} OR cc:${personDescription} OR to:${personDescription}`];
+  } catch (e) {
+    console.log("[buildEmailSearchQuery] failed:", e.message);
+    return [`from:${personDescription} OR cc:${personDescription} OR to:${personDescription}`];
+  }
 }
 
 async function sendEmail(to, subject, body) {
@@ -734,23 +772,36 @@ export async function POST(req) {
     if (isEmailRead(msg)) {
       const lower = msg.toLowerCase();
 
-      // Person-specific search. "X reached out / emailed / contacted" → messages
-      // SENT by X (from + cc). Generic "from X" / "emails about X" widens to
-      // include messages where X was a recipient too.
-      const STOP = ["i", "you", "we", "they", "he", "she", "me", "us", "someone", "anyone", "the", "a"];
-      const reachMatch =
-        lower.match(/when\s+did\s+(\w+)\s+(?:last\s+)?(?:reach(?:ed)?\s+out|email(?:ed)?|message(?:d)?|contact(?:ed)?)/) ||
-        lower.match(/\b(\w+)\s+(?:last\s+)?(?:reached\s+out|emailed|messaged|contacted)\b/);
-      const fromMatch = msg.match(/\bfrom\s+(\w+)/i);
+      // Person extraction. Captures multi-word names (e.g. "Eric Brandley") by
+      // grabbing everything from the trigger word until punctuation or EOL,
+      // then trimming filler words off the tail.
+      const STOP = ["i", "you", "we", "they", "he", "she", "me", "us", "someone", "anyone", "the", "a", "an"];
+      const TAIL_FILLER = /\s+(?:please|today|now|recently|lately|ever|yesterday|this week|last week)\.?$/i;
+      const cleanName = (raw) =>
+        raw.trim().replace(TAIL_FILLER, "").replace(/[?.!,]+$/, "").trim();
 
-      let search = null;
+      const reachMatch =
+        msg.match(/when\s+did\s+(.+?)\s+(?:last\s+)?(?:reach(?:ed)?\s+out|email(?:ed)?|message(?:d)?|contact(?:ed)?)/i) ||
+        msg.match(/\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)?)\s+(?:last\s+)?(?:reached\s+out|emailed|messaged|contacted)\b/);
+      const fromMatch =
+        msg.match(/\b(?:from|by|involving|about|with)\s+(.+?)(?:[?.!,]|$)/i);
+
       let searchedName = null;
-      if (reachMatch && !STOP.includes(reachMatch[1].toLowerCase())) {
-        searchedName = reachMatch[1];
-        search = `from:${searchedName} OR cc:${searchedName}`;
-      } else if (fromMatch && !STOP.includes(fromMatch[1].toLowerCase())) {
-        searchedName = fromMatch[1];
-        search = `from:${searchedName} OR cc:${searchedName} OR to:${searchedName}`;
+      if (reachMatch) {
+        const name = cleanName(reachMatch[1]);
+        if (name && !STOP.includes(name.toLowerCase())) searchedName = name;
+      }
+      if (!searchedName && fromMatch) {
+        const name = cleanName(fromMatch[1]);
+        if (name && !STOP.includes(name.toLowerCase())) searchedName = name;
+      }
+
+      // Build queries. Use GPT to expand the person description into 3-4 Gmail
+      // query variations (from:, cc:, email-domain guesses, raw name) and run
+      // them in parallel.
+      let queries = null;
+      if (searchedName) {
+        queries = await buildEmailSearchQuery(searchedName);
       }
 
       const all = msg.includes("all");
@@ -759,14 +810,14 @@ export async function POST(req) {
         /\bmost\s+recent\s+emails?\b/.test(lower) ||
         /\brecent\s+emails?\b/.test(lower) ||
         /\bwhat\s+did\s+i\s+just\s+get\b/.test(lower);
-      // For person searches we want history, so fetch up to 20. For "last email"
-      // / "recent email" peeks we only need 1.
-      const limit = recent ? 1 : search ? 20 : all ? 20 : 5;
-      const emails = await getEmails(search, limit, recent);
+      // For multi-query person searches let the email route default to 50/query.
+      // For "last/recent email" peeks limit to 1. Otherwise default to 5.
+      const limit = recent ? 1 : queries ? null : all ? 20 : 5;
+      const emails = await getEmails(queries, limit, recent);
       if (emails.length === 0) {
         return Response.json({
           reply: searchedName
-            ? `No emails involving ${searchedName} found.`
+            ? `I searched for emails involving ${searchedName} (queries: ${queries.join(" | ")}) and found nothing. Got a more specific name or email address I should try?`
             : recent
               ? "No emails in your inbox."
               : "No unread emails.",
@@ -778,6 +829,10 @@ export async function POST(req) {
         )
         .join("\n\n");
 
+      const groupingHint = searchedName
+        ? `\n\nThe results above were the union of multiple Gmail searches (${queries.join(" | ")}), already deduped and sorted newest-first. List EVERY email shown above, grouped by date (most recent date first), with subject + sender. Do not omit any.`
+        : "";
+
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
@@ -786,7 +841,7 @@ export async function POST(req) {
           ...history.map((m) => ({ role: m.role, content: m.content })),
           {
             role: "user",
-            content: `${message}\n\n--- Email data fetched for this turn ---\n${emailContext}`,
+            content: `${message}\n\n--- Email data fetched for this turn ---\n${emailContext}${groupingHint}`,
           },
         ],
       });

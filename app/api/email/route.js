@@ -45,33 +45,54 @@ export async function GET(req) {
     const { searchParams } = new URL(req.url);
     const explicitLimit = searchParams.get("limit");
     const all = searchParams.get("all") === "true";
-    const search = searchParams.get("search");
+    // Accept repeated &search=... params so callers can pass multiple Gmail
+    // queries in one HTTP round trip; we run them in parallel and dedupe.
+    const searches = searchParams.getAll("search").filter(Boolean);
     const fullBody = searchParams.get("full") === "true";
     const recent = searchParams.get("recent") === "true";
 
-    // Search defaults to 20 (Brad usually wants historical context), inbox/recent
-    // peeks default to 5. Caller can always override via ?limit=.
-    const defaultLimit = search ? 20 : 5;
+    // Multi-query search defaults to 50/query, single-query to 20, inbox/recent
+    // peeks to 5. Caller can always override via ?limit=.
+    const isSearch = searches.length > 0;
+    const isMulti = searches.length > 1;
+    const defaultLimit = isMulti ? 50 : isSearch ? 20 : 5;
     const limit = explicitLimit ? parseInt(explicitLimit) : defaultLimit;
 
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
     // Default query is in:inbox so peeks return the newest message regardless of
-    // read state. When the caller passes a search term we run it directly so it
-    // hits ALL mail (read + unread, all folders) — not just the inbox.
-    const query = search || "in:inbox";
+    // read state. When search terms are passed we run each directly so they hit
+    // ALL mail (read + unread, every folder) — not just the inbox.
+    const queries = isSearch ? searches : ["in:inbox"];
 
-    const listRes = await gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults: all ? 50 : limit,
-    });
+    const listResults = await Promise.all(
+      queries.map((q) =>
+        gmail.users.messages.list({
+          userId: "me",
+          q,
+          maxResults: all ? 50 : limit,
+        }).catch((e) => {
+          console.log(`[/api/email GET] list failed for q="${q}":`, e.message);
+          return { data: { messages: [] } };
+        })
+      )
+    );
 
-    const messages = listRes.data.messages || [];
+    // Dedupe by message id while preserving first-seen order.
+    const seenIds = new Set();
+    const messages = [];
+    for (const r of listResults) {
+      for (const m of r.data.messages || []) {
+        if (!seenIds.has(m.id)) {
+          seenIds.add(m.id);
+          messages.push(m);
+        }
+      }
+    }
 
     if (messages.length === 0) {
-      return Response.json({ emails: [], text: "No unread emails." });
+      return Response.json({ emails: [], text: "No emails found.", queries });
     }
 
     const emails = await Promise.all(

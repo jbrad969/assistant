@@ -470,6 +470,9 @@ export default function Page() {
 
   function formatMessage(text) {
     if (!text) return text;
+    // If the assistant already produced a bulleted list (e.g. the reminders / calendar
+    // handlers return "• 7:45 AM — ...") leave it alone — we don't want to add a second bullet.
+    if (/^[•\-*]\s/m.test(text)) return text;
     const timeRegex = /\b(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\b/g;
     const matches = [...text.matchAll(timeRegex)];
     if (matches.length < 2) return text;

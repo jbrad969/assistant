@@ -420,6 +420,15 @@ Examples:
 
 Return JSON: {"message": "what to remind Brad about (concise)", "time": "UTC ISO timestamp ending in Z"}
 
+Write the reminder message in first person as an action, not as "Remind Brad to..." or "Brad needs to...".
+Examples:
+WRONG: "Remind Brad to leave the shop for BNI"
+RIGHT: "Leave the shop for BNI"
+WRONG: "Brad needs to call Nicole"
+RIGHT: "Call Nicole"
+WRONG: "Reminder for Brad to email Yvonne"
+RIGHT: "Email Yvonne"
+
 If day mentioned without year, use 2026.
 If the conversation already establishes time/topic for the reminder, reuse them — do not ask.`,
       },

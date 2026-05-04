@@ -86,6 +86,74 @@ async function saveReminder({ message, phoenixIso }) {
   return { ok: res.ok && !data.error, data };
 }
 
+// Pending calendar change marker — parseable, survives cleanResponse (no XML tags).
+function formatPendingCalendarBlock({ eventId, eventTitle, newDate, newTime, durationMinutes, newTimeLabel, dayLabel, oldTimeLabel }) {
+  return `[Calendar update queued]
+event_id: ${eventId}
+event_title: ${eventTitle}
+new_date: ${newDate}
+new_time: ${newTime}
+duration_minutes: ${durationMinutes}
+new_time_label: ${newTimeLabel}
+day_label: ${dayLabel}
+old_time_label: ${oldTimeLabel}
+[End calendar update]`;
+}
+
+function parsePendingCalendarBlock(text) {
+  if (!text) return null;
+  const m = text.match(/\[Calendar update queued\]([\s\S]+?)\[End calendar update\]/);
+  if (!m) return null;
+  const block = m[1];
+  const get = (k) => block.match(new RegExp(`^${k}:\\s*(.+)$`, "im"))?.[1]?.trim();
+  const eventId = get("event_id");
+  const newDate = get("new_date");
+  const newTime = get("new_time");
+  if (!eventId || !newDate || !newTime) return null;
+  return {
+    eventId,
+    eventTitle: get("event_title") || "event",
+    newDate,
+    newTime,
+    durationMinutes: parseInt(get("duration_minutes") || "60", 10),
+    newTimeLabel: get("new_time_label") || newTime,
+    dayLabel: get("day_label") || newDate,
+    oldTimeLabel: get("old_time_label") || "",
+  };
+}
+
+async function applyPendingCalendarChange(pending) {
+  const newStart = { date: pending.newDate, time: pending.newTime };
+  const newEnd = addMinutesToDateTime(newStart, pending.durationMinutes);
+  const res = await fetch(`${BASE_URL}/api/calendar/today`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ eventId: pending.eventId, start: newStart, end: newEnd }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    return { ok: false, error: data?.error || `status ${res.status}` };
+  }
+  // Verify the change actually landed by re-fetching the event for the new day.
+  const verifyDate = new Date(`${pending.newDate}T12:00:00-07:00`);
+  const verifyRes = await fetch(
+    `${BASE_URL}/api/calendar/today?date=${encodeURIComponent(verifyDate.toISOString())}`
+  );
+  const verifyData = await verifyRes.json();
+  const verified = (verifyData.events || []).find((e) => e.id === pending.eventId);
+  if (!verified) {
+    return { ok: false, error: "calendar didn't echo the change after PATCH" };
+  }
+  const actualHHMM = getPhoenixHHMM(verified.start);
+  if (actualHHMM !== pending.newTime) {
+    return {
+      ok: false,
+      error: `expected ${pending.newTime} but calendar still shows ${actualHHMM}`,
+    };
+  }
+  return { ok: true };
+}
+
 /* ============================================================================
  * 2. SHARED HELPERS
  * ========================================================================== */
@@ -628,9 +696,61 @@ The "to" field must be either an email address that appeared verbatim in the con
   return parseJsonFromClaude(raw);
 }
 
+async function handleCompoundApproval(ctx) {
+  // Compound = the prior assistant message contains BOTH a [Calendar update queued] block
+  // AND a Draft email block, ending with "Send it?". Brad's reply must be an approval phrase.
+  const last = lastAssistantMessage(ctx.history);
+  if (!last) return null;
+  const pending = parsePendingCalendarBlock(last);
+  const draft = parseEmailDraft(last);
+  if (!pending || !draft) return null;
+  if (!/Send it\?/i.test(last)) return null;
+  if (!isEmailApproval(ctx.message)) return null;
+
+  // Run BOTH actions independently. Calendar PATCH does not wait on the email and vice versa.
+  const [calRes, emailRes] = await Promise.all([
+    applyPendingCalendarChange(pending),
+    fetch(`${BASE_URL}/api/email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: draft.to, subject: draft.subject, body: draft.body }),
+    }).then(async (r) => ({ ok: r.ok, body: await r.json().catch(() => ({})) })),
+  ]);
+
+  const parts = [];
+  if (calRes.ok) {
+    parts.push(`calendar updated to ${pending.newTimeLabel}`);
+    try {
+      await insertMemoryWithCap(
+        `[LOG] Moved ${pending.eventTitle} to ${pending.newTimeLabel} on ${pending.dayLabel}`
+      );
+    } catch (e) { console.log("[chat] couldn't save move memory:", e.message); }
+  } else {
+    parts.push(`calendar update FAILED — ${calRes.error}`);
+  }
+
+  const emailOk = emailRes.ok && (emailRes.body?.success || !emailRes.body?.error);
+  if (emailOk) {
+    parts.push(`email sent to ${draft.to}`);
+    try {
+      await insertMemoryWithCap(
+        `[LOG] Sent email to ${draft.to} on ${ctx.today}: ${draft.subject}`
+      );
+    } catch (e) { console.log("[chat] couldn't save email memory:", e.message); }
+  } else {
+    parts.push(
+      `email send FAILED — ${emailRes.body?.error || `status ${emailRes.body?.status || "unknown"}`}`
+    );
+  }
+
+  return reply(parts.join(" and ") + ".");
+}
+
 async function handleEmailSendApproval(ctx) {
   if (!hasPendingEmailDraft(ctx.history)) return null;
   if (!isEmailApproval(ctx.message)) return null;
+  // Defer compound approvals to handleCompoundApproval (which runs first).
+  if (parsePendingCalendarBlock(lastAssistantMessage(ctx.history))) return null;
 
   const draft = parseEmailDraft(lastAssistantMessage(ctx.history));
   if (!draft) {
@@ -919,7 +1039,9 @@ async function handleCalendarWrite(ctx) {
       }),
     });
     const data = await res.json();
-    if (!data.success) return reply(`Couldn't add that event: ${data.error}`);
+    if (!res.ok || !data.success) {
+      return reply(`Couldn't add that event — ${data?.error || `status ${res.status}`}.`);
+    }
     const dayLabel = formatDateLabel(new Date(`${details.date}T12:00:00`));
     return reply(`Done — added "${details.title}" on ${dayLabel} at ${format12Hour(details.time)}.`);
   }
@@ -938,7 +1060,9 @@ async function handleCalendarWrite(ctx) {
       body: JSON.stringify({ eventId: event.id }),
     });
     const data = await res.json();
-    if (!data.success) return reply(`Couldn't delete that event: ${data.error}`);
+    if (!res.ok || !data.success) {
+      return reply(`Couldn't delete that event — ${data?.error || `status ${res.status}`}.`);
+    }
     return reply(`Done — deleted "${event.title}" on ${formatDateLabel(new Date(event.start))} at ${event.time}.`);
   }
 
@@ -955,19 +1079,61 @@ async function handleCalendarWrite(ctx) {
     const newTime = details.newTime || getPhoenixHHMM(event.start);
     if (!newDate || !newTime) return reply("I need a new date or time to move it to.");
 
-    const newStart = { date: newDate, time: newTime };
-    const newEnd = addMinutesToDateTime(newStart, durationMinutes);
-    const res = await fetch(`${BASE_URL}/api/calendar/today`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ eventId: event.id, start: newStart, end: newEnd }),
-    });
-    const data = await res.json();
-    if (!data.success) return reply(`Couldn't move that event: ${data.error}`);
-
     const oldTimeLabel = event.time;
     const newTimeLabel = format12Hour(newTime);
     const dayLabel = formatDateLabel(new Date(`${newDate}T12:00:00`));
+
+    // Detect compound intent — Brad named a person whose email we can pull from data,
+    // i.e. the move should also notify them.
+    const personName = extractPersonFromMessage(ctx.message);
+    const attendeeEmail = personName
+      ? findAttendeeEmailInEvent(personName, event) ||
+        findAttendeeEmailInHistory(personName, ctx.history)
+      : null;
+
+    // PATH A — compound (move + email): defer BOTH actions until Brad approves. Show the
+    // pending calendar change and the draft email together. handleCompoundApproval runs
+    // both atomically on the next "send it" / "yes" / "go".
+    if (personName && attendeeEmail) {
+      const pendingBlock = formatPendingCalendarBlock({
+        eventId: event.id,
+        eventTitle: event.title,
+        newDate, newTime,
+        durationMinutes,
+        newTimeLabel, dayLabel, oldTimeLabel,
+      });
+      return reply(`Pending changes — reply "send it" to apply both:
+
+Calendar: move "${event.title}" to ${newTimeLabel} on ${dayLabel} (was ${oldTimeLabel}).
+
+${pendingBlock}
+
+Draft email:
+To: ${attendeeEmail}
+Subject: Meeting moved to ${newTimeLabel}
+Body:
+Hi ${personName},
+
+I had to reschedule our meeting from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}. Hope that still works for you — let me know if not.
+
+Best,
+Brad
+
+Send it?`);
+    }
+
+    // PATH B — calendar-only move: apply immediately with verify.
+    const apply = await applyPendingCalendarChange({
+      eventId: event.id,
+      eventTitle: event.title,
+      newDate, newTime,
+      durationMinutes,
+      newTimeLabel, dayLabel, oldTimeLabel,
+    });
+    if (!apply.ok) {
+      return reply(`Couldn't move that event — ${apply.error}.`);
+    }
+
     let confirmation = `Done — moved "${event.title}" to ${newTimeLabel} on ${dayLabel} (was ${oldTimeLabel}).`;
 
     // RULE 5 — chained reminder: if Brad said "remind me ..." in the same message, save a
@@ -990,38 +1156,11 @@ async function handleCalendarWrite(ctx) {
       }
     }
 
-    // If Brad named a specific person ("move the meeting with Nicole..."), auto-draft an
-    // email to them so they can be notified. Email is taken from the event's attendee list
-    // when available, otherwise from prior calendar context in conversation history.
-    // Never invent an address.
-    const personName = extractPersonFromMessage(ctx.message);
-    const attendeeEmail = personName
-      ? findAttendeeEmailInEvent(personName, event) ||
-        findAttendeeEmailInHistory(personName, ctx.history)
-      : null;
-
-    if (personName && attendeeEmail) {
-      try {
-        await insertMemoryWithCap(
-          `[LOG] Moved ${event.title} from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}`
-        );
-      } catch (e) { console.log("[chat] couldn't save move memory:", e.message); }
-
-      return reply(`${confirmation}
-
-Draft email:
-To: ${attendeeEmail}
-Subject: Meeting moved to ${newTimeLabel}
-Body:
-Hi ${personName},
-
-I needed to reschedule our meeting from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}. Hope that still works for you — let me know if not.
-
-Best,
-Brad
-
-Send it?`);
-    }
+    try {
+      await insertMemoryWithCap(
+        `[LOG] Moved ${event.title} from ${oldTimeLabel} to ${newTimeLabel} on ${dayLabel}`
+      );
+    } catch (e) { console.log("[chat] couldn't save move memory:", e.message); }
 
     return reply(confirmation);
   }
@@ -1275,7 +1414,8 @@ ${NO_GUESS_EMAIL_RULE}`,
  * ========================================================================== */
 
 const HANDLERS = [
-  handleEmailSendApproval, // "send it" only when last assistant message is a Draft
+  handleCompoundApproval,  // "send it" when prior turn queued BOTH a calendar move and an email
+  handleEmailSendApproval, // "send it" when only a Draft email is pending
   handleReminder,          // "remind me" — must beat departure / calendar
   handleQuote,             // narrow phrase triggers
   handleEmailSend,         // "email Nicole" / "send an email"

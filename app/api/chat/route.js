@@ -157,7 +157,10 @@ ABSOLUTE RULES:
 7. Empty attendees array = "No attendees listed in the invite"
 8. Be direct and brief. No fluff. No markdown. No bullet symbols in plain text.
 9. Never say "When and what should I remind you about" if context exists
-10. Chain actions automatically`;
+10. Chain actions automatically
+
+TOOLS YOU HAVE:
+You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.`;
 }
 
 /* ============================================================================
@@ -504,6 +507,51 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
+// Scan the last 5 messages for a US street-style address. Returns the most recent match
+// (e.g. "2828 North PECO Drive", "15257 N Northsight Blvd", "5045 E Yale Street").
+function findRecentAddressInHistory(history) {
+  const recent = history.slice(-5);
+  const addressRegex =
+    /\b\d{2,5}\s+[\w'.\- ]+?\s+(?:Dr|Drive|St|Street|Ave|Avenue|Blvd|Boulevard|Rd|Road|Ln|Lane|Way|Pl|Place|Ct|Court|Pkwy|Parkway|Cir|Circle|Hwy|Highway|Ter|Terrace)\.?\b/gi;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const content = recent[i].content || "";
+    const matches = content.match(addressRegex);
+    if (matches && matches.length > 0) {
+      // Take the LAST match in the most recent message — the freshest reference.
+      return matches[matches.length - 1].trim();
+    }
+  }
+  return null;
+}
+
+// Scan current message + last 5 history messages for an "at <time>" / "by <time>" pattern.
+function findArrivalTimeInContext(message, history) {
+  const sources = [message, ...history.slice(-5).map((m) => m.content || "")];
+  for (const text of sources) {
+    const match = text.match(/\b(?:at|by)\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))/);
+    if (match) return match[1].trim();
+  }
+  return null;
+}
+
+// Convert "8:30 AM" plus today's Phoenix date to an absolute UTC ISO. If the time has already
+// passed today, push to tomorrow.
+function arrivalIsoForTodayTime(timeText) {
+  const m = timeText.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm)/i);
+  if (!m) return null;
+  let hh = parseInt(m[1], 10);
+  const mm = m[2] ? parseInt(m[2], 10) : 0;
+  const period = m[3].toUpperCase();
+  if (period === "PM" && hh < 12) hh += 12;
+  if (period === "AM" && hh === 12) hh = 0;
+  const phoenixDate = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIMEZONE,
+  }).format(new Date());
+  let target = new Date(`${phoenixDate}T${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00-07:00`);
+  if (target.getTime() <= Date.now()) target = new Date(target.getTime() + 24 * 60 * 60 * 1000);
+  return target.toISOString();
+}
+
 // Search the calendar by title across the next 7 days. Returns the soonest upcoming match.
 async function findUpcomingEventByTitle(eventName) {
   const params = new URLSearchParams({ days: "7", searchTitle: eventName });
@@ -786,24 +834,40 @@ export async function POST(req) {
           });
         }
       } else {
-        // No specific event named — fall back to next event with a location across 7 days.
-        const params = new URLSearchParams({ days: "7" });
-        const res = await fetch(`${BASE_URL}/api/calendar/today?${params.toString()}`);
-        const data = await res.json();
-        const upcoming = (data.events || [])
-          .filter((e) => e.location && new Date(e.start).getTime() > Date.now())
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-        if (upcoming.length === 0) {
-          return Response.json({
-            reply: "I can see your calendar but none of the upcoming events have a location listed. What address are you heading to?",
-          });
+        // No specific event named — first try a fresh address from the recent conversation
+        // (e.g. an event Brad just discussed or added). If found, use it directly without
+        // re-fetching the calendar. Pair with an explicit "at/by <time>" if one is in scope.
+        const histAddress = findRecentAddressInHistory(history.concat([{ role: "user", content: message }]));
+        const arrivalText = findArrivalTimeInContext(message, history);
+
+        if (histAddress) {
+          location = histAddress;
+          title = "the address you mentioned";
+          if (arrivalText) {
+            arrivalIso = arrivalIsoForTodayTime(arrivalText);
+            arrivalTimeText = arrivalText;
+          }
+          console.log(`[departure] using address from history: "${histAddress}" arrivalText=${arrivalText || "(none)"}`);
+        } else {
+          // Fallback: next event with a location across 7 days.
+          const params = new URLSearchParams({ days: "7" });
+          const res = await fetch(`${BASE_URL}/api/calendar/today?${params.toString()}`);
+          const data = await res.json();
+          const upcoming = (data.events || [])
+            .filter((e) => e.location && new Date(e.start).getTime() > Date.now())
+            .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+          if (upcoming.length === 0) {
+            return Response.json({
+              reply: "I can see your calendar but none of the upcoming events have a location listed. What address are you heading to?",
+            });
+          }
+          const ev = upcoming[0];
+          location = ev.location;
+          title = ev.title;
+          arrivalIso = new Date(ev.start).toISOString();
+          arrivalTimeText = ev.time;
+          console.log(`[departure] no event named; using next: "${title}" at "${location}"`);
         }
-        const ev = upcoming[0];
-        location = ev.location;
-        title = ev.title;
-        arrivalIso = new Date(ev.start).toISOString();
-        arrivalTimeText = ev.time;
-        console.log(`[departure] no event named; using next: "${title}" at "${location}"`);
       }
 
       console.log(`[departure] calling Maps with origin="${origin}" destination="${location}"`);
@@ -815,20 +879,47 @@ export async function POST(req) {
       }
 
       const driveMinutes = maps.driveTimeMinutes;
-      let departureLine;
-      if (arrivalIso) {
-        const arrivalMs = new Date(arrivalIso).getTime();
-        const departureMs = arrivalMs - (driveMinutes + 10) * 60 * 1000;
-        const departureStr = new Date(departureMs).toLocaleTimeString("en-US", {
-          hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
+      const originLabel = origin === HOME ? "home" : "the shop";
+
+      if (!arrivalIso) {
+        return Response.json({
+          reply: `It's ${driveMinutes} minutes from ${originLabel} to ${location}.`,
         });
-        departureLine = `Leave ${origin === HOME ? "home" : "the shop"} by ${departureStr} to make your ${arrivalTimeText} ${title} at ${location}. That's a ${driveMinutes}-minute drive with a 10-minute buffer.`;
-      } else {
-        // No arrivalIso (history-only path with no calendar match) — give a drive-time only answer.
-        departureLine = `It's ${driveMinutes} minutes from ${origin === HOME ? "home" : "the shop"} to ${location}.`;
       }
 
-      return Response.json({ reply: departureLine });
+      const arrivalMs = new Date(arrivalIso).getTime();
+      const departureMs = arrivalMs - driveMinutes * 60 * 1000;
+      const reminderMs = departureMs - 10 * 60 * 1000; // 10-min buffer before departure
+      const fmt = (ms) =>
+        new Date(ms).toLocaleTimeString("en-US", {
+          hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
+        });
+      const departureStr = fmt(departureMs);
+      const reminderStr = fmt(reminderMs);
+
+      // Auto-save the reminder for departure - 10 min, then verify.
+      const reminderText = `Leave ${originLabel} for ${title}`;
+      const reminderUtc = new Date(reminderMs).toISOString();
+      let reminderConfirmed = false;
+      try {
+        const saveRes = await saveReminder(reminderText, reminderUtc);
+        if (!saveRes.error) {
+          const verify = await getReminders();
+          reminderConfirmed = verify.some(
+            (r) => String(r.id) === String(saveRes.reminder?.id) || r.message === reminderText
+          );
+        }
+      } catch (e) {
+        console.log("[departure] reminder auto-save threw:", e.message);
+      }
+
+      const reminderClause = reminderConfirmed
+        ? ` I'll set a reminder for ${reminderStr} to give you buffer. Done.`
+        : ` (couldn't auto-set the reminder — try saying \"remind me at ${reminderStr}\")`;
+
+      return Response.json({
+        reply: `Leave ${originLabel} by ${departureStr} to make your ${arrivalTimeText} ${title} at ${location}. That's a ${driveMinutes}-minute drive.${reminderClause}`,
+      });
     }
 
     // 10. NORMAL CHAT

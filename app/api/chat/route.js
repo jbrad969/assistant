@@ -158,6 +158,11 @@ Brad's shop: ${SHOP}
 Memory:
 ${memoryText || "No memories yet."}
 
+HALLUCINATION IS A FIRING OFFENSE. If email data is not in the API response, say exactly: "I don't see that in the results I got back." Never invent names, email addresses, subjects, or content. If Brad says you're wrong, believe him - you made it up. The only acceptable responses when data is missing are:
+1. "I found nothing matching that search"
+2. "I found X emails - here they are: [list actual results]"
+Nothing else is acceptable.
+
 ABSOLUTE RULES:
 1. NEVER hallucinate. No data = say "I don't have that information"
 2. NEVER guess locations, addresses, times, or email addresses
@@ -814,22 +819,35 @@ export async function POST(req) {
       // For multi-query person searches let the email route default to 50/query.
       // For "last/recent email" peeks limit to 1. Otherwise default to 5.
       const limit = recent ? 1 : queries ? null : all ? 20 : 5;
-      const emails = await getEmails(queries, limit, recent);
+      const rawEmails = await getEmails(queries, limit, recent);
+
+      // ID VALIDATION: every email must carry a real Gmail message id. Anything
+      // without one is fabricated/garbage and must be dropped before Claude
+      // sees it. Without this, a malformed upstream response could let invented
+      // entries reach the model.
+      const emails = (rawEmails || []).filter(
+        (e) => e && typeof e.id === "string" && e.id.length > 0
+      );
+      const dropped = (rawEmails || []).length - emails.length;
+      if (dropped > 0) {
+        console.log(`[email read] DROPPED ${dropped} email(s) missing a Gmail id`);
+      }
 
       // HARD GUARDRAIL: empty/missing results never reach Claude. Returning a
       // factual reply directly prevents the model from inventing emails to
       // satisfy Brad's question.
-      if (!emails || emails.length === 0) {
+      if (emails.length === 0) {
         return Response.json({
           reply: `I searched for emails involving ${searchedName || "your inbox"} and found nothing. This could mean the emails are read/archived, or the search needs a different term. What else can I try?`,
         });
       }
 
-      // ONLY reach Claude when we have REAL email data.
+      // ONLY reach Claude when we have REAL email data (every entry has a
+      // verified Gmail id).
       const emailContext = emails
         .map(
           (e, i) =>
-            `${i + 1}. From: ${e.from} (${e.fromEmail})\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${e.body?.slice(0, 300) || ""}`
+            `${i + 1}. [id:${e.id}] From: ${e.from} (${e.fromEmail})\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${e.body?.slice(0, 300) || ""}`
         )
         .join("\n\n");
 

@@ -815,18 +815,21 @@ export async function POST(req) {
       // For "last/recent email" peeks limit to 1. Otherwise default to 5.
       const limit = recent ? 1 : queries ? null : all ? 20 : 5;
       const emails = await getEmails(queries, limit, recent);
-      if (emails.length === 0) {
+
+      // HARD GUARDRAIL: empty/missing results never reach Claude. Returning a
+      // factual reply directly prevents the model from inventing emails to
+      // satisfy Brad's question.
+      if (!emails || emails.length === 0) {
         return Response.json({
-          reply: searchedName
-            ? `I searched for emails involving ${searchedName} (queries: ${queries.join(" | ")}) and found nothing. Got a more specific name or email address I should try?`
-            : recent
-              ? "No emails in your inbox."
-              : "No unread emails.",
+          reply: `I searched for emails involving ${searchedName || "your inbox"} and found nothing. This could mean the emails are read/archived, or the search needs a different term. What else can I try?`,
         });
       }
+
+      // ONLY reach Claude when we have REAL email data.
       const emailContext = emails
-        .map((e, i) =>
-          `${i + 1}. From: ${e.from}\nEmail address: ${e.fromEmail || "(unknown)"}\nSender name: ${e.fromName || "(unknown)"}\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${(e.body || "").slice(0, 300)}`
+        .map(
+          (e, i) =>
+            `${i + 1}. From: ${e.from} (${e.fromEmail})\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${e.body?.slice(0, 300) || ""}`
         )
         .join("\n\n");
 
@@ -834,10 +837,13 @@ export async function POST(req) {
         ? `\n\nThe results above were the union of multiple Gmail searches (${queries.join(" | ")}), already deduped and sorted newest-first. List EVERY email shown above, grouped by date (most recent date first), with subject + sender. Do not omit any.`
         : "";
 
+      const emailGuardrail =
+        "\n\nEMAIL SUMMARY GUARDRAIL:\nYou are summarizing REAL emails from the API. The emails above are the ONLY emails that exist. Do not mention, invent, or reference any emails not in the list above. If the list is empty, say you found nothing.";
+
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
-        system: buildSystemPrompt(today, memoryText),
+        system: buildSystemPrompt(today, memoryText) + emailGuardrail,
         messages: [
           ...history.map((m) => ({ role: m.role, content: m.content })),
           {

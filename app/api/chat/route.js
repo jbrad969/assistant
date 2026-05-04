@@ -737,8 +737,14 @@ ATTENDEE NAMES vs EMAILS:
 - When summarizing a calendar event, you MAY mention attendee names/emails from the "(attendees: ...)" segment.
 - DO NOT recite every attendee email unless Brad asks for them. If he just asks "what's on Wednesday", a brief mention by role/name is enough.
 
+EMPTY ATTENDEES (NON-NEGOTIABLE):
+- If Brad asks who's invited / who the attendees are / who's on a calendar event AND that event has no "(attendees: ...)" segment (the attendees array is empty or missing in the data), respond EXACTLY in this form, substituting the real event title:
+  "The <EVENT TITLE> meeting doesn't have any attendee emails listed in the calendar invite. You may need to open the invite directly in Google Calendar to see the full list."
+- Example for the HomeSmart event: "The HomeSmart meeting doesn't have any attendee emails listed in the calendar invite. You may need to open the invite directly in Google Calendar to see the full list."
+- NEVER make up attendee names or emails when the attendees array is empty or missing. NEVER fill in plausible-sounding people. This is non-negotiable.
+
 ${NO_GUESS_EMAIL_RULE}
-When asked for someone's email address from a calendar event, ONLY use the exact email from the "(attendees: ...)" segment for that event. If the segment is empty or doesn't include the person Brad named, say: "I can see [name] is on the invite but I cannot read their email address from the data - can you confirm it?" NEVER construct or guess an email address.`,
+When asked for a SPECIFIC named person's email from a calendar event, ONLY use the exact email from the "(attendees: ...)" segment for that event. If that segment exists but doesn't include the person Brad named, say: "I can see [name] is on the invite but I cannot read their email address from the data - can you confirm it?" NEVER construct or guess an email address.`,
     user: `Calendar data:\n\n${calendarContext}\n\nBrad asked: "${ctx.message}"`,
   });
   return reply(text);

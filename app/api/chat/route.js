@@ -763,6 +763,13 @@ export async function POST(req) {
         /\*?\*?To:\*?\*?\s*\S+/im.test(lastContent) &&
         /\*?\*?Subject:\*?\*?\s*\S+/im.test(lastContent);
 
+      console.log("=== EMAIL SEND TRIGGERED ===");
+      console.log("Message:", message);
+      console.log("Last assistant msg:", lastContent?.slice(0, 200));
+      console.log("isDraftApproval:", isDraftApproval);
+      console.log("lookedLikeDraft:", lookedLikeDraft);
+      console.log("trimmed:", trimmed);
+
       if (isDraftApproval && lookedLikeDraft) {
         const draft = parseEmailDraft(lastContent);
         if (!draft) {

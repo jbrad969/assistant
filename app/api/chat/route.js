@@ -1,3 +1,4 @@
+// Jess AI v2 - deployed 2026-05-03
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";

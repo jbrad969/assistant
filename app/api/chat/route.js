@@ -77,10 +77,15 @@ function subtractMinutesFromPhoenixIso(phoenixIso, minutes) {
 }
 
 async function saveReminder({ message, phoenixIso }) {
+  // Convert Phoenix-local ISO ("...-07:00") to UTC ISO ("...Z") so the Supabase row stores
+  // the canonical UTC instant. Postgres timestamptz treats both as equivalent, but UTC is
+  // what we want when inspecting the table directly.
+  const utcIso = new Date(phoenixIso).toISOString();
+  console.log(`saveReminder: phoenix=${phoenixIso} -> utc=${utcIso}`);
   const res = await fetch(`${BASE_URL}/api/reminders`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, remind_at: phoenixIso }),
+    body: JSON.stringify({ message, remind_at: utcIso }),
   });
   const data = await res.json();
   return { ok: res.ok && !data.error, data };
@@ -1321,6 +1326,60 @@ If Brad says "remind me 15 min before X" and X has a time in history, set remind
   return parseJsonFromClaude(raw);
 }
 
+function isRemindersListQuestion(message) {
+  const m = message.toLowerCase();
+  return (
+    m.includes("any reminders") ||
+    m.includes("what reminders") ||
+    m.includes("which reminders") ||
+    m.includes("show me my reminders") ||
+    m.includes("show my reminders") ||
+    m.includes("show reminders") ||
+    m.includes("list reminders") ||
+    m.includes("list my reminders") ||
+    m.includes("upcoming reminders") ||
+    m.includes("what's reminded") ||
+    /\bdo (?:i|you) have (?:any )?reminders?\b/.test(m) ||
+    /\breminders?\s+(?:set|left|coming|today|tomorrow|this week)\b/.test(m)
+  );
+}
+
+async function handleRemindersList(ctx) {
+  if (!isRemindersListQuestion(ctx.message)) return null;
+
+  const res = await fetch(`${BASE_URL}/api/reminders`);
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    console.log("[chat] reminders list fetch failed:", data?.error || res.status);
+    return reply("I'm having trouble loading your reminders right now.");
+  }
+
+  const reminders = data.reminders || [];
+  if (reminders.length === 0) return reply("You don't have any active reminders.");
+
+  // Group by Phoenix-local day; format times in Phoenix tz.
+  const groups = new Map();
+  for (const r of reminders) {
+    const d = new Date(r.remind_at);
+    const dayLabel = d.toLocaleDateString("en-US", {
+      timeZone: TIME_ZONE,
+      weekday: "long", month: "short", day: "numeric",
+    });
+    const timeLabel = d.toLocaleTimeString("en-US", {
+      timeZone: TIME_ZONE,
+      hour: "numeric", minute: "2-digit", hour12: true,
+    });
+    if (!groups.has(dayLabel)) groups.set(dayLabel, []);
+    groups.get(dayLabel).push(`${timeLabel} — ${r.message}`);
+  }
+
+  const text = [...groups.entries()]
+    .map(([day, items]) => `${day}:\n${items.map((i) => `  • ${i}`).join("\n")}`)
+    .join("\n\n");
+
+  return reply(text);
+}
+
 async function handleReminder(ctx) {
   if (!isReminder(ctx.message)) return null;
 
@@ -1353,13 +1412,16 @@ async function handleReminder(ctx) {
     console.log(`Applied ${buffer}-minute departure buffer; remindAt now ${phoenixIso}`);
   }
 
-  console.log(`Saving reminder: "${reminder.message}" at ${phoenixIso}`);
+  // Send as canonical UTC ISO. Postgres timestamptz stores it the same either way, but the
+  // value Brad sees in Supabase will now be in UTC ("...Z" / "...+00:00") rather than -07:00.
+  const utcIso = new Date(phoenixIso).toISOString();
+  console.log(`Saving reminder: "${reminder.message}" at ${phoenixIso} (utc ${utcIso})`);
   let data;
   try {
     const res = await fetch(`${BASE_URL}/api/reminders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: reminder.message, remind_at: phoenixIso }),
+      body: JSON.stringify({ message: reminder.message, remind_at: utcIso }),
     });
     data = await res.json();
     if (!res.ok || data.error) {
@@ -1430,6 +1492,7 @@ ${NO_GUESS_EMAIL_RULE}`,
 const HANDLERS = [
   handleCompoundApproval,  // "send it" when prior turn queued BOTH a calendar move and an email
   handleEmailSendApproval, // "send it" when only a Draft email is pending
+  handleRemindersList,     // "any reminders" / "what reminders are set" — read-only
   handleReminder,          // "remind me" — must beat departure / calendar
   handleQuote,             // narrow phrase triggers
   handleEmailSend,         // "email Nicole" / "send an email"

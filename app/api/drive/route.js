@@ -260,43 +260,48 @@ export async function PATCH(req) {
           { status: 404 }
         );
       }
-      const current = await drive.files.get({
+
+      // Pull parents + owners. owners powers the "this isn't your file"
+      // error message when Drive silently refuses the move.
+      const currentFile = await drive.files.get({
         fileId,
-        fields: "parents, name, webViewLink",
+        fields: "parents, name, webViewLink, owners",
         supportsAllDrives: true,
       });
-      const removeParents = (current.data.parents || []).join(",");
-      const updated = await drive.files.update({
+      const currentParents = currentFile.data.parents?.join(",") || "";
+
+      const result = await drive.files.update({
         fileId,
         addParents: targetId,
-        removeParents,
+        removeParents: currentParents,
         fields: "id, name, parents, webViewLink",
         supportsAllDrives: true,
       });
 
-      // Verify the move actually landed by re-fetching parents. Drive's
-      // update response can sometimes return success even when the parent
-      // change hasn't propagated; a follow-up GET catches that.
-      const verify = await drive.files.get({
-        fileId,
-        fields: "parents",
-        supportsAllDrives: true,
-      });
-      const moved = verify.data.parents?.includes(targetId);
+      console.log("[/api/drive PATCH move] result parents:", result.data.parents);
+      console.log("[/api/drive PATCH move] target folder id:", targetId);
+
+      // Verify directly from the update response — drive.files.update returns
+      // the post-update file, so result.data.parents is authoritative.
+      const moved = result.data.parents?.includes(targetId);
       if (!moved) {
+        const ownerEmail = currentFile.data.owners?.[0]?.emailAddress;
+        const ownerClause = ownerEmail
+          ? ` It may be owned by someone else (${ownerEmail}). You can only move files you own.`
+          : " It may be owned by someone else. You can only move files you own.";
         console.log(
-          `[/api/drive PATCH move] verify failed — fileId=${fileId} targetId=${targetId} verifyParents=${JSON.stringify(verify.data.parents)}`
+          `[/api/drive PATCH move] verify failed — fileId=${fileId} targetId=${targetId} resultParents=${JSON.stringify(result.data.parents)}`
         );
         return Response.json(
-          { success: false, error: "The move didn't stick - try again" },
+          { success: false, error: `Could not move file.${ownerClause}` },
           { status: 500 }
         );
       }
 
       return Response.json({
         success: true,
-        name: updated.data.name,
-        link: updated.data.webViewLink,
+        name: result.data.name,
+        link: result.data.webViewLink,
         movedTo: targetFolderName,
       });
     }

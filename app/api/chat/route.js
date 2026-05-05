@@ -299,6 +299,26 @@ async function getMemory() {
   }));
 }
 
+// Cheap pre-filter so trivial messages (greetings, thanks, one-word replies)
+// don't burn a gpt-4o-mini call AND a Supabase re-fetch on every turn.
+function shouldSkipMemoryExtraction(message) {
+  const raw = String(message || "").trim();
+  if (!raw) return true;
+
+  const wordCount = raw.split(/\s+/).filter(Boolean).length;
+  if (wordCount < 5) return true;
+
+  const lower = raw.toLowerCase().replace(/[.!?,]+$/g, "").trim();
+  const trivialPatterns = [
+    /^(?:hi|hey|hello|yo|sup|good morning|good afternoon|good evening|gm|ga)\b/,
+    /^(?:thanks|thank you|thx|ty|appreciate it|appreciated|cool|nice|great|perfect|awesome|sweet|got it|gotcha)\b/,
+    /^(?:yes|yep|yeah|yup|y|sure|ok|okay|k|alright|right|sounds good|works for me|do it|go ahead|send it|looks good)\b/,
+    /^(?:no|nope|nah|n|not now|not yet|never mind|nvm)\b/,
+    /^(?:stop|cancel|wait|hold on|hold up|pause)\b/,
+  ];
+  return trivialPatterns.some((p) => p.test(lower));
+}
+
 async function saveOrUpdateMemory(message, currentMemory) {
   const memoryText = currentMemory.length > 0
     ? currentMemory.map((m) => `ID: ${m.id} | ${m.content}`).join("\n")
@@ -704,10 +724,12 @@ export async function POST(req) {
       timeZone: TIMEZONE,
     });
 
-    // Memory housekeeping (always before any intent branch).
+    // Memory housekeeping (always before any intent branch). Skip the GPT
+    // extraction + re-fetch on trivial messages — saves ~30%+ of turns.
     const memory = await getMemory();
-    await saveOrUpdateMemory(message, memory);
-    const updatedMemory = await getMemory();
+    const skipMemory = shouldSkipMemoryExtraction(message);
+    if (!skipMemory) await saveOrUpdateMemory(message, memory);
+    const updatedMemory = skipMemory ? memory : await getMemory();
     const memoryText = updatedMemory.map((m) => `- ${m.content}`).join("\n");
 
     const msg = message.toLowerCase();

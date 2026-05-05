@@ -873,7 +873,7 @@ export async function POST(req) {
       if (emails.length === 0) {
         const subject = searchedName ? `${searchedName} emails` : "your emails";
         return Response.json({
-          reply: `I searched for ${subject} and the API returned nothing. I know they exist - there may be a technical issue. Try asking again.`,
+          reply: `I searched for ${subject} and found nothing. Try a different name, date range, or keyword.`,
         });
       }
 

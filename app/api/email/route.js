@@ -160,13 +160,23 @@ export async function POST(req) {
     const auth = getGmailClient();
     const gmail = google.gmail({ version: "v1", auth });
 
+    // Wrap the body in HTML, convert newlines to <br>, and auto-link any URL
+    // (Drive/Docs links from the chat route's Drive intents render clickable).
+    const htmlBody = `<html><body>${body
+      .replace(/\n/g, "<br>")
+      .replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>')}</body></html>`;
+
+    // RFC 5322 requires CRLF between headers; Gmail tolerates LF but CRLF is
+    // the safer and standards-compliant separator.
     const message = [
       `To: ${to}`,
+      `From: brad@solarfixaz.com`,
       `Subject: ${subject}`,
-      "Content-Type: text/plain; charset=utf-8",
-      "",
-      body,
-    ].join("\n");
+      `MIME-Version: 1.0`,
+      `Content-Type: text/html; charset=utf-8`,
+      ``,
+      htmlBody,
+    ].join("\r\n");
 
     const encoded = Buffer.from(message)
       .toString("base64")

@@ -97,12 +97,13 @@ function isEmailSend(msg) {
 
 function isQuote(msg) {
   const m = msg.toLowerCase();
+  // Require an unambiguous quote-request phrase. Bare "quote for" (e.g.
+  // "got a quote for that?") is too broad and used to false-positive.
   return (
     m.includes("roof quote") ||
-    m.includes("need a quote") ||
     m.includes("request a quote") ||
     m.includes("send a quote") ||
-    m.includes("quote for")
+    /\bneed a quote\s+for\b/.test(m)
   );
 }
 

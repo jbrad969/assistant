@@ -605,30 +605,44 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
-// Parse a To/Subject/Body draft from an assistant message. Handles both plain
-// "To: ..." form and markdown-bold "**To:** ..." / "[email](mailto:email)" forms.
+// Parse a To/Subject/Body draft from an assistant message. Tolerates
+// markdown bold ("**To:**"), markdown links ("[email](mailto:...)"), and
+// label variants — "Recipient", "Send to", "Email to", "Subject Line",
+// "Re", "Message", "Content". If the To label is missing entirely, falls
+// back to the first bare email address in the text.
 function parseEmailDraft(text) {
   if (!text) return null;
-  // Strip markdown bold and convert markdown links "[label](url)" -> "label"
   const cleaned = text
     .replace(/\*\*/g, "")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
 
-  const toMatch = cleaned.match(/To:\s*([^\n]+)/i);
-  const subjectMatch = cleaned.match(/Subject:\s*([^\n]+)/i);
-  const bodyMatch = cleaned.match(/Body:\s*([\s\S]+?)(?:\n\nWant|\n\nShall|\n\n---|\n\nSend|$)/i);
+  // Anchor each label to start-of-line so "want to" / "going to" don't false-match.
+  // Allow ":" or "-" separator after the label.
+  const TO_LABEL = /(?:^|\n)\s*(?:to|recipient|send\s*to|email\s*to)\s*[:\-]\s*([^\n]+)/i;
+  const SUBJECT_LABEL = /(?:^|\n)\s*(?:subject(?:\s*line)?|re)\s*[:\-]\s*([^\n]+)/i;
+  const BODY_LABEL = /(?:^|\n)\s*(?:body|message|content)\s*[:\-]\s*([\s\S]+?)(?:\n\s*(?:want\b|shall\b|---|send\s*it\b|send\?|let\s*me\s*know\b)|$)/i;
 
-  if (!toMatch || !subjectMatch) return null;
+  const toMatch = cleaned.match(TO_LABEL);
+  const subjectMatch = cleaned.match(SUBJECT_LABEL);
+  const bodyMatch = cleaned.match(BODY_LABEL);
 
-  const to = toMatch[1].trim().replace(/^[<"']|[>"']$/g, "");
-  const subject = subjectMatch[1].trim();
-  let body = bodyMatch ? bodyMatch[1].trim() : "";
+  let to = null;
+  if (toMatch) {
+    to = toMatch[1].trim().replace(/^[<"']+|[>"',]+$/g, "");
+  } else {
+    // Last-resort: pull the first bare email address out of the draft.
+    const emailRe = cleaned.match(/[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}/);
+    if (emailRe) to = emailRe[0];
+  }
 
-  // If Claude's draft skipped the "Body:" label, fall back to "everything after Subject".
-  if (!body) {
+  const subject = subjectMatch ? subjectMatch[1].trim() : null;
+
+  let body = bodyMatch ? bodyMatch[1].trim() : null;
+  // If no Body label, take "everything after Subject" up to the first send-confirmation prompt.
+  if (!body && subjectMatch) {
     const subjEnd = subjectMatch.index + subjectMatch[0].length;
     let raw = cleaned.slice(subjEnd);
-    raw = raw.split(/\n\s*(?:Send it\?|Shall I send|---|Want me to send|Want to send)/i)[0];
+    raw = raw.split(/\n\s*(?:Send it\?|Shall I send|---|Want me to send|Want to send|Let me know)/i)[0];
     body = raw.trim();
   }
 

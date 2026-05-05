@@ -262,77 +262,57 @@ export async function PATCH(req) {
         );
       }
 
-      const currentFile = await drive.files.get({
+      const fileDetails = await drive.files.get({
         fileId,
-        fields: "parents, name, webViewLink, owners",
+        fields: "id, name, parents, owners, mimeType",
         supportsAllDrives: true,
       });
 
-      // Drive only lets you move files you own. If Brad isn't the owner,
-      // create a shortcut in the target folder instead so the file is
-      // organizationally where he wants it without changing the original.
-      const isOwner = currentFile.data.owners?.some(
+      const isOwner = fileDetails.data.owners?.some(
         (o) => o.emailAddress === BRAD_EMAIL
       );
 
-      if (!isOwner) {
-        const ownerEmail = currentFile.data.owners?.[0]?.emailAddress || "another user";
-        const shortcut = await drive.files.create({
-          requestBody: {
-            name: currentFile.data.name,
-            mimeType: "application/vnd.google-apps.shortcut",
-            parents: [targetId],
-            shortcutDetails: { targetId: fileId },
-          },
-          fields: "id, name, webViewLink",
+      if (isOwner) {
+        const currentParents = fileDetails.data.parents?.join(",") || "";
+        await drive.files.update({
+          fileId,
+          addParents: targetId,
+          removeParents: currentParents,
+          fields: "id, parents",
           supportsAllDrives: true,
         });
-        console.log(
-          `[/api/drive PATCH move] not owner — created shortcut id=${shortcut.data.id} -> source=${fileId} owner=${ownerEmail}`
-        );
         return Response.json({
           success: true,
-          shortcut: true,
-          name: shortcut.data.name,
-          link: shortcut.data.webViewLink,
+          method: "moved",
+          name: fileDetails.data.name,
           movedTo: targetFolderName,
-          ownerEmail,
-          message: `Created shortcut to "${currentFile.data.name}" (owned by ${ownerEmail})`,
         });
       }
 
-      // Brad owns it — perform the actual move.
-      const currentParents = currentFile.data.parents?.join(",") || "";
-
-      const result = await drive.files.update({
-        fileId,
-        addParents: targetId,
-        removeParents: currentParents,
-        fields: "id, name, parents, webViewLink",
+      // Brad doesn't own this file — Drive won't let him move it. Create a
+      // shortcut in the target folder so the file lives where he wants it
+      // organizationally and clicking the shortcut opens the original.
+      const shortcut = await drive.files.create({
+        requestBody: {
+          name: fileDetails.data.name,
+          mimeType: "application/vnd.google-apps.shortcut",
+          parents: [targetId],
+          shortcutDetails: { targetId: fileId },
+        },
+        fields: "id, name, webViewLink",
         supportsAllDrives: true,
       });
-
-      console.log("[/api/drive PATCH move] result parents:", result.data.parents);
-      console.log("[/api/drive PATCH move] target folder id:", targetId);
-
-      // Verify directly from the update response — drive.files.update returns
-      // the post-update file, so result.data.parents is authoritative.
-      const moved = result.data.parents?.includes(targetId);
-      if (!moved) {
-        console.log(
-          `[/api/drive PATCH move] verify failed — fileId=${fileId} targetId=${targetId} resultParents=${JSON.stringify(result.data.parents)}`
-        );
-        return Response.json(
-          { success: false, error: "The move didn't stick. Try again in a moment." },
-          { status: 500 }
-        );
-      }
-
+      console.log(
+        "Created shortcut:",
+        shortcut.data.name,
+        "in folder:",
+        targetId
+      );
       return Response.json({
         success: true,
-        name: result.data.name,
-        link: result.data.webViewLink,
-        movedTo: targetFolderName,
+        method: "shortcut",
+        name: shortcut.data.name,
+        link: shortcut.data.webViewLink,
       });
     }
 

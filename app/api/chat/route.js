@@ -1278,14 +1278,14 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       console.log("[drive move] result:", JSON.stringify(mData));
 
       if (mData.success) {
-        if (mData.shortcut) {
+        if (mData.method === "shortcut") {
           try {
             await insertMemoryWithCap(
-              `[LOG] Created shortcut to "${source.name}" in "${targetFolderName}" on ${today} (original owned by ${mData.ownerEmail || "another user"})`
+              `[LOG] Created shortcut to "${source.name}" in "${targetFolderName}" on ${today}`
             );
           } catch (e) { console.log("[drive move] memory log failed:", e.message); }
           return Response.json({
-            reply: `I created a shortcut to "${source.name}" in the ${targetFolderName} folder since the original is owned by ${mData.ownerEmail || "another team member"}. The shortcut will appear in the folder and clicking it opens the original.`,
+            reply: `I added a shortcut to ${source.name} in the folder — it works just like the real file but since it's owned by a teammate I can't move the original.`,
           });
         }
         try {
@@ -1294,7 +1294,7 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
           );
         } catch (e) { console.log("[drive move] memory log failed:", e.message); }
         return Response.json({
-          reply: `Done — moved "${source.name}" to "${targetFolderName}". Link: ${mData.link || "(no link)"}`,
+          reply: `Done — moved "${source.name}" to "${targetFolderName}".`,
         });
       }
       return Response.json({

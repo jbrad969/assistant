@@ -121,7 +121,30 @@ function isQuote(msg) {
   );
 }
 
+function isEmailToDrive(msg) {
+  const m = msg.toLowerCase();
+  const verb = /\b(save|move|put|upload)\b/.test(m);
+  return verb && m.includes("attachment") && (m.includes("drive") || m.includes("folder"));
+}
+
+function isDriveMove(msg) {
+  if (isEmailToDrive(msg)) return false;
+  const m = msg.toLowerCase();
+  if (!/\bmove\b/.test(m)) return false;
+  if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf)\b/.test(m)) return false;
+  // require " to " appearing AFTER the move verb so we know there's a destination
+  const moveIdx = m.search(/\bmove\b/);
+  return m.slice(moveIdx).includes(" to ");
+}
+
+function isDriveCreate(msg) {
+  if (isDriveMove(msg) || isEmailToDrive(msg)) return false;
+  const m = msg.toLowerCase();
+  return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
+}
+
 function isDriveSearch(msg) {
+  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg)) return false;
   const m = msg.toLowerCase();
   if (m.includes("search drive") || m.includes("search my drive")) return true;
   const verb = /\b(find|search|look for|locate|get)\b/.test(m);
@@ -132,11 +155,6 @@ function isDriveSearch(msg) {
     m.includes("in my drive") ||
     m.includes("on drive");
   return verb && target;
-}
-
-function isDriveCreate(msg) {
-  const m = msg.toLowerCase();
-  return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
 }
 
 function isDriveShare(msg) {
@@ -161,12 +179,6 @@ function isDriveRead(msg) {
     m.includes("what's in");
   const target = /\b(file|doc|document|pdf)\b/.test(m);
   return verb && target;
-}
-
-function isEmailToDrive(msg) {
-  const m = msg.toLowerCase();
-  const verb = /\b(save|move|put|upload)\b/.test(m);
-  return verb && m.includes("attachment") && (m.includes("drive") || m.includes("folder"));
 }
 
 function isCalendarWrite(msg) {
@@ -1206,6 +1218,78 @@ Return JSON: {"folderName": "cleaned name", "parentFolderName": "parent folder n
         });
       }
       return Response.json({ reply: `I couldn't create that folder: ${data.error || "unknown error"}` });
+    }
+
+    // 7b2. DRIVE MOVE — extract source + target, look up source, call PATCH move.
+    if (isDriveMove(msg)) {
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: `Extract a Drive move command. The user wants to move a file or folder to a destination folder.
+Return JSON: {"sourceName": "name of file/folder being moved", "targetFolderName": "destination folder name"}
+Examples:
+"move the Lisa Scott folder to Brad's project" -> {"sourceName": "Lisa Scott", "targetFolderName": "Brad's project"}
+"move PO-0316 to invoices folder" -> {"sourceName": "PO-0316", "targetFolderName": "invoices"}
+"take Lisa Scott Fair Oaks Ranch and move it to the folder I just created called Brads Personal Project" -> {"sourceName": "Lisa Scott Fair Oaks Ranch", "targetFolderName": "Brads Personal Project"}
+"move the David Wheat PO into the SolarFix POs folder" -> {"sourceName": "David Wheat PO", "targetFolderName": "SolarFix POs"}
+Strip filler like "the folder called", "the file named", "I just created". Return the bare names.`,
+          },
+          { role: "user", content: message },
+        ],
+      });
+      const { sourceName, targetFolderName } = JSON.parse(
+        extractRes.choices[0].message.content
+      );
+      console.log("[drive move] extracted:", { sourceName, targetFolderName });
+
+      if (!sourceName || !targetFolderName) {
+        return Response.json({
+          reply: "I need both the source and the destination folder. What should I move and where?",
+        });
+      }
+
+      // Find the source by name. Use ALL of /api/drive's name+fullText search.
+      const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
+      const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
+      const sData = await sRes.json();
+      const candidates = (sData.files || []).filter((f) => f && f.id);
+
+      if (candidates.length === 0) {
+        return Response.json({
+          reply: `I couldn't find "${sourceName}" in Drive. Try a different name.`,
+        });
+      }
+
+      // Punctuation-insensitive exact-name match preferred; otherwise first.
+      const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const exact = candidates.find((f) => norm(f.name) === norm(sourceName));
+      const source = exact || candidates[0];
+      console.log(`[drive move] picked source: id=${source.id} name="${source.name}"`);
+
+      const mRes = await fetch(`${BASE_URL}/api/drive`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "move", fileId: source.id, targetFolderName }),
+      });
+      const mData = await mRes.json();
+      console.log("[drive move] result:", JSON.stringify(mData));
+
+      if (mData.success) {
+        try {
+          await insertMemoryWithCap(
+            `[LOG] Moved "${source.name}" to "${targetFolderName}" on ${today}`
+          );
+        } catch (e) { console.log("[drive move] memory log failed:", e.message); }
+        return Response.json({
+          reply: `Done — moved "${source.name}" to "${targetFolderName}". Link: ${mData.link || "(no link)"}`,
+        });
+      }
+      return Response.json({
+        reply: `I couldn't move that: ${mData.error || "unknown error"}`,
+      });
     }
 
     // 7c. DRIVE SHARE — Claude collects the file ID + recipient, calls the API

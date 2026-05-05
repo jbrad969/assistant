@@ -18,16 +18,51 @@ function escapeQ(s) {
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 
+// Normalize a folder name to alphanumeric-lowercase so Brad's casual reference
+// ("Brad's Personal Project") matches what GPT cleaned during creation
+// ("Brads Personal Project"). Matters because the create prompt strips
+// apostrophes/articles but Brad's later messages don't.
+function normalizeFolderName(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 async function findFolderId(drive, folderName) {
   if (!folderName) return null;
-  const res = await drive.files.list({
+
+  // Exact-name lookup wins when it works.
+  const exact = await drive.files.list({
     q: `name = '${escapeQ(folderName)}' and mimeType = '${FOLDER_MIME}' and trashed = false`,
     fields: "files(id, name)",
     pageSize: 1,
     includeItemsFromAllDrives: true,
     supportsAllDrives: true,
   });
-  return res.data.files?.[0]?.id || null;
+  if (exact.data.files?.[0]?.id) return exact.data.files[0].id;
+
+  // Fuzzy fallback: pull folders containing the longest meaningful word, then
+  // compare normalized names client-side.
+  const words = folderName.split(/\s+/).filter((w) => w.length >= 3);
+  if (words.length === 0) return null;
+  const longest = words.reduce((a, b) => (b.length > a.length ? b : a));
+
+  const fuzzy = await drive.files.list({
+    q: `name contains '${escapeQ(longest)}' and mimeType = '${FOLDER_MIME}' and trashed = false`,
+    fields: "files(id, name)",
+    pageSize: 20,
+    orderBy: "modifiedTime desc",
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
+  });
+
+  const target = normalizeFolderName(folderName);
+  const match = (fuzzy.data.files || []).find(
+    (f) => normalizeFolderName(f.name) === target
+  );
+  if (match) {
+    console.log(`[findFolderId] fuzzy matched "${folderName}" -> "${match.name}" (id=${match.id})`);
+    return match.id;
+  }
+  return null;
 }
 
 const TYPE_TO_MIME = {

@@ -120,13 +120,17 @@ function isCalendarWrite(msg) {
 function isCalendarRead(msg) {
   const m = msg.toLowerCase();
   if (isSetReminder(msg) || isCalendarWrite(msg) || isCheckReminders(msg)) return false;
+  // Require an explicit calendar-intent word. Day names alone do NOT trigger
+  // (e.g. "see you Monday" is not a calendar query).
   return (
     m.includes("schedule") ||
     m.includes("calendar") ||
     m.includes("what do i have") ||
     m.includes("what's on") ||
     m.includes("whats on") ||
-    /\b(today|tomorrow|sunday|sun|monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thu|friday|fri|saturday|sat)\b/i.test(m)
+    /\bappointments?\b/.test(m) ||
+    /\bmeetings?\b/.test(m) ||
+    /\bagenda\b/.test(m)
   );
 }
 

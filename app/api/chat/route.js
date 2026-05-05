@@ -74,16 +74,19 @@ function isEmailRead(msg) {
   );
 }
 
-function isEmailSend(msg) {
-  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
-  const approvalPhrases = [
-    "send it", "yes send", "yes send it", "send", "go", "go ahead",
-    "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
-  ];
-  const isApproval = approvalPhrases.some((p) => m === p || m.startsWith(p + " "));
+const EMAIL_APPROVAL_PHRASES = [
+  "send it", "yes send", "yes send it", "send", "go", "go ahead",
+  "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
+];
 
+function isEmailApprovalPhrase(msg) {
+  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
+  return EMAIL_APPROVAL_PHRASES.some((p) => m === p || m.startsWith(p + " "));
+}
+
+function isExplicitEmailSend(msg) {
+  const m = msg.toLowerCase();
   return (
-    isApproval ||
     m.includes("send an email") ||
     m.includes("send email") ||
     m.includes("email to") ||
@@ -93,6 +96,17 @@ function isEmailSend(msg) {
     m.includes("write an email") ||
     m.includes("write email")
   );
+}
+
+function isEmailSend(msg, history = []) {
+  if (isExplicitEmailSend(msg)) return true;
+  if (!isEmailApprovalPhrase(msg)) return false;
+  // Approval phrases ("yes", "go ahead", "send it") only route to the email
+  // branch when the previous assistant turn actually looks like a draft.
+  // Otherwise the same words are confirming something else — calendar,
+  // reminder, departure — and must fall through.
+  const lastAssistant = history.filter((m) => m.role === "assistant").slice(-1)[0];
+  return lookedLikeEmailDraft(lastAssistant?.content);
 }
 
 function isQuote(msg) {
@@ -605,6 +619,17 @@ function findEventLocationInHistory(eventName, history) {
   return null;
 }
 
+// Quick predicate: does the text look like an email draft we showed to Brad?
+// Mirrors parseEmailDraft's expanded label set so an approval phrase ("yes",
+// "send it") is only treated as confirming an email when the last assistant
+// turn actually presented one.
+function lookedLikeEmailDraft(text) {
+  if (!text) return false;
+  const TO_LABEL = /(?:^|\n)\s*\*?\*?(?:to|recipient|send\s*to|email\s*to)\*?\*?\s*[:\-]\s*\S+/im;
+  const SUBJECT_LABEL = /(?:^|\n)\s*\*?\*?(?:subject(?:\s*line)?|re)\*?\*?\s*[:\-]\s*\S+/im;
+  return TO_LABEL.test(text) && SUBJECT_LABEL.test(text);
+}
+
 // Parse a To/Subject/Body draft from an assistant message. Tolerates
 // markdown bold ("**To:**"), markdown links ("[email](mailto:...)"), and
 // label variants — "Recipient", "Send to", "Email to", "Subject Line",
@@ -923,25 +948,12 @@ export async function POST(req) {
     }
 
     // 5. EMAIL SEND
-    if (isEmailSend(msg)) {
+    if (isEmailSend(msg, history)) {
       const lastAssistantMsg = history.filter((m) => m.role === "assistant").slice(-1)[0];
       const lastContent = lastAssistantMsg?.content || "";
 
-      // Approval phrases — Brad confirming a draft we already showed.
-      const trimmed = msg.trim().replace(/[.!?]+$/, "");
-      const APPROVAL_PHRASES = [
-        "send it", "yes send", "yes send it", "send", "go", "go ahead",
-        "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
-      ];
-      const isDraftApproval = APPROVAL_PHRASES.some(
-        (p) => trimmed === p || trimmed.startsWith(p + " ")
-      );
-
-      // Detect that the prior assistant turn actually was a draft. Tolerates markdown bold
-      // ("**To:**") and inline placement (no leading whitespace required).
-      const lookedLikeDraft =
-        /\*?\*?To:\*?\*?\s*\S+/im.test(lastContent) &&
-        /\*?\*?Subject:\*?\*?\s*\S+/im.test(lastContent);
+      const isDraftApproval = isEmailApprovalPhrase(msg);
+      const lookedLikeDraft = lookedLikeEmailDraft(lastContent);
 
       console.log("=== EMAIL SEND TRIGGERED ===");
       console.log("Message:", message);

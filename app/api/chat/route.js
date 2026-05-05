@@ -1078,8 +1078,15 @@ export async function POST(req) {
         messages: [
           {
             role: "system",
-            content:
-              'Extract Drive search details from the message. Return JSON: {"searchTerm": "what to search", "folderName": "specific folder or null", "fileType": "pdf/doc/folder/any"}',
+            content: `Extract the search term for Google Drive.
+File names in this Drive look like: "PO-0418 - David Wheat - 2026-01-12.pdf"
+Extract just the person name or keyword to search for.
+Examples:
+"find PO for David Wheat" -> {"searchTerm": "David Wheat", "folderName": null}
+"find Green Tech files" -> {"searchTerm": "Green Tech", "folderName": null}
+"find WattMonk contract" -> {"searchTerm": "WattMonk", "folderName": null}
+"find files in SolarFix POs folder" -> {"searchTerm": "", "folderName": "SolarFix POs"}
+Return JSON: {"searchTerm": "exact name or keyword", "folderName": "folder name or null"}`,
           },
           { role: "user", content: message },
         ],

@@ -1008,7 +1008,6 @@ export async function POST(req) {
       console.log("Last assistant msg:", lastContent?.slice(0, 200));
       console.log("isDraftApproval:", isDraftApproval);
       console.log("lookedLikeDraft:", lookedLikeDraft);
-      console.log("trimmed:", trimmed);
 
       if (isDraftApproval && lookedLikeDraft) {
         const draft = parseEmailDraft(lastContent);

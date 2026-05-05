@@ -26,7 +26,7 @@ const styles = `
   }
 
   body {
-    background: #0d0d1a;
+    background: #1a1a2e;
     color: var(--text-primary);
     font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
     font-size: 15px;
@@ -61,10 +61,8 @@ const styles = `
     position: sticky;
     top: 0;
     z-index: 10;
-    background: rgba(13, 13, 26, 0.85);
-    backdrop-filter: blur(24px) saturate(180%);
-    -webkit-backdrop-filter: blur(24px) saturate(180%);
-    border-bottom: 1px solid #2a2a3a;
+    background: #12122a;
+    border-bottom: 1px solid #3a3a5a;
     padding: 14px 22px;
     display: flex;
     justify-content: space-between;
@@ -109,8 +107,8 @@ const styles = `
 
   .btn {
     background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border-mid);
+    color: #c8c8e8;
+    border: 1px solid #4a4a6a;
     padding: 7px 14px;
     border-radius: 9px;
     cursor: pointer;
@@ -121,17 +119,17 @@ const styles = `
   }
 
   .btn:hover {
-    background: rgba(99, 102, 241, 0.08);
-    color: var(--text-primary);
-    border-color: var(--accent-dim);
+    background: #2d2d4e;
+    color: #ffffff;
+    border-color: var(--accent);
     transform: translateY(-1px);
   }
 
   .btn.active {
-    background: var(--accent);
-    color: #fff;
-    border-color: var(--accent);
-    box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
+    background: #6366f1;
+    color: #ffffff;
+    border-color: #6366f1;
+    box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
   }
 
   /* MEMORY PANEL */
@@ -139,8 +137,8 @@ const styles = `
     margin: 14px 18px 0;
     padding: 22px;
     border-radius: 16px;
-    background: var(--bg-elev);
-    border: 1px solid var(--border-soft);
+    background: #22223a;
+    border: 1px solid #3a3a5a;
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
   }
 
@@ -209,9 +207,9 @@ const styles = `
 
   .memory-input {
     width: 100%;
-    background: var(--bg-elev-2);
-    border: 1px solid var(--border-mid);
-    color: var(--text-primary);
+    background: #2d2d4e;
+    border: 1px solid #4a4a6a;
+    color: #ffffff;
     padding: 9px 13px;
     border-radius: 9px;
     font-size: 14px;
@@ -258,11 +256,12 @@ const styles = `
   .message-label {
     font-size: 11px;
     font-family: 'DM Mono', monospace;
-    color: var(--accent-light);
     letter-spacing: 1.2px;
     font-weight: 600;
     padding: 0 8px;
   }
+  .message-label.label-jess { color: #818cf8; }
+  .message-label.label-brad { color: #94a3b8; }
 
   .bubble {
     max-width: 78%;
@@ -276,20 +275,20 @@ const styles = `
 
   .bubble.user {
     background: #ffffff;
-    color: #0a0a0f;
+    color: #0d0d1a;
     border-radius: 20px;
     border-bottom-right-radius: 6px;
     font-weight: 400;
     box-shadow:
-      0 4px 18px rgba(255, 255, 255, 0.06),
+      0 4px 18px rgba(255, 255, 255, 0.08),
       0 1px 3px rgba(0, 0, 0, 0.4);
   }
 
   .bubble.assistant {
-    background: #1e1e35;
-    color: #e8e8f0;
-    border: 1px solid #2e2e48;
-    border-left: 3px solid var(--accent);
+    background: #2d2d4e;
+    color: #ffffff;
+    border: 1px solid #3a3a5a;
+    border-left: 3px solid #6366f1;
     border-radius: 18px;
     border-bottom-left-radius: 6px;
     box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
@@ -309,7 +308,7 @@ const styles = `
   .event-day:first-child { margin-top: 0; }
 
   .event-intro {
-    color: #e8e8f0;
+    color: #ffffff;
     margin-bottom: 4px;
   }
 
@@ -317,14 +316,14 @@ const styles = `
     display: flex;
     gap: 14px;
     padding: 10px 0;
-    border-bottom: 1px solid rgba(99, 102, 241, 0.18);
+    border-bottom: 1px solid rgba(129, 140, 248, 0.25);
     align-items: baseline;
   }
   .event-row:last-child { border-bottom: none; padding-bottom: 2px; }
 
   .event-time {
     font-weight: 600;
-    color: var(--accent-light);
+    color: #818cf8;
     font-family: 'DM Mono', monospace;
     font-size: 13px;
     letter-spacing: 0.3px;
@@ -334,7 +333,7 @@ const styles = `
   }
 
   .event-text {
-    color: #f0f0f0;
+    color: #ffffff;
     font-size: 15px;
     line-height: 1.5;
     flex: 1;
@@ -347,9 +346,9 @@ const styles = `
     align-items: center;
     gap: 8px;
     padding: 14px 18px;
-    background: #1e1e35;
-    border: 1px solid #2e2e48;
-    border-left: 3px solid var(--accent);
+    background: #2d2d4e;
+    border: 1px solid #3a3a5a;
+    border-left: 3px solid #6366f1;
     border-radius: 18px;
     border-bottom-left-radius: 6px;
     width: fit-content;
@@ -360,7 +359,7 @@ const styles = `
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--accent-light);
+    background: #818cf8;
     animation: thinkingPulse 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   }
   .thinking-dot:nth-child(2) { animation-delay: 0.18s; }
@@ -374,27 +373,24 @@ const styles = `
   /* INPUT BAR */
   .input-bar {
     padding: 16px 18px 22px;
-    background: linear-gradient(180deg, transparent 0%, rgba(13, 13, 26, 0.85) 35%, rgba(13, 13, 26, 0.95) 100%);
+    background: linear-gradient(180deg, transparent 0%, rgba(26, 26, 46, 0.9) 35%, #1a1a2e 100%);
     position: sticky;
     bottom: 0;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
   }
 
   .input-wrap {
     display: flex;
     gap: 10px;
     align-items: center;
-    background: #1e1e2e;
-    border: 1px solid #3a3a5a;
+    background: #2d2d4e;
+    border: 1px solid #6366f1;
     border-radius: 999px;
     padding: 6px 6px 6px 22px;
     transition: border-color 0.18s, box-shadow 0.18s;
   }
 
   .input-wrap:focus-within {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.18);
+    box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.25);
   }
 
   .input-field {
@@ -408,26 +404,26 @@ const styles = `
     padding: 8px 0;
   }
 
-  .input-field::placeholder { color: #888aaa; }
+  .input-field::placeholder { color: #9999bb; }
 
   .send-btn {
     background: #6366f1;
     color: #ffffff;
     border: none;
     border-radius: 999px;
-    padding: 10px 20px;
+    padding: 10px 22px;
     font-size: 14px;
     font-weight: 600;
     font-family: 'DM Sans', sans-serif;
     cursor: pointer;
     transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
     flex-shrink: 0;
-    box-shadow: 0 2px 12px rgba(99, 102, 241, 0.4);
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.5);
   }
 
   .send-btn:hover {
-    background: var(--accent-hover);
-    box-shadow: 0 4px 18px rgba(99, 102, 241, 0.5);
+    background: #4f46e5;
+    box-shadow: 0 6px 22px rgba(99, 102, 241, 0.65);
     transform: translateY(-1px);
   }
 
@@ -442,9 +438,9 @@ const styles = `
     width: 38px;
     height: 38px;
     border-radius: 50%;
-    background: #2a2a4a;
-    border: 1px solid #3a3a5a;
-    color: #888aaa;
+    background: #3a3a5a;
+    border: 1px solid #4a4a6a;
+    color: #c8c8e8;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -455,9 +451,9 @@ const styles = `
   }
 
   .mic-btn:hover {
-    background: #353560;
+    background: #4a4a6a;
     color: #ffffff;
-    border-color: var(--accent);
+    border-color: #6366f1;
   }
 
   .mic-btn svg { width: 18px; height: 18px; }
@@ -523,9 +519,9 @@ const styles = `
   .reply-choice { display: flex; gap: 10px; }
 
   .reply-choice-btn {
-    background: #1e1e2e;
-    color: #f0f0f0;
-    border: 1px solid #3a3a5a;
+    background: #2d2d4e;
+    color: #ffffff;
+    border: 1px solid #4a4a6a;
     border-radius: 999px;
     padding: 9px 18px;
     font-size: 13px;
@@ -536,8 +532,8 @@ const styles = `
   }
 
   .reply-choice-btn:hover {
-    background: #2a2a4a;
-    border-color: var(--accent);
+    background: #3a3a6a;
+    border-color: #6366f1;
     color: #ffffff;
   }
 `;
@@ -954,7 +950,7 @@ export default function Page() {
         <section className="chat">
           {messages.map((msg, i) => (
             <div key={i} className={`message-row ${msg.role}`}>
-              <div className="message-label">
+              <div className={`message-label ${msg.role === "user" ? "label-brad" : "label-jess"}`}>
                 {msg.role === "user" ? "BRAD" : "JESS"}
               </div>
               <div className={`bubble ${msg.role}`}>
@@ -965,7 +961,7 @@ export default function Page() {
 
           {loading && (
             <div className="message-row assistant">
-              <div className="message-label">JESS</div>
+              <div className="message-label label-jess">JESS</div>
               <div className="thinking">
                 <div className="thinking-dot" />
                 <div className="thinking-dot" />

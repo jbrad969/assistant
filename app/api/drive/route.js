@@ -17,6 +17,7 @@ function escapeQ(s) {
 }
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
+const BRAD_EMAIL = "brad@solarfixaz.com";
 
 // Normalize a folder name to alphanumeric-lowercase so Brad's casual reference
 // ("Brad's Personal Project") matches what GPT cleaned during creation
@@ -261,13 +262,46 @@ export async function PATCH(req) {
         );
       }
 
-      // Pull parents + owners. owners powers the "this isn't your file"
-      // error message when Drive silently refuses the move.
       const currentFile = await drive.files.get({
         fileId,
         fields: "parents, name, webViewLink, owners",
         supportsAllDrives: true,
       });
+
+      // Drive only lets you move files you own. If Brad isn't the owner,
+      // create a shortcut in the target folder instead so the file is
+      // organizationally where he wants it without changing the original.
+      const isOwner = currentFile.data.owners?.some(
+        (o) => o.emailAddress === BRAD_EMAIL
+      );
+
+      if (!isOwner) {
+        const ownerEmail = currentFile.data.owners?.[0]?.emailAddress || "another user";
+        const shortcut = await drive.files.create({
+          requestBody: {
+            name: currentFile.data.name,
+            mimeType: "application/vnd.google-apps.shortcut",
+            parents: [targetId],
+            shortcutDetails: { targetId: fileId },
+          },
+          fields: "id, name, webViewLink",
+          supportsAllDrives: true,
+        });
+        console.log(
+          `[/api/drive PATCH move] not owner — created shortcut id=${shortcut.data.id} -> source=${fileId} owner=${ownerEmail}`
+        );
+        return Response.json({
+          success: true,
+          shortcut: true,
+          name: shortcut.data.name,
+          link: shortcut.data.webViewLink,
+          movedTo: targetFolderName,
+          ownerEmail,
+          message: `Created shortcut to "${currentFile.data.name}" (owned by ${ownerEmail})`,
+        });
+      }
+
+      // Brad owns it — perform the actual move.
       const currentParents = currentFile.data.parents?.join(",") || "";
 
       const result = await drive.files.update({
@@ -285,15 +319,11 @@ export async function PATCH(req) {
       // the post-update file, so result.data.parents is authoritative.
       const moved = result.data.parents?.includes(targetId);
       if (!moved) {
-        const ownerEmail = currentFile.data.owners?.[0]?.emailAddress;
-        const ownerClause = ownerEmail
-          ? ` It may be owned by someone else (${ownerEmail}). You can only move files you own.`
-          : " It may be owned by someone else. You can only move files you own.";
         console.log(
           `[/api/drive PATCH move] verify failed — fileId=${fileId} targetId=${targetId} resultParents=${JSON.stringify(result.data.parents)}`
         );
         return Response.json(
-          { success: false, error: `Could not move file.${ownerClause}` },
+          { success: false, error: "The move didn't stick. Try again in a moment." },
           { status: 500 }
         );
       }

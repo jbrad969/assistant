@@ -44,38 +44,6 @@ export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
 
-    // Emergency test endpoint — hit /api/email?test=eric to fire 5 hand-crafted
-    // Gmail queries directly and see which ones return results. Bypasses the
-    // chat route's GPT query builder entirely so we can confirm Gmail is
-    // reachable and which query shape actually matches Eric Brandley's mail.
-    const testMode = searchParams.get("test");
-    if (testMode === "eric") {
-      const auth = getGmailClient();
-      const gmail = google.gmail({ version: "v1", auth });
-
-      const queries = [
-        "Eric Brandley",
-        "eric@solarfixaz.com",
-        "from:eric@solarfixaz.com",
-        "cc:eric@solarfixaz.com",
-        "eric",
-      ];
-
-      const results = {};
-      for (const q of queries) {
-        try {
-          const r = await gmail.users.messages.list({ userId: "me", q, maxResults: 5 });
-          results[q] = r.data.messages?.length || 0;
-          console.log(`[test=eric] q="${q}" -> ${results[q]} hits`);
-        } catch (e) {
-          results[q] = `ERROR: ${e.message}`;
-          console.log(`[test=eric] q="${q}" FAILED:`, e.message);
-        }
-      }
-
-      return Response.json({ testResults: results });
-    }
-
     const explicitLimit = searchParams.get("limit");
     const all = searchParams.get("all") === "true";
     // Accept repeated &search=... params so callers can pass multiple Gmail

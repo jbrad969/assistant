@@ -1161,8 +1161,21 @@ Return JSON: {"searchTerm": "exact name or keyword", "folderName": "folder name 
         messages: [
           {
             role: "system",
-            content:
-              'Extract folder creation details. Return JSON: {"folderName": "name for new folder", "parentFolderName": "parent folder name or null"}',
+            content: `Extract folder creation details and clean up the folder name to be professional.
+Rules:
+- Strip leading articles ("the", "a", "an")
+- Title-case the words ("Don Peterson Project", not "don peterson project")
+- Keep proper nouns, brand names, and acronyms intact (POs, WattMonk, BNI)
+- Drop filler phrasing like "for", "called", "named"
+- Trim trailing punctuation
+
+Examples:
+"create a folder called the Don Peterson project" -> {"folderName": "Don Peterson Project", "parentFolderName": null}
+"new folder for invoices" -> {"folderName": "Invoices", "parentFolderName": null}
+"make a folder named the David Wheat 2026 stuff inside SolarFix POs" -> {"folderName": "David Wheat 2026", "parentFolderName": "SolarFix POs"}
+"create folder for green tech proposals" -> {"folderName": "Green Tech Proposals", "parentFolderName": null}
+
+Return JSON: {"folderName": "cleaned name", "parentFolderName": "parent folder name or null"}`,
           },
           { role: "user", content: message },
         ],

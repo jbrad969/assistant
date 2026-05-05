@@ -238,6 +238,26 @@ export async function PATCH(req) {
         fields: "id, name, parents, webViewLink",
         supportsAllDrives: true,
       });
+
+      // Verify the move actually landed by re-fetching parents. Drive's
+      // update response can sometimes return success even when the parent
+      // change hasn't propagated; a follow-up GET catches that.
+      const verify = await drive.files.get({
+        fileId,
+        fields: "parents",
+        supportsAllDrives: true,
+      });
+      const moved = verify.data.parents?.includes(targetId);
+      if (!moved) {
+        console.log(
+          `[/api/drive PATCH move] verify failed — fileId=${fileId} targetId=${targetId} verifyParents=${JSON.stringify(verify.data.parents)}`
+        );
+        return Response.json(
+          { success: false, error: "The move didn't stick - try again" },
+          { status: 500 }
+        );
+      }
+
       return Response.json({
         success: true,
         name: updated.data.name,

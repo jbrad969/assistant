@@ -121,6 +121,54 @@ function isQuote(msg) {
   );
 }
 
+function isDriveSearch(msg) {
+  const m = msg.toLowerCase();
+  if (m.includes("search drive") || m.includes("search my drive")) return true;
+  const verb = /\b(find|search|look for|locate|get)\b/.test(m);
+  // \bpo\b prevents matching "post", "spot", "polo", etc.
+  const target =
+    /\b(file|files|document|documents|doc|docs|folder|folders|pdf|contract|report|po)\b/.test(m) ||
+    m.includes("in drive") ||
+    m.includes("in my drive") ||
+    m.includes("on drive");
+  return verb && target;
+}
+
+function isDriveCreate(msg) {
+  const m = msg.toLowerCase();
+  return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
+}
+
+function isDriveShare(msg) {
+  const m = msg.toLowerCase();
+  const verb =
+    /\bshare\b/.test(m) ||
+    m.includes("send link") ||
+    m.includes("email link") ||
+    m.includes("send the file") ||
+    m.includes("send the doc");
+  const target = /\b(file|doc|document|folder|link|pdf)\b/.test(m);
+  return verb && target;
+}
+
+function isDriveRead(msg) {
+  const m = msg.toLowerCase();
+  const verb =
+    /\b(read|open)\b/.test(m) ||
+    m.includes("show me") ||
+    m.includes("what does") ||
+    m.includes("what is in") ||
+    m.includes("what's in");
+  const target = /\b(file|doc|document|pdf)\b/.test(m);
+  return verb && target;
+}
+
+function isEmailToDrive(msg) {
+  const m = msg.toLowerCase();
+  const verb = /\b(save|move|put|upload)\b/.test(m);
+  return verb && m.includes("attachment") && (m.includes("drive") || m.includes("folder"));
+}
+
 function isCalendarWrite(msg) {
   const m = msg.toLowerCase();
   if (m.includes("remind me")) return false;
@@ -1021,6 +1069,178 @@ export async function POST(req) {
         });
       }
       return Response.json({ reply: "Quote submission failed: " + (data.error || "unknown") });
+    }
+
+    // 7a. DRIVE SEARCH
+    if (isDriveSearch(msg)) {
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              'Extract Drive search details from the message. Return JSON: {"searchTerm": "what to search", "folderName": "specific folder or null", "fileType": "pdf/doc/folder/any"}',
+          },
+          { role: "user", content: message },
+        ],
+      });
+      const { searchTerm, folderName, fileType } = JSON.parse(
+        extractRes.choices[0].message.content
+      );
+      console.log("[drive search] extracted:", { searchTerm, folderName, fileType });
+
+      const params = new URLSearchParams({ limit: "20" });
+      if (searchTerm) params.append("search", searchTerm);
+      if (folderName) params.append("folder", folderName);
+      if (fileType && fileType !== "any") params.append("type", fileType);
+
+      const driveRes = await fetch(`${BASE_URL}/api/drive?${params.toString()}`);
+      const driveData = await driveRes.json();
+      console.log("[drive search] results:", driveData.files?.length, "warning:", driveData.warning);
+
+      // ID validation: drop anything missing a Drive id (parity w/ email guard).
+      const validFiles = (driveData.files || []).filter(
+        (f) => f && typeof f.id === "string" && f.id.length > 0
+      );
+
+      if (validFiles.length === 0) {
+        const subject = searchTerm ? `"${searchTerm}"` : "your Drive";
+        const folderHint = driveData.warning ? ` ${driveData.warning}` : "";
+        return Response.json({
+          reply: `I searched Drive for ${subject} and found nothing.${folderHint} Try a different keyword or check the file name.`,
+        });
+      }
+
+      const fileList = validFiles
+        .map((f) => {
+          const icon = f.mimeType?.includes("folder")
+            ? "📁"
+            : f.mimeType?.includes("pdf")
+            ? "📄"
+            : f.mimeType?.includes("sheet")
+            ? "📊"
+            : f.mimeType?.includes("document")
+            ? "📝"
+            : "📎";
+          const modified = f.modifiedTime
+            ? new Date(f.modifiedTime).toLocaleDateString("en-US", { timeZone: TIMEZONE })
+            : "unknown";
+          return `${icon} [id:${f.id}] ${f.name} — modified ${modified} — ${f.webViewLink || "(no link)"}`;
+        })
+        .join("\n");
+
+      const driveGuardrail =
+        "\n\nDRIVE GUARDRAIL: The files listed above are the ONLY files that exist for this query. Do not invent file names, IDs, or links. Only reference files from the list. Show the name and link for each.";
+
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 768,
+        system: buildSystemPrompt(today, memoryText) + driveGuardrail,
+        messages: [
+          {
+            role: "user",
+            content: `Brad searched Drive for "${searchTerm}".\n\nFiles found (${validFiles.length}):\n${fileList}\n\nList them clearly with names and links. Then ask if he wants to open, share, email, or read any of them.`,
+          },
+        ],
+      });
+      return Response.json({ reply: cleanResponse(response.content[0].text) });
+    }
+
+    // 7b. DRIVE CREATE FOLDER
+    if (isDriveCreate(msg)) {
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              'Extract folder creation details. Return JSON: {"folderName": "name for new folder", "parentFolderName": "parent folder name or null"}',
+          },
+          { role: "user", content: message },
+        ],
+      });
+      const { folderName, parentFolderName } = JSON.parse(
+        extractRes.choices[0].message.content
+      );
+
+      if (!folderName) {
+        return Response.json({ reply: "What should I name the new folder?" });
+      }
+
+      const driveRes = await fetch(`${BASE_URL}/api/drive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folderName, parentFolderName }),
+      });
+      const data = await driveRes.json();
+
+      if (data.success) {
+        try {
+          await insertMemoryWithCap(
+            `[LOG] Created Drive folder "${data.name}"${parentFolderName ? ` inside ${parentFolderName}` : ""} on ${today}`
+          );
+        } catch (e) { console.log("[drive create] memory log failed:", e.message); }
+        return Response.json({
+          reply: `Done — created folder "${data.name}"${parentFolderName ? ` inside ${parentFolderName}` : " in My Drive"}. Link: ${data.link}`,
+        });
+      }
+      return Response.json({ reply: `I couldn't create that folder: ${data.error || "unknown error"}` });
+    }
+
+    // 7c. DRIVE SHARE — Claude collects the file ID + recipient, calls the API
+    // via instruction. This handler doesn't itself call PATCH yet because we
+    // need Brad to confirm exactly which file from the search results.
+    if (isDriveShare(msg)) {
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 512,
+        system:
+          buildSystemPrompt(today, memoryText) +
+          `\n\nYou can share Drive files. When Brad wants to share a file:
+1. If you don't know the file ID, tell him to first search for it
+2. If a recent Drive search in this conversation has the file (look for "[id:...]" markers in past assistant messages), use that ID
+3. Ask: who to share with and what permission (view/edit)
+4. Never make up file IDs`,
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+      return Response.json({ reply: cleanResponse(response.content[0].text) });
+    }
+
+    // 7d. DRIVE READ — same pattern as share: needs a file ID first.
+    if (isDriveRead(msg)) {
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 512,
+        system:
+          buildSystemPrompt(today, memoryText) +
+          `\n\nTo read a file, you need its Drive ID. If a recent Drive search in this conversation surfaced the file (look for "[id:...]" markers in past assistant messages), use that ID. Otherwise ask Brad to search for the file first.`,
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+      return Response.json({ reply: cleanResponse(response.content[0].text) });
+    }
+
+    // 7e. EMAIL ATTACHMENT TO DRIVE
+    if (isEmailToDrive(msg)) {
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 512,
+        system:
+          buildSystemPrompt(today, memoryText) +
+          `\n\nYou can save Gmail attachments to Drive. Ask Brad which email has the attachment (subject or sender) and which Drive folder to save it to. If both are clear from prior context, confirm before saving.`,
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+      return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
     // 7. CALENDAR WRITE

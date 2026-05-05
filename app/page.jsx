@@ -340,6 +340,31 @@ const styles = `
     white-space: normal;
   }
 
+  /* Drive / Docs URLs rendered as inline buttons */
+  .drive-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(99, 102, 241, 0.18);
+    color: #818cf8;
+    text-decoration: none;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(99, 102, 241, 0.4);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: 'DM Sans', sans-serif;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    margin: 0 2px;
+  }
+
+  .drive-link:hover {
+    background: #6366f1;
+    color: #ffffff;
+    border-color: #6366f1;
+  }
+
   /* Thinking indicator */
   .thinking {
     display: flex;
@@ -594,9 +619,42 @@ export default function Page() {
     return intro ? `${intro}\n\n${bullets.join("\n")}` : bullets.join("\n");
   }
 
+  // Replace Google Drive / Docs URLs in a string with clickable "Open in Drive →"
+  // buttons. Returns either the plain string (no links) or an array of mixed
+  // strings + JSX nodes that React renders as inline content.
+  function linkifyDriveUrls(text, keyBase) {
+    if (!text || typeof text !== "string") return text;
+    const driveUrlRe = /https:\/\/(?:drive|docs)\.google\.com\/[^\s)]+/g;
+    if (!driveUrlRe.test(text)) return text;
+
+    driveUrlRe.lastIndex = 0;
+    const parts = [];
+    let lastIdx = 0;
+    let match;
+    let i = 0;
+    while ((match = driveUrlRe.exec(text)) !== null) {
+      if (match.index > lastIdx) parts.push(text.slice(lastIdx, match.index));
+      parts.push(
+        <a
+          key={`${keyBase}-link-${i++}`}
+          href={match[0]}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="drive-link"
+        >
+          Open in Drive →
+        </a>
+      );
+      lastIdx = match.index + match[0].length;
+    }
+    if (lastIdx < text.length) parts.push(text.slice(lastIdx));
+    return parts;
+  }
+
   // Render assistant text. If the formatted text contains "• <time> — <rest>"
   // bullet lines (calendar/reminder lists), promote each to a styled event row;
   // otherwise return the plain string and let the bubble's pre-wrap render it.
+  // Drive/Docs URLs are turned into "Open in Drive →" buttons in either path.
   function renderAssistantContent(text) {
     const formatted = formatMessage(text);
     if (!formatted) return formatted;
@@ -604,7 +662,7 @@ export default function Page() {
     const lines = formatted.split("\n");
     const eventRe = /^•\s+(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))\s*[—\-]\s*(.+)$/;
     const hasEvents = lines.some((line) => eventRe.test(line));
-    if (!hasEvents) return formatted;
+    if (!hasEvents) return linkifyDriveUrls(formatted, "msg");
 
     const elements = [];
     lines.forEach((line, idx) => {
@@ -613,14 +671,14 @@ export default function Page() {
         elements.push(
           <div key={`e${idx}`} className="event-row">
             <span className="event-time">{m[1]}</span>
-            <span className="event-text">{m[2]}</span>
+            <span className="event-text">{linkifyDriveUrls(m[2], `e${idx}`)}</span>
           </div>
         );
       } else if (line.trim()) {
         const isDayLabel = /:\s*$/.test(line);
         elements.push(
           <div key={`t${idx}`} className={isDayLabel ? "event-day" : "event-intro"}>
-            {line}
+            {linkifyDriveUrls(line, `t${idx}`)}
           </div>
         );
       }

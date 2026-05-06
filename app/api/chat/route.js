@@ -132,9 +132,11 @@ function isDriveMove(msg) {
   const m = msg.toLowerCase();
   if (!/\bmove\b/.test(m)) return false;
   if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf)\b/.test(m)) return false;
-  // require " to " appearing AFTER the move verb so we know there's a destination
+  // Require a destination preposition AFTER the move verb so we know there's
+  // a target. Accepts "to", "into", or "inside" — Brad uses all three
+  // interchangeably ("move X into Y" was previously falling through).
   const moveIdx = m.search(/\bmove\b/);
-  return m.slice(moveIdx).includes(" to ");
+  return /\b(to|into|inside)\b/.test(m.slice(moveIdx));
 }
 
 function isDriveCreate(msg) {
@@ -1269,36 +1271,44 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       const source = exact || candidates[0];
       console.log(`[drive move] picked source: id=${source.id} name="${source.name}"`);
 
+      console.log("=== CALLING DRIVE PATCH ===");
       const mRes = await fetch(`${BASE_URL}/api/drive`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "move", fileId: source.id, targetFolderName }),
+        body: JSON.stringify({
+          action: "move",
+          fileId: source.id,
+          fileName: source.name,
+          targetFolderName,
+        }),
       });
       const mData = await mRes.json();
-      console.log("[drive move] result:", JSON.stringify(mData));
+      console.log("Drive PATCH response:", JSON.stringify(mData));
 
-      if (mData.success) {
-        if (mData.method === "shortcut") {
-          try {
-            await insertMemoryWithCap(
-              `[LOG] Created shortcut to "${source.name}" in "${targetFolderName}" on ${today}`
-            );
-          } catch (e) { console.log("[drive move] memory log failed:", e.message); }
-          return Response.json({
-            reply: `I added a shortcut to ${source.name} in the folder — it works just like the real file but since it's owned by a teammate I can't move the original.`,
-          });
-        }
+      if (!mData.success) {
+        return Response.json({
+          reply: `I couldn't move the file: ${mData.error || "unknown error"}`,
+        });
+      }
+
+      if (mData.method === "shortcut") {
         try {
           await insertMemoryWithCap(
-            `[LOG] Moved "${source.name}" to "${targetFolderName}" on ${today}`
+            `[LOG] Created shortcut to "${source.name}" in "${targetFolderName}" on ${today}`
           );
         } catch (e) { console.log("[drive move] memory log failed:", e.message); }
         return Response.json({
-          reply: `Done — moved "${source.name}" to "${targetFolderName}".`,
+          reply: `I added a shortcut to ${source.name} in the folder — it works just like the real file but since it's owned by a teammate I can't move the original.`,
         });
       }
+
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Moved "${source.name}" to "${targetFolderName}" on ${today}`
+        );
+      } catch (e) { console.log("[drive move] memory log failed:", e.message); }
       return Response.json({
-        reply: `I couldn't move that: ${mData.error || "unknown error"}`,
+        reply: `Done — moved "${source.name}" into "${targetFolderName}". Check your Drive now.`,
       });
     }
 

@@ -91,7 +91,7 @@ export async function POST(req) {
     if (!att.data?.data) {
       console.log("[email-to-drive] Gmail returned no attachment data for id:", found.attachmentId);
       return Response.json(
-        { success: false, error: "Gmail returned no attachment data" },
+        { success: false, error: "Could not get attachment from Gmail" },
         { status: 502 }
       );
     }
@@ -100,6 +100,16 @@ export async function POST(req) {
     // encoding directly (cleaner than the manual -+/_ swap).
     const buffer = Buffer.from(att.data.data, "base64url");
     console.log("[email-to-drive] decoded buffer size:", buffer.length, "bytes; mimeType:", found.mimeType);
+
+    // Empty buffer means Gmail returned malformed/empty data. Without this
+    // check we'd "successfully" upload a 0-byte file and tell Brad it worked.
+    if (!buffer || buffer.length === 0) {
+      console.log("[email-to-drive] decoded to 0 bytes — refusing to upload empty file");
+      return Response.json(
+        { success: false, error: "Could not get attachment from Gmail (decoded to 0 bytes)" },
+        { status: 502 }
+      );
+    }
 
     const driveCreate = await drive.files.create({
       requestBody: {

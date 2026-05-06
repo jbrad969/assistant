@@ -1684,17 +1684,26 @@ Examples:
         }),
       });
       const result = await e2dRes.json();
-      console.log("Email-to-Drive result:", JSON.stringify(result));
+      console.log("Email-to-Drive raw response:", JSON.stringify(result));
 
-      if (!result.success) {
+      // STRICT validation — three independent checks. Anything but a real
+      // Drive file ID + a google.com webViewLink means the upload didn't
+      // really land, and we refuse to claim "Done".
+      if (result.success !== true || !result.fileId) {
         return Response.json({
-          reply: `I couldn't save that attachment: ${result.error || "unknown error"}`,
+          reply: `I couldn't save that attachment - the upload failed. Error: ${result.error || "no fileId returned"}`,
+        });
+      }
+      if (!result.link || !result.link.includes("google.com")) {
+        console.log("[email-to-drive] invalid link in response:", result.link);
+        return Response.json({
+          reply: "The upload returned an invalid response. The file may not have saved.",
         });
       }
 
       try {
         await insertMemoryWithCap(
-          `[LOG] Saved attachment "${result.name}" from email "${emailWithAttachments.subject}" to "${targetFolderName}" on ${today}`
+          `[LOG] Saved attachment "${result.name}" (id ${result.fileId}) from email "${emailWithAttachments.subject}" to "${targetFolderName}" on ${today}`
         );
       } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
 
@@ -1704,7 +1713,7 @@ Examples:
           : "";
 
       return Response.json({
-        reply: `Done — saved "${result.name}" to ${targetFolderName}.${noteOthers} Link: ${result.link || "(no link)"}`,
+        reply: `Done — saved "${result.name}" to ${targetFolderName}.${noteOthers} Link: ${result.link}`,
       });
     }
 

@@ -127,26 +127,38 @@ function isEmailToDrive(msg) {
   return verb && m.includes("attachment") && (m.includes("drive") || m.includes("folder"));
 }
 
+// "put it back" / "move it back" — Brad is asking to undo a prior move, but
+// we don't track move history, so the handler asks for the destination
+// explicitly instead of guessing.
+function isDriveRevert(msg) {
+  const m = msg.toLowerCase();
+  return (
+    /\b(put|move)\b/.test(m) &&
+    /\bback\b/.test(m) &&
+    /\b(it|that|file|files|folder|doc|document|pdf)\b/.test(m)
+  );
+}
+
 function isDriveMove(msg) {
-  if (isEmailToDrive(msg)) return false;
+  if (isEmailToDrive(msg) || isDriveRevert(msg)) return false;
   const m = msg.toLowerCase();
   if (!/\bmove\b/.test(m)) return false;
-  if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf)\b/.test(m)) return false;
+  if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf|contract|report)\b/.test(m)) return false;
   // Require a destination preposition AFTER the move verb so we know there's
   // a target. Accepts "to", "into", or "inside" — Brad uses all three
-  // interchangeably ("move X into Y" was previously falling through).
+  // interchangeably.
   const moveIdx = m.search(/\bmove\b/);
   return /\b(to|into|inside)\b/.test(m.slice(moveIdx));
 }
 
 function isDriveCreate(msg) {
-  if (isDriveMove(msg) || isEmailToDrive(msg)) return false;
+  if (isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg)) return false;
   const m = msg.toLowerCase();
   return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
 }
 
 function isDriveSearch(msg) {
-  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg)) return false;
+  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg)) return false;
   const m = msg.toLowerCase();
   if (m.includes("search drive") || m.includes("search my drive")) return true;
   const verb = /\b(find|search|look for|locate|get)\b/.test(m);
@@ -255,6 +267,7 @@ ABSOLUTE RULES:
 8. Be direct and brief. No fluff. No markdown. No bullet symbols in plain text.
 9. Never say "When and what should I remind you about" if context exists
 10. Chain actions automatically
+11. NEVER move, delete, or modify any file that Brad did not explicitly name in his message. If the move fails for one file, do not attempt to move other files. Ask Brad which specific file to try next.
 
 TOOLS YOU HAVE:
 You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.
@@ -1222,6 +1235,14 @@ Return JSON: {"folderName": "cleaned name", "parentFolderName": "parent folder n
       return Response.json({ reply: `I couldn't create that folder: ${data.error || "unknown error"}` });
     }
 
+    // 7b1. DRIVE REVERT — "put it back" / "move it back". We don't track move
+    // history, so ask for the destination explicitly rather than guess.
+    if (isDriveRevert(msg)) {
+      return Response.json({
+        reply: "I don't track where files came from, so I can't put it back automatically. Which folder should I move it to?",
+      });
+    }
+
     // 7b2. DRIVE MOVE — extract source + target, look up source, call PATCH move.
     if (isDriveMove(msg)) {
       const extractRes = await openai.chat.completions.create({
@@ -1265,10 +1286,22 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
         });
       }
 
-      // Punctuation-insensitive exact-name match preferred; otherwise first.
+      // Punctuation-insensitive exact-name match required. NEVER silently fall
+      // back to the first search result — moving the wrong file is worse than
+      // asking Brad to disambiguate.
       const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-      const exact = candidates.find((f) => norm(f.name) === norm(sourceName));
-      const source = exact || candidates[0];
+      const source = candidates.find((f) => norm(f.name) === norm(sourceName));
+      if (!source) {
+        if (candidates.length === 1) {
+          return Response.json({
+            reply: `I found "${candidates[0].name}" but its name doesn't exactly match "${sourceName}". Reply with the exact file name to confirm — I won't move it until you do.`,
+          });
+        }
+        const list = candidates.slice(0, 5).map((f) => `• ${f.name}`).join("\n");
+        return Response.json({
+          reply: `Multiple files match "${sourceName}". Which exact file should I move?\n\n${list}\n\nReply with the exact name and I'll move only that one.`,
+        });
+      }
       console.log(`[drive move] picked source: id=${source.id} name="${source.name}"`);
 
       console.log("=== CALLING DRIVE PATCH ===");
@@ -1302,6 +1335,30 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
         });
       }
 
+      // Real move — verify by re-fetching the file inside the target folder.
+      // /api/drive GET with both search and folder filters returns only files
+      // matching the name AND parented under the resolved target folder ID.
+      let verified = false;
+      try {
+        const vParams = new URLSearchParams({
+          search: source.name,
+          folder: targetFolderName,
+          limit: "5",
+        });
+        const vRes = await fetch(`${BASE_URL}/api/drive?${vParams.toString()}`);
+        const vData = await vRes.json();
+        verified = (vData.files || []).some((f) => f.id === source.id);
+        console.log("[drive move verify]", { fileId: source.id, verified, returned: vData.files?.length });
+      } catch (e) {
+        console.log("[drive move verify] failed:", e.message);
+      }
+
+      if (!verified) {
+        return Response.json({
+          reply: "The move API returned success but I can't verify it worked. Please check your Drive — if it's not there, this may be a permissions issue with that specific file.",
+        });
+      }
+
       try {
         await insertMemoryWithCap(
           `[LOG] Moved "${source.name}" to "${targetFolderName}" on ${today}`
@@ -1312,26 +1369,98 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       });
     }
 
-    // 7c. DRIVE SHARE — Claude collects the file ID + recipient, calls the API
-    // via instruction. This handler doesn't itself call PATCH yet because we
-    // need Brad to confirm exactly which file from the search results.
+    // 7c. DRIVE SHARE — extract source + recipient, look up source, call PATCH
+    // share. Never hands off to Claude (which would invent "Done" without a
+    // real API call).
     if (isDriveShare(msg)) {
-      const response = await anthropic.messages.create({
-        model: CLAUDE_MODEL,
-        max_tokens: 512,
-        system:
-          buildSystemPrompt(today, memoryText) +
-          `\n\nYou can share Drive files. When Brad wants to share a file:
-1. If you don't know the file ID, tell him to first search for it
-2. If a recent Drive search in this conversation has the file (look for "[id:...]" markers in past assistant messages), use that ID
-3. Ask: who to share with and what permission (view/edit)
-4. Never make up file IDs`,
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
         messages: [
-          ...history.map((m) => ({ role: m.role, content: m.content })),
+          {
+            role: "system",
+            content: `Extract a Drive share command. Return JSON:
+{"sourceName": "name of file/folder to share", "shareEmail": "recipient email or null", "shareRole": "reader|writer|commenter"}
+Default shareRole to "reader" unless the user clearly asks for edit/comment access.
+Examples:
+"share PO-0316 with eric@solarfixaz.com" -> {"sourceName": "PO-0316", "shareEmail": "eric@solarfixaz.com", "shareRole": "reader"}
+"share the David Wheat folder with phillip@solarfixaz.com as editor" -> {"sourceName": "David Wheat", "shareEmail": "phillip@solarfixaz.com", "shareRole": "writer"}
+"send link to the contract to nicole@example.com" -> {"sourceName": "contract", "shareEmail": "nicole@example.com", "shareRole": "reader"}
+"share Lisa Scott Producing" -> {"sourceName": "Lisa Scott Producing", "shareEmail": null, "shareRole": "reader"}
+If the message has no email, set shareEmail to null.`,
+          },
           { role: "user", content: message },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
+      const { sourceName, shareEmail, shareRole } = JSON.parse(
+        extractRes.choices[0].message.content
+      );
+      console.log("[drive share] extracted:", { sourceName, shareEmail, shareRole });
+
+      if (!sourceName) {
+        return Response.json({ reply: "Which file or folder should I share?" });
+      }
+      if (!shareEmail) {
+        return Response.json({
+          reply: `Who should I share "${sourceName}" with? Give me their email address.`,
+        });
+      }
+
+      // Find source — same disambiguation rules as move.
+      const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
+      const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
+      const sData = await sRes.json();
+      const candidates = (sData.files || []).filter((f) => f && f.id);
+
+      if (candidates.length === 0) {
+        return Response.json({
+          reply: `I couldn't find "${sourceName}" in Drive. Try a different name.`,
+        });
+      }
+
+      const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const source = candidates.find((f) => norm(f.name) === norm(sourceName));
+      if (!source) {
+        if (candidates.length === 1) {
+          return Response.json({
+            reply: `I found "${candidates[0].name}" but its name doesn't exactly match "${sourceName}". Reply with the exact file name to confirm — I won't share it until you do.`,
+          });
+        }
+        const list = candidates.slice(0, 5).map((f) => `• ${f.name}`).join("\n");
+        return Response.json({
+          reply: `Multiple files match "${sourceName}". Which exact one should I share with ${shareEmail}?\n\n${list}`,
+        });
+      }
+
+      console.log("=== CALLING DRIVE PATCH (share) ===");
+      const shareRes = await fetch(`${BASE_URL}/api/drive`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "share",
+          fileId: source.id,
+          shareEmail,
+          shareRole: shareRole || "reader",
+        }),
+      });
+      const shareData = await shareRes.json();
+      console.log("Drive share response:", JSON.stringify(shareData));
+
+      if (!shareData.success) {
+        return Response.json({
+          reply: `I couldn't share that file: ${shareData.error || "unknown error"}`,
+        });
+      }
+
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Shared "${source.name}" with ${shareEmail} (${shareRole || "reader"}) on ${today}`
+        );
+      } catch (e) { console.log("[drive share] memory log failed:", e.message); }
+
+      return Response.json({
+        reply: `Done — shared "${source.name}" with ${shareEmail} as ${shareRole || "reader"}. They'll get a notification email.`,
+      });
     }
 
     // 7d. DRIVE READ — same pattern as share: needs a file ID first.

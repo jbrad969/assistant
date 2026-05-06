@@ -1603,20 +1603,109 @@ If the message has no email, set shareEmail to null.`,
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 7e. EMAIL ATTACHMENT TO DRIVE
+    // 7e. EMAIL ATTACHMENT TO DRIVE — fetch the email, locate the attachment,
+    // call /api/drive/email-to-drive directly. Never hands off to Claude.
     if (isEmailToDrive(msg)) {
-      const response = await anthropic.messages.create({
-        model: CLAUDE_MODEL,
-        max_tokens: 512,
-        system:
-          buildSystemPrompt(today, memoryText) +
-          `\n\nYou can save Gmail attachments to Drive. Ask Brad which email has the attachment (subject or sender) and which Drive folder to save it to. If both are clear from prior context, confirm before saving.`,
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
         messages: [
-          ...history.map((m) => ({ role: m.role, content: m.content })),
+          {
+            role: "system",
+            content: `Extract an email-to-drive command. Brad wants to save an email attachment to a Drive folder.
+Return JSON: {"emailSearch": "search term to find the email — sender name or subject keyword", "targetFolderName": "Drive folder name", "fileName": "rename or null to keep original name"}
+Examples:
+"save the Thrifty attachment to my Receipts folder" -> {"emailSearch": "Thrifty", "targetFolderName": "Receipts", "fileName": null}
+"upload the David Wheat invoice from email to David Wheat folder" -> {"emailSearch": "David Wheat invoice", "targetFolderName": "David Wheat", "fileName": null}
+"put the PDF from Phillip's email into PO 2026 folder" -> {"emailSearch": "Phillip", "targetFolderName": "PO 2026", "fileName": null}
+"save the WattMonk attachment as wattmonk-jan.pdf in Contracts folder" -> {"emailSearch": "WattMonk", "targetFolderName": "Contracts", "fileName": "wattmonk-jan.pdf"}`,
+          },
           { role: "user", content: message },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
+      const { emailSearch, targetFolderName, fileName: customName } = JSON.parse(
+        extractRes.choices[0].message.content
+      );
+      console.log("[email-to-drive] extracted:", { emailSearch, targetFolderName, customName });
+
+      if (!emailSearch || !targetFolderName) {
+        return Response.json({
+          reply: "I need both an email reference (sender or subject) and a Drive folder name. Try: \"save the Thrifty attachment to my Receipts folder\".",
+        });
+      }
+
+      // Step 1: find the email
+      console.log("[email-to-drive] fetching email with search:", emailSearch);
+      const emailRes = await fetch(
+        `${BASE_URL}/api/email?search=${encodeURIComponent(emailSearch)}&limit=10`
+      );
+      const emailData = await emailRes.json();
+      const emails = (emailData.emails || []).filter((e) => e && e.id);
+      console.log("[email-to-drive] emails found:", emails.length);
+
+      if (emails.length === 0) {
+        return Response.json({
+          reply: `I couldn't find any email matching "${emailSearch}". Try a different sender or keyword.`,
+        });
+      }
+
+      // Step 2: pick the first email that actually has attachments
+      const emailWithAttachments = emails.find(
+        (e) => Array.isArray(e.attachments) && e.attachments.length > 0
+      );
+      if (!emailWithAttachments) {
+        return Response.json({
+          reply: `I found ${emails.length} email(s) matching "${emailSearch}" but none of them have attachments.`,
+        });
+      }
+      console.log("[email-to-drive] email with attachments:", {
+        id: emailWithAttachments.id,
+        subject: emailWithAttachments.subject,
+        from: emailWithAttachments.fromEmail,
+        attachmentCount: emailWithAttachments.attachments.length,
+      });
+
+      // Step 3: pick the first attachment. If multiple, save the first and
+      // mention the rest so Brad knows.
+      const attachment = emailWithAttachments.attachments[0];
+      console.log("[email-to-drive] attachment:", attachment);
+
+      // Step 4: call email-to-drive (which resolves folderName → folderId
+      // server-side, so we don't need to look it up here).
+      console.log("=== CALLING EMAIL-TO-DRIVE ===");
+      const e2dRes = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          emailId: emailWithAttachments.id,
+          attachmentId: attachment.attachmentId,
+          fileName: customName || attachment.filename,
+          folderName: targetFolderName,
+        }),
+      });
+      const result = await e2dRes.json();
+      console.log("Email-to-Drive result:", JSON.stringify(result));
+
+      if (!result.success) {
+        return Response.json({
+          reply: `I couldn't save that attachment: ${result.error || "unknown error"}`,
+        });
+      }
+
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Saved attachment "${result.name}" from email "${emailWithAttachments.subject}" to "${targetFolderName}" on ${today}`
+        );
+      } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
+
+      const noteOthers =
+        emailWithAttachments.attachments.length > 1
+          ? ` (this email had ${emailWithAttachments.attachments.length} attachments — I saved the first one. Tell me which other to save if needed.)`
+          : "";
+
+      return Response.json({
+        reply: `Done — saved "${result.name}" to ${targetFolderName}.${noteOthers} Link: ${result.link || "(no link)"}`,
+      });
     }
 
     // 7. CALENDAR WRITE

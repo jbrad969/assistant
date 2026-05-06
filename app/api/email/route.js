@@ -14,6 +14,26 @@ function getGmailClient() {
   return client;
 }
 
+// Walk the Gmail payload tree and collect every attachment. Top-level-only
+// (Brad's spec) misses attachments nested inside multipart/mixed wrappers,
+// so this recurses through `parts`.
+function collectAttachments(payload, out = []) {
+  if (!payload) return out;
+  const parts = payload.parts || [];
+  for (const part of parts) {
+    if (part.filename && part.body?.attachmentId) {
+      out.push({
+        filename: part.filename,
+        attachmentId: part.body.attachmentId,
+        mimeType: part.mimeType || "application/octet-stream",
+        size: part.body?.size || 0,
+      });
+    }
+    if (part.parts) collectAttachments(part, out);
+  }
+  return out;
+}
+
 function decodeBody(payload) {
   if (!payload) return "";
 
@@ -139,6 +159,7 @@ export async function GET(req) {
           to,
           date,
           body,
+          attachments: collectAttachments(detail.data.payload),
           internalDate: detail.data.internalDate || "0",
         };
       })

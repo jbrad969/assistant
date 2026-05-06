@@ -37,6 +37,7 @@ function findAttachment(payload, wantedId, wantedName) {
 export async function POST(req) {
   try {
     const { emailId, attachmentId, fileName, folderId, folderName } = await req.json();
+    console.log("[email-to-drive] inputs:", { emailId, attachmentId, fileName, folderId, folderName });
 
     if (!emailId) {
       return Response.json({ error: "emailId is required" }, { status: 400 });
@@ -57,6 +58,7 @@ export async function POST(req) {
         supportsAllDrives: true,
       });
       parentId = folderRes.data.files?.[0]?.id || null;
+      console.log("[email-to-drive] folder resolution:", { folderName, resolvedId: parentId });
       if (!parentId) {
         return Response.json(
           { success: false, error: `Folder "${folderName}" not found in Drive` },
@@ -72,6 +74,7 @@ export async function POST(req) {
       format: "full",
     });
     const found = findAttachment(msg.data.payload, attachmentId, fileName);
+    console.log("[email-to-drive] attachment found:", found);
     if (!found) {
       return Response.json(
         { success: false, error: "No matching attachment found in that email" },
@@ -86,15 +89,17 @@ export async function POST(req) {
       id: found.attachmentId,
     });
     if (!att.data?.data) {
+      console.log("[email-to-drive] Gmail returned no attachment data for id:", found.attachmentId);
       return Response.json(
         { success: false, error: "Gmail returned no attachment data" },
         { status: 502 }
       );
     }
 
-    // Gmail returns base64url; convert to base64 then to a Buffer + Readable stream.
-    const base64 = String(att.data.data).replace(/-/g, "+").replace(/_/g, "/");
-    const buffer = Buffer.from(base64, "base64");
+    // Gmail returns base64url-encoded bytes — Node's Buffer supports that
+    // encoding directly (cleaner than the manual -+/_ swap).
+    const buffer = Buffer.from(att.data.data, "base64url");
+    console.log("[email-to-drive] decoded buffer size:", buffer.length, "bytes; mimeType:", found.mimeType);
 
     const driveCreate = await drive.files.create({
       requestBody: {
@@ -109,6 +114,8 @@ export async function POST(req) {
       supportsAllDrives: true,
     });
 
+    console.log("[email-to-drive] drive.files.create result:", JSON.stringify(driveCreate.data));
+
     return Response.json({
       success: true,
       fileId: driveCreate.data.id,
@@ -118,7 +125,14 @@ export async function POST(req) {
       sourceAttachment: found.filename,
     });
   } catch (error) {
-    console.log("[/api/drive/email-to-drive POST] FAILED:", error.message, "| code:", error.code);
+    console.log(
+      "[/api/drive/email-to-drive POST] FAILED:",
+      error.message,
+      "| code:",
+      error.code,
+      "| stack:",
+      error.stack?.split("\n").slice(0, 3).join(" | ")
+    );
     return Response.json(
       { success: false, error: error.message, code: error.code },
       { status: 500 }

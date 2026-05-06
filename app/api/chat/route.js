@@ -139,26 +139,48 @@ function isDriveRevert(msg) {
   );
 }
 
-function isDriveMove(msg) {
-  if (isEmailToDrive(msg) || isDriveRevert(msg)) return false;
+// Marker embedded in the assistant's "are you sure" prompt so the approval
+// handler can recover the file ID on the next turn without needing session
+// storage. Format: [delete:abc123]
+const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
+
+function isDriveDelete(msg) {
+  if (isEmailToDrive(msg)) return false;
   const m = msg.toLowerCase();
-  if (!/\bmove\b/.test(m)) return false;
+  if (!/\b(delete|remove|trash)\b/.test(m)) return false;
+  return /\b(file|files|folder|folders|doc|docs|document|documents|pdf|contract|report)\b/.test(m);
+}
+
+function isDriveDeleteApproval(msg, history = []) {
+  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
+  if (m !== "yes delete it") return false;
+  const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
+  return DELETE_MARKER_RE.test(lastAssistant?.content || "");
+}
+
+function isDriveMove(msg) {
+  if (isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
+  const m = msg.toLowerCase();
+  // Verbs are word-boundaried — \bput\b prevents matching computer/input/etc.
+  if (!/\b(move|put)\b/.test(m)) return false;
+  // Mandatory file/folder/doc target — without this, calendar and reminder
+  // messages ("put gas in the truck", "move my meeting to Friday") would
+  // false-positive constantly.
   if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf|contract|report)\b/.test(m)) return false;
-  // Require a destination preposition AFTER the move verb so we know there's
-  // a target. Accepts "to", "into", or "inside" — Brad uses all three
-  // interchangeably.
-  const moveIdx = m.search(/\bmove\b/);
-  return /\b(to|into|inside)\b/.test(m.slice(moveIdx));
+  // Destination preposition AFTER the move verb. Bare "in" excluded — every
+  // sentence has it.
+  const verbIdx = m.search(/\b(move|put)\b/);
+  return /\b(to|into|inside)\b/.test(m.slice(verbIdx));
 }
 
 function isDriveCreate(msg) {
-  if (isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg)) return false;
+  if (isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
   const m = msg.toLowerCase();
   return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
 }
 
 function isDriveSearch(msg) {
-  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg)) return false;
+  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
   const m = msg.toLowerCase();
   if (m.includes("search drive") || m.includes("search my drive")) return true;
   const verb = /\b(find|search|look for|locate|get)\b/.test(m);
@@ -1366,6 +1388,108 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       } catch (e) { console.log("[drive move] memory log failed:", e.message); }
       return Response.json({
         reply: `Done — moved "${source.name}" into "${targetFolderName}". Check your Drive now.`,
+      });
+    }
+
+    // 7b3. DRIVE DELETE APPROVAL — must come before isDriveDelete.
+    // "yes delete it" is only honored when the previous assistant turn
+    // contained a [delete:...] marker; the file ID is parsed out of that
+    // marker so we delete exactly the file Brad confirmed.
+    if (isDriveDeleteApproval(msg, history)) {
+      const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
+      const idMatch = lastAssistant?.content?.match(DELETE_MARKER_RE);
+      const fileId = idMatch?.[1];
+      if (!fileId) {
+        return Response.json({
+          reply: "I lost track of which file you confirmed. Tell me which file to delete and I'll ask again.",
+        });
+      }
+      const nameMatch = lastAssistant.content.match(/delete\s+["']([^"']+)["']/i);
+      const fileName = nameMatch?.[1] || "the file";
+
+      console.log("=== CALLING DRIVE DELETE ===");
+      const dRes = await fetch(`${BASE_URL}/api/drive`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileId }),
+      });
+      const dData = await dRes.json();
+      console.log("Drive DELETE response:", JSON.stringify(dData));
+
+      if (!dData.success) {
+        return Response.json({
+          reply: `I couldn't delete that file: ${dData.error || "unknown error"}`,
+        });
+      }
+
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Deleted "${fileName}" (id ${fileId}) on ${today}`
+        );
+      } catch (e) { console.log("[drive delete] memory log failed:", e.message); }
+
+      return Response.json({ reply: `Done — "${fileName}" moved to trash.` });
+    }
+
+    // 7b4. DRIVE DELETE — first turn. Find the file, show it to Brad,
+    // ask for explicit confirmation. Embeds the file ID as a [delete:...]
+    // marker so the approval handler can recover it. NO API call until
+    // Brad responds with exactly "yes delete it".
+    if (isDriveDelete(msg)) {
+      const extractRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: `Extract the name of the Drive file or folder Brad wants to delete.
+Return JSON: {"sourceName": "exact file or folder name"}
+Examples:
+"delete PO-0418" -> {"sourceName": "PO-0418"}
+"trash the Lisa Scott folder" -> {"sourceName": "Lisa Scott"}
+"remove the David Wheat contract" -> {"sourceName": "David Wheat contract"}
+"delete the file called Brads Personal Project" -> {"sourceName": "Brads Personal Project"}
+Strip filler like "the file called", "the folder named". Return the bare name.`,
+          },
+          { role: "user", content: message },
+        ],
+      });
+      const { sourceName } = JSON.parse(extractRes.choices[0].message.content);
+      console.log("[drive delete] extracted:", { sourceName });
+
+      if (!sourceName) {
+        return Response.json({ reply: "Which file or folder should I delete?" });
+      }
+
+      const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
+      const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
+      const sData = await sRes.json();
+      const candidates = (sData.files || []).filter((f) => f && f.id);
+
+      if (candidates.length === 0) {
+        return Response.json({
+          reply: `I couldn't find "${sourceName}" in Drive. Try a different name.`,
+        });
+      }
+
+      // Mandatory normalized exact match — never silently target a similar file.
+      const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+      const source = candidates.find((f) => norm(f.name) === norm(sourceName));
+      if (!source) {
+        if (candidates.length === 1) {
+          return Response.json({
+            reply: `I found "${candidates[0].name}" but its name doesn't exactly match "${sourceName}". Reply with the exact file name to confirm — I won't delete anything until you do.`,
+          });
+        }
+        const list = candidates.slice(0, 5).map((f) => `• ${f.name}`).join("\n");
+        return Response.json({
+          reply: `Multiple files match "${sourceName}". Which exact one should I delete?\n\n${list}\n\nReply with the exact name and I'll only target that one.`,
+        });
+      }
+
+      console.log(`[drive delete] picked source: id=${source.id} name="${source.name}"`);
+      return Response.json({
+        reply: `Are you sure you want to delete "${source.name}"? Type 'yes delete it' to confirm.\n\n[delete:${source.id}]`,
       });
     }
 

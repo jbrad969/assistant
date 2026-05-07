@@ -121,10 +121,30 @@ function isQuote(msg) {
   );
 }
 
+// Marker embedded in the "I found <filename> — save this?" prompt so the
+// approval handler knows which email, which attachment, and which folder
+// to act on. Format: [save:emailId:attachmentId:folderName]
+const SAVE_MARKER_RE = /\[save:([^:]+):([^:]+):([^\]]+)\]/;
+
 function isEmailToDrive(msg) {
   const m = msg.toLowerCase();
   const verb = /\b(save|move|put|upload)\b/.test(m);
-  return verb && m.includes("attachment") && (m.includes("drive") || m.includes("folder"));
+  if (!verb) return false;
+  if (!m.includes("drive") && !m.includes("folder")) return false;
+  // Strong signal: literal word "attachment"
+  if (m.includes("attachment")) return true;
+  // Weaker signal: "email" + a file-type word ("save the Thrifty PDF from
+  // the email to Receipts folder"). Without "email" we'd false-positive
+  // generic Drive moves.
+  if (m.includes("email") && /\b(pdf|file|files|doc|docs|document|image|images|photo|photos)\b/.test(m)) return true;
+  return false;
+}
+
+function isEmailToDriveApproval(msg, history = []) {
+  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
+  if (m !== "yes save it") return false;
+  const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
+  return SAVE_MARKER_RE.test(lastAssistant?.content || "");
 }
 
 // "put it back" / "move it back" — Brad is asking to undo a prior move, but
@@ -290,6 +310,7 @@ ABSOLUTE RULES:
 9. Never say "When and what should I remind you about" if context exists
 10. Chain actions automatically
 11. NEVER move, delete, or modify any file that Brad did not explicitly name in his message. If the move fails for one file, do not attempt to move other files. Ask Brad which specific file to try next.
+12. When saving email attachments to Drive, ALWAYS show the filename first and confirm with Brad before saving. Never save attachments from emails Brad didn't specify.
 
 TOOLS YOU HAVE:
 You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.
@@ -1603,8 +1624,95 @@ If the message has no email, set shareEmail to null.`,
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 7e. EMAIL ATTACHMENT TO DRIVE — fetch the email, locate the attachment,
-    // call /api/drive/email-to-drive directly. Never hands off to Claude.
+    // 7e0. EMAIL-TO-DRIVE APPROVAL — must come before isEmailToDrive.
+    // Brad confirmed a specific (emailId, attachmentId, folder) tuple shown
+    // in the previous assistant turn. Pull those values from the marker and
+    // call the upload API. NEVER re-search emails — we save exactly what
+    // Brad confirmed.
+    if (isEmailToDriveApproval(msg, history)) {
+      const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
+      const markerMatch = lastAssistant?.content?.match(SAVE_MARKER_RE);
+      if (!markerMatch) {
+        return Response.json({
+          reply: "I lost track of which attachment you confirmed. Tell me the email and folder again.",
+        });
+      }
+      const [, emailId, attachmentId, folderName] = markerMatch;
+
+      // Pull the filename out of the prior message for the success reply +
+      // verification step. Format we wrote: 'I found an attachment called "X.pdf" ...'
+      const nameMatch = lastAssistant.content.match(/called\s+["']([^"']+)["']/i);
+      const fileName = nameMatch?.[1] || null;
+
+      console.log("=== CALLING EMAIL-TO-DRIVE (approved) ===");
+      console.log("[email-to-drive approval] params:", { emailId, attachmentId, fileName, folderName });
+      const e2dRes = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          emailId,
+          attachmentId,
+          fileName,
+          folderName,
+        }),
+      });
+      const result = await e2dRes.json();
+      console.log("Email-to-Drive raw response:", JSON.stringify(result));
+
+      if (result.success !== true || !result.fileId) {
+        return Response.json({
+          reply: `I couldn't save that attachment - the upload failed. Error: ${result.error || "no fileId returned"}`,
+        });
+      }
+      if (!result.link || !result.link.includes("google.com")) {
+        return Response.json({
+          reply: "The upload returned an invalid response. The file may not have saved.",
+        });
+      }
+
+      // Post-save verification: search Drive for the file by its base name
+      // and confirm we get back the same fileId we just uploaded. If the
+      // file isn't actually there, refuse to claim "Done".
+      let verifiedFile = null;
+      try {
+        const baseName = (result.name || fileName || "").split(".")[0];
+        if (baseName) {
+          const vParams = new URLSearchParams({ search: baseName, limit: "5" });
+          const vRes = await fetch(`${BASE_URL}/api/drive?${vParams.toString()}`);
+          const vData = await vRes.json();
+          verifiedFile =
+            (vData.files || []).find((f) => f.id === result.fileId) ||
+            (vData.files || []).find((f) => (f.name || "").includes(baseName));
+          console.log("[email-to-drive verify]", {
+            baseName,
+            found: !!verifiedFile,
+            returned: vData.files?.length,
+          });
+        }
+      } catch (e) {
+        console.log("[email-to-drive verify] failed:", e.message);
+      }
+
+      if (!verifiedFile) {
+        return Response.json({
+          reply: "The upload failed - I can't find it in Drive. Want me to try again?",
+        });
+      }
+
+      try {
+        await insertMemoryWithCap(
+          `[LOG] Saved attachment "${result.name}" (id ${result.fileId}) from email ${emailId} to "${folderName}" on ${today}`
+        );
+      } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
+
+      return Response.json({
+        reply: `Done — saved "${result.name}" to ${folderName}. Here's the link: ${verifiedFile.webViewLink || result.link}`,
+      });
+    }
+
+    // 7e. EMAIL ATTACHMENT TO DRIVE — first turn. Find the email + attachment,
+    // show Brad EXACTLY what we'll save, embed the IDs in a marker, and wait
+    // for "yes save it". No upload until Brad confirms.
     if (isEmailToDrive(msg)) {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -1649,71 +1757,76 @@ Examples:
         });
       }
 
-      // Step 2: pick the first email that actually has attachments
-      const emailWithAttachments = emails.find(
+      // Step 2: which emails have attachments
+      const emailsWithAttachments = emails.filter(
         (e) => Array.isArray(e.attachments) && e.attachments.length > 0
       );
-      if (!emailWithAttachments) {
+      if (emailsWithAttachments.length === 0) {
         return Response.json({
           reply: `I found ${emails.length} email(s) matching "${emailSearch}" but none of them have attachments.`,
         });
       }
-      console.log("[email-to-drive] email with attachments:", {
-        id: emailWithAttachments.id,
-        subject: emailWithAttachments.subject,
-        from: emailWithAttachments.fromEmail,
-        attachmentCount: emailWithAttachments.attachments.length,
-      });
 
-      // Step 3: pick the first attachment. If multiple, save the first and
-      // mention the rest so Brad knows.
-      const attachment = emailWithAttachments.attachments[0];
-      console.log("[email-to-drive] attachment:", attachment);
-
-      // Step 4: call email-to-drive (which resolves folderName → folderId
-      // server-side, so we don't need to look it up here).
-      console.log("=== CALLING EMAIL-TO-DRIVE ===");
-      const e2dRes = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          emailId: emailWithAttachments.id,
-          attachmentId: attachment.attachmentId,
-          fileName: customName || attachment.filename,
-          folderName: targetFolderName,
-        }),
-      });
-      const result = await e2dRes.json();
-      console.log("Email-to-Drive raw response:", JSON.stringify(result));
-
-      // STRICT validation — three independent checks. Anything but a real
-      // Drive file ID + a google.com webViewLink means the upload didn't
-      // really land, and we refuse to claim "Done".
-      if (result.success !== true || !result.fileId) {
+      // If multiple emails match AND have attachments, ask Brad which one —
+      // we never silently pick the "first" because that risks saving from
+      // the wrong email (rule #11 / #12).
+      if (emailsWithAttachments.length > 1) {
+        const list = emailsWithAttachments
+          .slice(0, 5)
+          .map((e) => {
+            const sender = e.fromEmail || e.from || "unknown";
+            const date = e.date || "";
+            return `• "${e.subject}" from ${sender}${date ? ` (${date})` : ""} — ${e.attachments.length} attachment(s)`;
+          })
+          .join("\n");
         return Response.json({
-          reply: `I couldn't save that attachment - the upload failed. Error: ${result.error || "no fileId returned"}`,
-        });
-      }
-      if (!result.link || !result.link.includes("google.com")) {
-        console.log("[email-to-drive] invalid link in response:", result.link);
-        return Response.json({
-          reply: "The upload returned an invalid response. The file may not have saved.",
+          reply: `Multiple emails matching "${emailSearch}" have attachments. Which one?\n\n${list}\n\nReply with more specific details (sender, date, or subject keyword).`,
         });
       }
 
-      try {
-        await insertMemoryWithCap(
-          `[LOG] Saved attachment "${result.name}" (id ${result.fileId}) from email "${emailWithAttachments.subject}" to "${targetFolderName}" on ${today}`
-        );
-      } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
+      const email = emailsWithAttachments[0];
+      console.log("[email-to-drive] picked email:", {
+        id: email.id,
+        subject: email.subject,
+        from: email.fromEmail,
+        attachmentCount: email.attachments.length,
+      });
 
-      const noteOthers =
-        emailWithAttachments.attachments.length > 1
-          ? ` (this email had ${emailWithAttachments.attachments.length} attachments — I saved the first one. Tell me which other to save if needed.)`
-          : "";
+      // If multiple attachments, list them and ask Brad which one. Never
+      // silently pick the first — rule #12 requires explicit confirmation.
+      if (email.attachments.length > 1) {
+        const list = email.attachments
+          .map((a, i) => `${i + 1}. "${a.filename}" (${a.mimeType})`)
+          .join("\n");
+        return Response.json({
+          reply: `The "${email.subject}" email has ${email.attachments.length} attachments:\n\n${list}\n\nWhich one(s) should I save to ${targetFolderName}? Reply with the file name (or all of them).`,
+        });
+      }
 
+      const attachment = email.attachments[0];
+      console.log("[email-to-drive] single attachment:", attachment);
+
+      // Format the email date for the confirmation prompt
+      let dateLabel = "";
+      const ts = parseInt(email.internalDate || "0", 10);
+      if (ts > 0) {
+        try {
+          dateLabel = ` from ${new Date(ts).toLocaleString("en-US", {
+            timeZone: TIMEZONE,
+            weekday: "short",
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+          })}`;
+        } catch (e) { /* ignore */ }
+      }
+
+      // CONFIRMATION ONLY — no upload yet. Marker pins the email + attachment
+      // + folder so the approval handler can act on EXACTLY this combination.
+      const displayName = customName || attachment.filename;
       return Response.json({
-        reply: `Done — saved "${result.name}" to ${targetFolderName}.${noteOthers} Link: ${result.link}`,
+        reply: `I found an attachment called "${displayName}" in the "${email.subject}" email${dateLabel}. Save this to ${targetFolderName}? Type 'yes save it' to confirm.\n\n[save:${email.id}:${attachment.attachmentId}:${targetFolderName}]`,
       });
     }
 

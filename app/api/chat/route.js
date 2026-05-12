@@ -284,6 +284,13 @@ function isDeparture(msg) {
  * SYSTEM PROMPT
  * ========================================================================== */
 
+const HALLUCINATION_GUARD = `
+ABSOLUTE RULE: You cannot claim to have done something you haven't.
+If an API call was not made, say "I was unable to complete that."
+Never say "Done", "Submitted", "Sent", or "Saved" unless an API returned success:true.
+If you are not sure if something worked, say "I'm not sure if that worked - please verify."
+`;
+
 function buildSystemPrompt(today, memoryText) {
   return `You are Jess, Brad's executive assistant.
 Today: ${today}
@@ -292,7 +299,7 @@ Brad's shop: ${SHOP}
 
 Memory:
 ${memoryText || "No memories yet."}
-
+${HALLUCINATION_GUARD}
 HALLUCINATION IS A FIRING OFFENSE. If email data is not in the API response, say exactly: "I don't see that in the results I got back." Never invent names, email addresses, subjects, or content. If Brad says you're wrong, believe him - you made it up. The only acceptable responses when data is missing are:
 1. "I found nothing matching that search"
 2. "I found X emails - here they are: [list actual results]"
@@ -1121,20 +1128,31 @@ export async function POST(req) {
     // 6. QUOTE
     if (isQuote(msg)) {
       const extracted = await extractQuoteDetails(message);
+      console.log("[quote] extracted:", JSON.stringify(extracted));
+
       if (!extracted.customerName || !extracted.customerAddress || !extracted.roofMaterial) {
         return Response.json({
-          reply: "I need the customer's full name, address, and roof material (Tile, Shingle, or Flat) to submit the quote.",
+          reply: "I need the customer name, address, and roof material (Tile, Shingle, or Flat) to submit the quote.",
         });
       }
+
+      console.log("SUBMITTING QUOTE for:", extracted.customerName);
       const res = await fetch(`${BASE_URL}/api/quote`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(extracted),
       });
       const data = await res.json();
+      console.log("QUOTE RESULT:", JSON.stringify(data));
+
       if (data.success) {
+        try {
+          await insertMemoryWithCap(
+            `[LOG] Submitted T&K quote for ${extracted.customerName} at ${extracted.customerAddress} (${extracted.roofMaterial}) on ${today}`
+          );
+        } catch (e) { console.log("[quote] memory log failed:", e.message); }
         return Response.json({
-          reply: `Done — quote sent to T&K Roofing for ${extracted.customerName} at ${extracted.customerAddress}. They'll respond in 15-30 minutes.`,
+          reply: `Quote submitted to T&K Roofing for ${extracted.customerName} at ${extracted.customerAddress}. Roof: ${extracted.roofMaterial}. They respond in 15-30 minutes.`,
         });
       }
       return Response.json({ reply: "Quote submission failed: " + (data.error || "unknown") });

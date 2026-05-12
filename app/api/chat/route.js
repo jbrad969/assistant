@@ -95,7 +95,6 @@ Intents:
 - "reminder_set" - set a NEW reminder
 - "reminder_check" - check existing reminders
 - "reminder_delete" - delete all reminders
-- "quote" - submit a NEW roof quote to T&K Roofing (ONLY when customer name, address AND roof material are all provided)
 - "chat" - general conversation, none of the above
 
 Return JSON:
@@ -109,10 +108,7 @@ Return JSON:
     "emailId": "if specific email referenced",
     "personName": "if person mentioned",
     "time": "if time mentioned",
-    "message": "if reminder message",
-    "customerName": "if quote",
-    "customerAddress": "if quote",
-    "roofMaterial": "if quote"
+    "message": "if reminder message"
   }
 }
 
@@ -770,7 +766,17 @@ export async function POST(req) {
 
     const msg = message.toLowerCase();
 
-    const intent = await classifyIntent(message, history);
+    // Quote routing is a hard pre-check, not classifier-driven: the AI classifier
+    // was over-triggering on stray mentions of "tile" / addresses. Require all three
+    // signals literally in the message.
+    const isQuoteRequest =
+      /\bquote\b/i.test(message) &&
+      /\b(tile|shingle|flat)\b/i.test(message) &&
+      /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
+
+    const intent = isQuoteRequest
+      ? { intent: "quote", confidence: 100 }
+      : await classifyIntent(message, history);
     console.log("Intent classified:", intent.intent, "confidence:", intent.confidence);
 
     switch (intent.intent) {

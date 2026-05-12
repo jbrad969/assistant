@@ -732,7 +732,18 @@ export default function Page() {
         if (shownRemindersRef.current.has(reminder.id)) continue;
         shownRemindersRef.current.add(reminder.id);
 
-        const text = `⏰ Reminder: ${reminder.message}`;
+        // remind_at is stored as UTC ISO in Supabase — format it in Phoenix
+        // time so Brad sees when the reminder was supposed to fire (helps
+        // distinguish "fired on time" from "fired late after page reopen").
+        const phoenixTime = new Date(reminder.remind_at).toLocaleString("en-US", {
+          timeZone: "America/Phoenix",
+          weekday: "long",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        });
+        const text = `⏰ Reminder (${phoenixTime}): ${reminder.message}`;
         setMessages((prev) => [...prev, { role: "assistant", content: text }]);
         speak(`Reminder. ${reminder.message}`);
 

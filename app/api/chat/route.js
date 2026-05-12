@@ -642,23 +642,41 @@ async function sendEmail(to, subject, body) {
 
 async function extractReminderDetails(message, history) {
   const context = history.slice(-5).map((m) => `${m.role}: ${m.content}`).join("\n");
-  const todayIso = new Date().toISOString();
+
+  // Compute today + tomorrow in Phoenix time so the prompt is anchored to the
+  // actual current Phoenix date, not a UTC ISO that GPT may misinterpret after
+  // 5pm Phoenix when UTC has already rolled to the next day.
+  const phoenixDate = (d) =>
+    new Intl.DateTimeFormat("en-CA", {
+      year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIMEZONE,
+    }).format(d);
+  const todayPhoenix = phoenixDate(new Date());
+  const tomorrowPhoenix = phoenixDate(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  const todayLabel = new Date().toLocaleDateString("en-US", {
+    timeZone: TIMEZONE, weekday: "long", year: "numeric", month: "long", day: "numeric",
+  });
+  const tomorrowLabel = new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleDateString("en-US", {
+    timeZone: TIMEZONE, weekday: "long", month: "long", day: "numeric",
+  });
+
   const result = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: `Extract reminder details. Today is ${todayIso}.
+        content: `Today is ${todayLabel}.
+Phoenix AZ timezone is ALWAYS UTC-7, no daylight saving time, ever.
+To convert Phoenix time to UTC: add exactly 7 hours.
 
-Phoenix AZ timezone is always UTC-7 (no daylight saving time ever). To convert Phoenix time to UTC, add 7 hours. Wednesday May 6 2026 at 7:45 AM Phoenix = 2026-05-06T14:45:00Z. Always output the remind_at as a UTC ISO string.
-
-Examples:
-- "remind me Wednesday at 7:45 AM" -> {"time": "2026-05-06T14:45:00Z", ...}  (7:45 AM Phoenix = 14:45 UTC)
-- "remind me at 10 AM tomorrow" -> add 7 hours to Phoenix 10:00 -> "...T17:00:00Z"
-- "remind me at 8 PM tonight" -> Phoenix 20:00 -> next day 03:00 UTC ("...T03:00:00Z" of the next date)
+Examples (using today's actual date):
+- ${tomorrowLabel} at 10:30 AM Phoenix = ${tomorrowPhoenix}T17:30:00Z
+- ${todayLabel} at 7:45 AM Phoenix = ${todayPhoenix}T14:45:00Z
+- Phoenix 6 PM (18:00) plus 7 hours rolls the UTC date forward by 1 day (so "tonight 6 PM" on ${todayLabel} = ${tomorrowPhoenix}T01:00:00Z).
 
 Return JSON: {"message": "what to remind Brad about (concise)", "time": "UTC ISO timestamp ending in Z"}
+
+CRITICAL: Use the actual current date shown above. Never guess the date. Never reuse an example date verbatim — compute against today.
 
 Write the reminder message in first person as an action, not as "Remind Brad to..." or "Brad needs to...".
 Examples:
@@ -669,7 +687,6 @@ RIGHT: "Call Nicole"
 WRONG: "Reminder for Brad to email Yvonne"
 RIGHT: "Email Yvonne"
 
-If day mentioned without year, use 2026.
 If the conversation already establishes time/topic for the reminder, reuse them — do not ask.`,
       },
       {

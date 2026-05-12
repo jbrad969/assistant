@@ -53,14 +53,19 @@ async function resolveFolderId(drive, folderName) {
     supportsAllDrives: true,
   });
   const existing = lookup.data.files?.[0];
-  if (existing) return { folderId: existing.id, created: false };
+  if (existing?.id) {
+    console.log("[email-to-drive] folder found:", folderName, "ID:", existing.id);
+    return { folderId: existing.id, created: false };
+  }
 
   const created = await drive.files.create({
     requestBody: { name: folderName, mimeType: FOLDER_MIME },
     fields: "id, name",
     supportsAllDrives: true,
   });
-  return { folderId: created.data.id, created: true };
+  const newId = created.data?.id || null;
+  console.log("[email-to-drive] folder created:", folderName, "ID:", newId);
+  return { folderId: newId, created: !!newId };
 }
 
 export async function POST(req) {
@@ -80,6 +85,16 @@ export async function POST(req) {
     const drive = google.drive({ version: "v3", auth });
 
     const { folderId, created: folderCreated } = await resolveFolderId(drive, folderName);
+    console.log("Saving to folder:", folderName, "ID:", folderId);
+
+    // Without this guard, Drive treats parents:[undefined] as "no parent" and
+    // silently drops the file into root. Refuse to upload — that's the bug.
+    if (!folderId) {
+      return Response.json(
+        { success: false, error: `Could not resolve or create folder "${folderName}"` },
+        { status: 500 }
+      );
+    }
 
     const msg = await gmail.users.messages.get({
       userId: "me",

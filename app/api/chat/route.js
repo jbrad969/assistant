@@ -1014,13 +1014,16 @@ export async function POST(req) {
       /\b(tile|shingle|flat)\b/i.test(message) &&
       /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
 
-    // Email-to-drive routing: two cases force email_to_drive ahead of the
+    // Email-to-drive routing: three cases force email_to_drive ahead of the
     // classifier so verbs like "move" don't drift to drive_move and bare
     // folder names don't drift to chat.
     //   (a) Prior assistant turn has a SAVE marker AND message has an
     //       approval verb.
     //   (b) cachedEmailAttachments is non-empty AND message resolves to a
     //       specific cached item ("save the May 1st one to X").
+    //   (c) cachedEmailAttachments is non-empty AND message is a generic
+    //       save/move directed at a folder ("save it to Roof Quotes",
+    //       "put it in the folder") — we'll use the last cached attachment.
     const lastAssistantTurn = history.filter((h) => h.role === "assistant").slice(-1)[0];
     const savePending = parseSaveMarker(lastAssistantTurn?.content || "");
     const isAttachmentApproval =
@@ -1030,11 +1033,14 @@ export async function POST(req) {
       cachedEmailAttachments.length > 0 &&
       /\b(?:save|move|put|upload|drop|stick)\b/i.test(message) &&
       !!pickSaveCandidate(message, cachedEmailAttachments);
+    const isGenericCacheSave =
+      cachedEmailAttachments.length > 0 &&
+      /\b(?:save|move|put|upload|drop|stick)\s+(?:it|that|this|the\s+(?:attachment|file|pdf))\b/i.test(message);
 
     let intent;
     if (isQuoteRequest) {
       intent = { intent: "quote", confidence: 100 };
-    } else if (isAttachmentApproval || isCacheReferenceSave) {
+    } else if (isAttachmentApproval || isCacheReferenceSave || isGenericCacheSave) {
       intent = { intent: "email_to_drive", confidence: 100 };
     } else {
       intent = await classifyIntent(message, history);
@@ -1224,7 +1230,9 @@ export async function POST(req) {
       // Cache every attachment-bearing email so a follow-up like "save the
       // May 1st one" or "save the Pershing one" can find the right
       // attachmentId even though the SAVE marker only pins the FIRST item.
-      cachedEmailAttachments = realEmails
+      // Only replace the cache when this search actually returned attachments
+      // — a zero-attachment search shouldn't wipe context Brad still relies on.
+      const freshAttachmentEmails = realEmails
         .filter((e) => Array.isArray(e.attachments) && e.attachments.length > 0)
         .map((e) => ({
           emailId: e.id,
@@ -1234,7 +1242,12 @@ export async function POST(req) {
           internalDate: e.internalDate,
           attachments: e.attachments,
         }));
-      console.log("[email read] cached attachment-bearing emails:", cachedEmailAttachments.length);
+      if (freshAttachmentEmails.length > 0) {
+        cachedEmailAttachments = freshAttachmentEmails;
+        console.log("[email read] cache replaced with", cachedEmailAttachments.length, "attachment-bearing email(s)");
+      } else {
+        console.log("[email read] no attachments in results; keeping existing cache of", cachedEmailAttachments.length);
+      }
 
       // If any result has an attachment, pin the FIRST one in a SAVE marker
       // and offer to save it. Brad's next turn ("yes save to Roof Quotes" /
@@ -1875,6 +1888,21 @@ If the message has no email, set shareEmail to null.`,
       if (!target && pinned) {
         target = pinned;
         console.log("[email-to-drive] using SAVE marker (default pinned)");
+      }
+      // Final fallback: bare "save it" / "put it in the folder" with no
+      // specific reference AND no marker in history — use the most recently
+      // cached attachment-bearing email.
+      if (!target && cachedEmailAttachments.length > 0) {
+        const last = cachedEmailAttachments[0];
+        const att = last.attachments[0];
+        if (att?.attachmentId) {
+          target = {
+            emailId: last.emailId,
+            attachmentId: att.attachmentId,
+            filename: att.filename,
+          };
+          console.log("[email-to-drive] using last cached attachment:", target.filename);
+        }
       }
 
       if (!target) {

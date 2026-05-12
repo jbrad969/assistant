@@ -48,6 +48,13 @@ function isEmailApprovalPhrase(msg) {
 // the pinned IDs without session storage.
 const SAVE_MARKER_RE = /\[save:([^:]+):([^:]+):([^\]]+)\]/;
 const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
+// Disambiguation markers for the email-to-drive multi-email path. dcand pins
+// every candidate (email + attachment + sender + mimeType + internalDateMs) so
+// a follow-up like "the first one", "the 9:57 one", "the T&K email", "the one
+// with the bid", or "the one from this morning" resolves without re-asking.
+// dfolder pins the target folder.
+const DISAMBIG_FOLDER_RE = /\[dfolder:([^\]]+)\]/;
+const DISAMBIG_CAND_RE = /\[dcand:(\d+)\|([^|\]]+)\|([^|\]]+)\|([^|\]]+)\|([^|\]]+)\|([^|\]]+)\|([^|\]]+)\|([^\]]+)\]/g;
 
 // Strict ID validation for every Google API response. Real Gmail/Drive IDs
 // are 16+ chars of alphanumeric — anything shorter or containing "fake" is
@@ -566,6 +573,204 @@ Only Tile/Shingle/Flat for roofMaterial. If unclear, null.`,
   return JSON.parse(result.choices[0].message.content);
 }
 
+// Format an internalDate (ms-as-string from Gmail) as 24h "HH:MM" in Phoenix.
+// Used as the time field in dcand markers so "9:57" or "9:57 AM" can match.
+function phoenixHHMM(internalDate) {
+  const ts = parseInt(internalDate || "0", 10);
+  if (!ts) return "00:00";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(ts));
+  let hh = parts.find((p) => p.type === "hour")?.value || "00";
+  const mm = parts.find((p) => p.type === "minute")?.value || "00";
+  if (hh === "24") hh = "00";
+  return `${hh.padStart(2, "0")}:${mm.padStart(2, "0")}`;
+}
+
+// Recover the candidate list + target folder from a prior assistant message
+// that listed multiple email/attachment options. Returns null if the message
+// didn't include disambig markers.
+function parseDisambigPrompt(text) {
+  if (!text) return null;
+  const folderMatch = text.match(DISAMBIG_FOLDER_RE);
+  if (!folderMatch) return null;
+  const candidates = [];
+  const re = new RegExp(DISAMBIG_CAND_RE.source, "g");
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    candidates.push({
+      index: parseInt(m[1], 10),
+      emailId: m[2],
+      attachmentId: m[3],
+      time: m[4],
+      filename: m[5],
+      sender: m[6],
+      mimeType: m[7],
+      internalDateMs: m[8],
+    });
+  }
+  if (candidates.length === 0) return null;
+  return { folder: folderMatch[1], candidates };
+}
+
+const DISAMBIG_ORDINALS = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+  "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5,
+};
+
+// True when the given Gmail internalDate (ms-as-string) lands on today's
+// Phoenix calendar day. Used by the "this morning" filter.
+function isPhoenixToday(internalDateMs) {
+  const ts = parseInt(internalDateMs || "0", 10);
+  if (!ts) return false;
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: TIMEZONE });
+  const day = new Date(ts).toLocaleDateString("en-CA", { timeZone: TIMEZONE });
+  return day === today;
+}
+
+// True when the candidate is a PDF (by mimeType or filename). Used by the
+// "bid"/"pdf" filter — bids are PDFs in T&K's workflow.
+function isPdfCandidate(c) {
+  const mt = (c.mimeType || "").toLowerCase();
+  const fn = (c.filename || "").toLowerCase();
+  return mt.includes("pdf") || fn.endsWith(".pdf");
+}
+
+// Heuristic: does this message look like Brad is picking from a list? Used as
+// the gate for the hard pre-check before classifyIntent runs.
+function looksLikeDisambigReply(message) {
+  const m = message.toLowerCase();
+  if (/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b/.test(m)) return true;
+  if (/\b\d{1,2}:\d{2}\b/.test(m)) return true;
+  if (/\b(that|this)\s+one\b/.test(m)) return true;
+  if (/\bthis\s+morning\b/.test(m)) return true;
+  if (/\b(t&k|tnk|tnkroofing|t\s+and\s+k)\b/i.test(message)) return true;
+  if (/\b(bid|pdf)\b/.test(m)) return true;
+  if (/^\s*\d+\s*[.!?]?\s*$/.test(m)) return true;
+  if (/\.(pdf|docx?|xlsx?|png|jpe?g|csv|zip|txt)\b/i.test(m)) return true;
+  return false;
+}
+
+// Resolve Brad's pick to one of the pinned candidates. Order: semantic filters
+// (sender / pdf / "this morning") run first — if any match, pick the most
+// recent surviving candidate (earliest, for "this morning"). Otherwise fall
+// back to ordinal → time → filename → number → "that one".
+function pickDisambigCandidate(message, candidates) {
+  const m = message.toLowerCase();
+
+  let pool = candidates.slice();
+  let filtered = false;
+  let preferEarliest = false;
+
+  if (/\b(t&k|tnk|tnkroofing|t\s+and\s+k)\b/i.test(message)) {
+    pool = pool.filter((c) => (c.sender || "").toLowerCase().includes("tnkroofing"));
+    filtered = true;
+  }
+
+  if (/\b(bid|pdf)\b/.test(m) || /\.pdf\b/.test(m)) {
+    pool = pool.filter(isPdfCandidate);
+    filtered = true;
+  }
+
+  if (/\bthis\s+morning\b/.test(m)) {
+    pool = pool.filter((c) => isPhoenixToday(c.internalDateMs));
+    filtered = true;
+    preferEarliest = true;
+  }
+
+  if (filtered && pool.length > 0) {
+    pool.sort((a, b) => {
+      const aMs = parseInt(a.internalDateMs || "0", 10);
+      const bMs = parseInt(b.internalDateMs || "0", 10);
+      return preferEarliest ? aMs - bMs : bMs - aMs;
+    });
+    return pool[0];
+  }
+
+  for (const [word, idx] of Object.entries(DISAMBIG_ORDINALS)) {
+    if (new RegExp(`\\b${word}\\b`).test(m)) {
+      const hit = candidates.find((c) => c.index === idx);
+      if (hit) return hit;
+    }
+  }
+
+  const timeMatch = m.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/);
+  if (timeMatch) {
+    const rawHour = parseInt(timeMatch[1], 10);
+    const minute = timeMatch[2];
+    const ampm = timeMatch[3];
+    const tryHours = [];
+    if (ampm === "pm") tryHours.push(rawHour < 12 ? rawHour + 12 : rawHour);
+    else if (ampm === "am") tryHours.push(rawHour === 12 ? 0 : rawHour);
+    else {
+      tryHours.push(rawHour);
+      if (rawHour < 12) tryHours.push(rawHour + 12);
+    }
+    for (const h of tryHours) {
+      const target = `${String(h).padStart(2, "0")}:${minute}`;
+      const hit = candidates.find((c) => c.time === target);
+      if (hit) return hit;
+    }
+  }
+
+  for (const c of candidates) {
+    const fn = (c.filename || "").toLowerCase();
+    if (fn && m.includes(fn)) return c;
+    const base = fn.split(".")[0];
+    if (base && base.length >= 4 && m.includes(base)) return c;
+  }
+
+  const bareNum = m.replace(/[.!?]/g, "").trim();
+  if (/^\d+$/.test(bareNum)) {
+    const idx = parseInt(bareNum, 10);
+    if (idx >= 1 && idx <= candidates.length) {
+      return candidates.find((c) => c.index === idx);
+    }
+  }
+
+  if (/\b(that|this)\s+one\b/.test(m) && candidates.length === 1) {
+    return candidates[0];
+  }
+
+  return null;
+}
+
+// Look up a Drive folder by name; create it if missing. Returns { folderId,
+// created, error? }. Used by the email-to-drive flows so a missing folder
+// never blocks an otherwise-unambiguous save.
+async function resolveOrCreateFolder(folderName) {
+  if (!folderName) return { folderId: null, created: false, error: "folderName is required" };
+  try {
+    const lookupRes = await fetch(
+      `${BASE_URL}/api/drive?type=folder&search=${encodeURIComponent(folderName)}`
+    );
+    const lookupData = await lookupRes.json();
+    const existing = (lookupData.files || []).find((f) => f.name === folderName);
+    if (existing) {
+      return { folderId: existing.id, created: false };
+    }
+  } catch (e) {
+    console.log("[resolveOrCreateFolder] lookup failed:", e.message);
+  }
+  try {
+    const createRes = await fetch(`${BASE_URL}/api/drive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folderName }),
+    });
+    const createData = await createRes.json();
+    if (!createData.success || !createData.folderId) {
+      return { folderId: null, created: false, error: createData.error || "folder creation failed" };
+    }
+    return { folderId: createData.folderId, created: true };
+  } catch (e) {
+    return { folderId: null, created: false, error: e.message };
+  }
+}
+
 /* ============================================================================
  * DEPARTURE HELPERS
  * ========================================================================== */
@@ -774,9 +979,20 @@ export async function POST(req) {
       /\b(tile|shingle|flat)\b/i.test(message) &&
       /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
 
-    const intent = isQuoteRequest
-      ? { intent: "quote", confidence: 100 }
-      : await classifyIntent(message, history);
+    // Email-to-drive disambig: prior turn listed candidates, this reply picks one.
+    // Hard-route so "the first one" / "9:57 AM today" doesn't fall through to chat.
+    const lastAssistantTurn = history.filter((h) => h.role === "assistant").slice(-1)[0];
+    const disambigPending = parseDisambigPrompt(lastAssistantTurn?.content || "");
+    const isDisambigReply = !!(disambigPending && looksLikeDisambigReply(message));
+
+    let intent;
+    if (isQuoteRequest) {
+      intent = { intent: "quote", confidence: 100 };
+    } else if (isDisambigReply) {
+      intent = { intent: "email_to_drive", confidence: 100 };
+    } else {
+      intent = await classifyIntent(message, history);
+    }
     console.log("Intent classified:", intent.intent, "confidence:", intent.confidence);
 
     switch (intent.intent) {
@@ -1630,6 +1846,83 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
+      // DISAMBIGUATION reply — prior turn listed candidates with dcand markers
+      // and Brad's reply picks one ("first", "9:57", a filename). Save directly:
+      // the listing already showed exactly what we'd save, so no second
+      // confirmation step.
+      {
+        const disambigState = parseDisambigPrompt(lastAssistantForSave?.content || "");
+        if (disambigState && looksLikeDisambigReply(message)) {
+          const pick = pickDisambigCandidate(message, disambigState.candidates);
+          if (pick) {
+            console.log("=== CALLING EMAIL-TO-DRIVE (disambig) ===");
+            console.log("[email-to-drive disambig] picked:", pick);
+            const e2dRes = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                emailId: pick.emailId,
+                attachmentId: pick.attachmentId,
+                fileName: pick.filename,
+                folderName: disambigState.folder,
+              }),
+            });
+            const result = await e2dRes.json();
+            console.log("[email-to-drive disambig] raw response:", JSON.stringify(result));
+
+            if (result.success !== true || !result.fileId) {
+              return Response.json({
+                reply: `I couldn't save that attachment - the upload failed. Error: ${result.error || "no fileId returned"}`,
+              });
+            }
+            if (!result.link || !result.link.includes("google.com")) {
+              return Response.json({
+                reply: "The upload returned an invalid response. The file may not have saved.",
+              });
+            }
+
+            let verifiedFile = null;
+            try {
+              const baseName = (result.name || pick.filename || "").split(".")[0];
+              if (baseName) {
+                const vParams = new URLSearchParams({ search: baseName, limit: "5" });
+                const vRes = await fetch(`${BASE_URL}/api/drive?${vParams.toString()}`);
+                const vData = await vRes.json();
+                verifiedFile =
+                  (vData.files || []).find((f) => f.id === result.fileId) ||
+                  (vData.files || []).find((f) => (f.name || "").includes(baseName));
+                console.log("[email-to-drive disambig verify]", {
+                  baseName,
+                  found: !!verifiedFile,
+                  returned: vData.files?.length,
+                });
+              }
+            } catch (e) {
+              console.log("[email-to-drive disambig verify] failed:", e.message);
+            }
+
+            if (!verifiedFile) {
+              return Response.json({
+                reply: "The upload failed - I can't find it in Drive. Want me to try again?",
+              });
+            }
+
+            try {
+              await insertMemoryWithCap(
+                `[LOG] Saved attachment "${result.name}" (id ${result.fileId}) from email ${pick.emailId} to "${disambigState.folder}" on ${today}`
+              );
+            } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
+
+            return Response.json({
+              reply: `Done — saved "${result.name}" to ${disambigState.folder}. Here's the link: ${verifiedFile.webViewLink || result.link}`,
+            });
+          }
+          return Response.json({
+            reply: "I couldn't tell which one you meant. Say the number, the time (e.g. '9:57'), or the filename.",
+          });
+        }
+      }
+
       // Fresh save request — find the email + attachment, show Brad EXACTLY
       // what we'll save, embed the IDs in a marker, and wait for "yes save
       // it". No upload until Brad confirms.
@@ -1641,20 +1934,23 @@ If the message has no email, set shareEmail to null.`,
           {
             role: "system",
             content: `Extract an email-to-drive command. Brad wants to save an email attachment to a Drive folder.
-Return JSON: {"emailSearch": "search term to find the email — sender name or subject keyword", "targetFolderName": "Drive folder name", "fileName": "rename or null to keep original name"}
+Return JSON: {"emailSearch": "search term to find the email — sender name or subject keyword", "targetFolderName": "Drive folder name", "fileName": "rename or null to keep original name", "createFolderFirst": true if Brad asked to create the folder in this same message, else false}
+Set createFolderFirst=true when the message includes patterns like "create a/the X folder and ...", "make a new folder called X ...", "in a new X folder", "create folder X then save ...". Default false.
 Examples:
-"save the Thrifty attachment to my Receipts folder" -> {"emailSearch": "Thrifty", "targetFolderName": "Receipts", "fileName": null}
-"upload the David Wheat invoice from email to David Wheat folder" -> {"emailSearch": "David Wheat invoice", "targetFolderName": "David Wheat", "fileName": null}
-"put the PDF from Phillip's email into PO 2026 folder" -> {"emailSearch": "Phillip", "targetFolderName": "PO 2026", "fileName": null}
-"save the WattMonk attachment as wattmonk-jan.pdf in Contracts folder" -> {"emailSearch": "WattMonk", "targetFolderName": "Contracts", "fileName": "wattmonk-jan.pdf"}`,
+"save the Thrifty attachment to my Receipts folder" -> {"emailSearch": "Thrifty", "targetFolderName": "Receipts", "fileName": null, "createFolderFirst": false}
+"upload the David Wheat invoice from email to David Wheat folder" -> {"emailSearch": "David Wheat invoice", "targetFolderName": "David Wheat", "fileName": null, "createFolderFirst": false}
+"put the PDF from Phillip's email into PO 2026 folder" -> {"emailSearch": "Phillip", "targetFolderName": "PO 2026", "fileName": null, "createFolderFirst": false}
+"save the WattMonk attachment as wattmonk-jan.pdf in Contracts folder" -> {"emailSearch": "WattMonk", "targetFolderName": "Contracts", "fileName": "wattmonk-jan.pdf", "createFolderFirst": false}
+"create a Roof Quotes folder and save the T&K attachment to it" -> {"emailSearch": "T&K", "targetFolderName": "Roof Quotes", "fileName": null, "createFolderFirst": true}
+"make a new folder called PO 2026 and put the WattMonk PDF in it" -> {"emailSearch": "WattMonk", "targetFolderName": "PO 2026", "fileName": null, "createFolderFirst": true}`,
           },
           { role: "user", content: message },
         ],
       });
-      const { emailSearch, targetFolderName, fileName: customName } = JSON.parse(
+      const { emailSearch, targetFolderName, fileName: customName, createFolderFirst } = JSON.parse(
         extractRes.choices[0].message.content
       );
-      console.log("[email-to-drive] extracted:", { emailSearch, targetFolderName, customName });
+      console.log("[email-to-drive] extracted:", { emailSearch, targetFolderName, customName, createFolderFirst });
 
       if (!emailSearch || !targetFolderName) {
         return Response.json({
@@ -1687,20 +1983,42 @@ Examples:
         });
       }
 
-      // If multiple emails match AND have attachments, ask Brad which one —
-      // we never silently pick the "first" because that risks saving from
-      // the wrong email (rule #11 / #12).
+      // If multiple emails match AND have attachments, list every candidate
+      // (per email × attachment pair) and pin each with a dcand marker so
+      // Brad's next reply ("first", "9:57", a filename) resolves directly to
+      // an email + attachment + folder triple. Per rules #11/#12 we still
+      // never silently pick — we list and wait — but the resolution is
+      // marker-driven, not free-text-driven.
       if (emailsWithAttachments.length > 1) {
-        const list = emailsWithAttachments
-          .slice(0, 5)
-          .map((e) => {
-            const sender = e.fromEmail || e.from || "unknown";
-            const date = e.date || "";
-            return `• "${e.subject}" from ${sender}${date ? ` (${date})` : ""} — ${e.attachments.length} attachment(s)`;
-          })
-          .join("\n");
+        const items = [];
+        for (const e of emailsWithAttachments.slice(0, 5)) {
+          for (const a of e.attachments) {
+            items.push({ email: e, attachment: a });
+            if (items.length >= 8) break;
+          }
+          if (items.length >= 8) break;
+        }
+
+        const lines = items.map((item, i) => {
+          const e = item.email;
+          const a = item.attachment;
+          const sender = e.fromEmail || e.from || "unknown";
+          const dateLabel = e.date ? ` (${e.date})` : "";
+          return `${i + 1}. "${a.filename}" from ${sender} — "${e.subject}"${dateLabel}`;
+        });
+
+        const markers = items.map((item, i) => {
+          const e = item.email;
+          const a = item.attachment;
+          const fn = (a.filename || "file").replace(/[|\]]/g, "_");
+          const sender = (e.fromEmail || e.from || "unknown").replace(/[|\]]/g, "_");
+          const mime = (a.mimeType || "application/octet-stream").replace(/[|\]]/g, "_");
+          const ms = e.internalDate || "0";
+          return `[dcand:${i + 1}|${e.id}|${a.attachmentId}|${phoenixHHMM(e.internalDate)}|${fn}|${sender}|${mime}|${ms}]`;
+        });
+
         return Response.json({
-          reply: `Multiple emails matching "${emailSearch}" have attachments. Which one?\n\n${list}\n\nReply with more specific details (sender, date, or subject keyword).`,
+          reply: `Multiple matches for "${emailSearch}" with attachments. Which one to save to ${targetFolderName}?\n\n${lines.join("\n")}\n\nSay the number, the time (e.g. "9:57"), or the filename — I'll save it immediately.\n\n[dfolder:${targetFolderName}]\n${markers.join("\n")}`,
         });
       }
 
@@ -1725,6 +2043,91 @@ Examples:
 
       const attachment = email.attachments[0];
       console.log("[email-to-drive] single attachment:", attachment);
+
+      // === ATOMIC create+save: Brad asked to create the folder this turn, OR
+      // the named folder doesn't exist yet. Either way the request is
+      // unambiguous (one named attachment, one named folder), so skip the
+      // [save:] confirmation step and combine folder-create + attachment-save
+      // into a single response.
+      const folderLookup = await resolveOrCreateFolder(targetFolderName);
+      const folderExists = folderLookup.folderId !== null && !folderLookup.created;
+      if (createFolderFirst || !folderExists) {
+        if (!folderLookup.folderId) {
+          return Response.json({
+            reply: `I couldn't create the "${targetFolderName}" folder: ${folderLookup.error || "unknown error"}`,
+          });
+        }
+
+        console.log("[email-to-drive atomic] folder resolved:", {
+          folderId: folderLookup.folderId,
+          justCreated: folderLookup.created,
+        });
+
+        const e2dRes = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            emailId: email.id,
+            attachmentId: attachment.attachmentId,
+            fileName: customName,
+            folderId: folderLookup.folderId,
+          }),
+        });
+        const result = await e2dRes.json();
+        console.log("[email-to-drive atomic] raw response:", JSON.stringify(result));
+
+        if (result.success !== true || !result.fileId) {
+          const folderNote = folderLookup.created
+            ? ` (the "${targetFolderName}" folder was created)`
+            : "";
+          return Response.json({
+            reply: `I couldn't save that attachment${folderNote} - the upload failed. Error: ${result.error || "no fileId returned"}`,
+          });
+        }
+        if (!result.link || !result.link.includes("google.com")) {
+          return Response.json({
+            reply: "The upload returned an invalid response. The file may not have saved.",
+          });
+        }
+
+        let verifiedFile = null;
+        try {
+          const baseName = (result.name || customName || attachment.filename || "").split(".")[0];
+          if (baseName) {
+            const vParams = new URLSearchParams({ search: baseName, limit: "5" });
+            const vRes = await fetch(`${BASE_URL}/api/drive?${vParams.toString()}`);
+            const vData = await vRes.json();
+            verifiedFile =
+              (vData.files || []).find((f) => f.id === result.fileId) ||
+              (vData.files || []).find((f) => (f.name || "").includes(baseName));
+          }
+        } catch (e) {
+          console.log("[email-to-drive atomic verify] failed:", e.message);
+        }
+
+        if (!verifiedFile) {
+          return Response.json({
+            reply: folderLookup.created
+              ? `Created "${targetFolderName}" folder but the upload failed - I can't find it in Drive. Want me to try again?`
+              : "The upload failed - I can't find it in Drive. Want me to try again?",
+          });
+        }
+
+        try {
+          await insertMemoryWithCap(
+            folderLookup.created
+              ? `[LOG] Created Drive folder "${targetFolderName}" and saved attachment "${result.name}" (id ${result.fileId}) from email ${email.id} on ${today}`
+              : `[LOG] Saved attachment "${result.name}" (id ${result.fileId}) from email ${email.id} to "${targetFolderName}" on ${today}`
+          );
+        } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
+
+        const link = verifiedFile.webViewLink || result.link;
+        return Response.json({
+          reply: folderLookup.created
+            ? `Created "${targetFolderName}" folder and saved "${result.name}" to it. Link: ${link}`
+            : `Done — saved "${result.name}" to ${targetFolderName}. Here's the link: ${link}`,
+        });
+      }
 
       // Format the email date for the confirmation prompt
       let dateLabel = "";

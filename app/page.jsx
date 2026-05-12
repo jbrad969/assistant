@@ -698,19 +698,83 @@ export default function Page() {
     setShowReplyChoice(false);
 
     try {
-      const res = await fetch("/api/chat", {
+      const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: userText, history: messages }),
       });
 
-      const data = await res.json();
-      const reply = data.reply || "Jess had an issue.";
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: reply },
-      ]);
-      speak(reply);
+      const contentType = response.headers.get("content-type") || "";
+
+      if (contentType.includes("text/event-stream")) {
+        // Streaming response: append a placeholder on the first delta, then
+        // grow it as more deltas arrive. The thinking indicator stays visible
+        // until the first delta so an empty bubble never flashes.
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = "";
+        let buffer = "";
+        let messageStarted = false;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const payload = line.slice(6);
+            if (payload === "[DONE]") continue;
+            try {
+              const data = JSON.parse(payload);
+              if (data.text) {
+                fullText += data.text;
+                if (!messageStarted) {
+                  messageStarted = true;
+                  setLoading(false);
+                  setMessages((prev) => [
+                    ...prev,
+                    { role: "assistant", content: fullText },
+                  ]);
+                } else {
+                  setMessages((prev) => {
+                    const updated = [...prev];
+                    updated[updated.length - 1] = {
+                      role: "assistant",
+                      content: fullText,
+                    };
+                    return updated;
+                  });
+                }
+              } else if (data.error) {
+                fullText += `\n[stream error: ${data.error}]`;
+              }
+            } catch (e) {
+              // ignore malformed SSE line
+            }
+          }
+        }
+
+        if (!messageStarted) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "Jess had no response." },
+          ]);
+        }
+        speak(fullText || "Jess had no response.");
+      } else {
+        const data = await response.json();
+        const reply = data.reply || "Jess had an issue.";
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: reply },
+        ]);
+        speak(reply);
+      }
+
       setShowReplyChoice(true);
       loadMemory();
     } catch (error) {

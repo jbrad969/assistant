@@ -208,6 +208,47 @@ CRITICAL: Read the ENTIRE conversation history before responding. The history co
  * SHARED HELPERS
  * ========================================================================== */
 
+// Stream an Anthropic messages.create call back to the client as SSE so the
+// frontend can render token-by-token. Used only for conversational Claude
+// responses (chat, email_read narration, calendar_read narration); structured
+// handlers (quote, reminder, drive actions) keep returning Response.json so
+// callers don't have to parse two transport formats.
+//
+// We don't run cleanResponse here — its regexes target multi-character XML/
+// code-fence sequences that can split across deltas. Those patterns shouldn't
+// appear in normal Claude output; if they ever do we'll strip client-side.
+function streamAnthropicResponse(params) {
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        const stream = await anthropic.messages.create({ ...params, stream: true });
+        for await (const chunk of stream) {
+          if (chunk.type === "content_block_delta" && chunk.delta?.type === "text_delta") {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`)
+            );
+          }
+        }
+      } catch (e) {
+        console.log("[stream] anthropic stream failed:", e.message);
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`)
+        );
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
 function cleanResponse(text) {
   if (!text) return text;
   return text
@@ -1239,7 +1280,7 @@ export async function POST(req) {
       const emailGuardrail =
         "\n\nEMAIL SUMMARY GUARDRAIL:\nThese are the ONLY emails that exist. Do not mention any email not in this list. If asked about a specific sender not in this list, say you found nothing from them. Never invent subjects, dates, or content. If the list above is empty, say you found nothing.";
 
-      const response = await anthropic.messages.create({
+      return streamAnthropicResponse({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system: buildSystemPrompt(today, memoryText) + emailGuardrail,
@@ -1251,7 +1292,6 @@ export async function POST(req) {
           },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
     // EMAIL SEND (covers both fresh sends and approval of a prior draft;
@@ -2406,7 +2446,7 @@ Examples:
       // asks ("check my calendar again", "refresh", "any new events", etc.).
       if (calendarAlreadyInHistory(message, history) && !isExplicitCalendarRefresh(message)) {
         console.log("[calendar read] using cached calendar data from history; no fetch");
-        const cachedResponse = await anthropic.messages.create({
+        return streamAnthropicResponse({
           model: CLAUDE_MODEL,
           max_tokens: 1024,
           system: buildSystemPrompt(today, memoryText),
@@ -2415,7 +2455,6 @@ Examples:
             { role: "user", content: message },
           ],
         });
-        return Response.json({ reply: cleanResponse(cachedResponse.content[0].text) });
       }
 
       const dates = getDetectedDates(message);
@@ -2439,7 +2478,7 @@ Examples:
         })
         .join("\n\n");
 
-      const response = await anthropic.messages.create({
+      return streamAnthropicResponse({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system: buildSystemPrompt(today, memoryText),
@@ -2451,7 +2490,6 @@ Examples:
           },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
     // DEPARTURE
@@ -2584,7 +2622,7 @@ Examples:
 
     // NORMAL CHAT — classifier returned "chat" or an unhandled intent.
     default: {
-      const response = await anthropic.messages.create({
+      return streamAnthropicResponse({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
         system: buildSystemPrompt(today, memoryText),
@@ -2593,7 +2631,6 @@ Examples:
           { role: "user", content: message },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
     }  // end switch
   } catch (error) {

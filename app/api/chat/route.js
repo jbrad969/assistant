@@ -863,8 +863,31 @@ async function resolveOrCreateFolder(folderName) {
 
 function detectDepartureOrigin(message) {
   const m = message.toLowerCase();
-  if (m.includes("from the shop") || m.includes("from shop")) return SHOP;
-  if (m.includes("from home") || m.includes("from my house")) return HOME;
+
+  // SHOP wins over HOME. Match explicit SHOP references first, then
+  // negated-HOME phrases ("not from home", "not leaving home", "not at home")
+  // which also imply SHOP. Without this precedence
+  // "I'm not leaving from home, I'm leaving from the shop" would default to
+  // HOME because the message contains "from home" as a substring.
+  if (
+    /\bfrom\s+(?:the\s+)?shop\b/.test(m) ||
+    /\bleaving\s+(?:the\s+)?shop\b/.test(m) ||
+    /\bat\s+the\s+shop\b/.test(m) ||
+    /\bnot\s+(?:leaving\s+)?(?:from\s+)?home\b/.test(m) ||
+    /\bnot\s+at\s+home\b/.test(m)
+  ) {
+    return SHOP;
+  }
+
+  if (
+    /\bfrom\s+home\b/.test(m) ||
+    /\bfrom\s+my\s+house\b/.test(m) ||
+    /\bat\s+home\b/.test(m) ||
+    /\bleaving\s+home\b/.test(m)
+  ) {
+    return HOME;
+  }
+
   return HOME; // default
 }
 
@@ -2494,6 +2517,12 @@ Examples:
 
     // DEPARTURE
     case "departure": {
+      // STRUCTURED RESPONSE — never streams. The reply is a single template
+      // string built from Maps drive time + computed departure/reminder times,
+      // returned in one Response.json call. Same rule applies to quote,
+      // reminder_*, drive_*, and email_send: only chat, calendar_read, and
+      // email_read use streamAnthropicResponse. Mixing streaming into a
+      // structured reply produces garbled interleaved output.
       const origin = detectDepartureOrigin(message);
       const eventName = extractEventNameFromDeparture(message);
       console.log(`[departure] origin=${origin} eventName=${eventName || "(none)"}`);

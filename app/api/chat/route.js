@@ -186,6 +186,13 @@ ABSOLUTE RULES:
 11. NEVER move, delete, or modify any file that Brad did not explicitly name in his message. If the move fails for one file, do not attempt to move other files. Ask Brad which specific file to try next.
 12. When saving email attachments to Drive, ALWAYS show the filename first and confirm with Brad before saving. Never save attachments from emails Brad didn't specify.
 
+DEPARTURE ORIGIN POLICY:
+For departure times, use your best judgment on origin — never ask for confirmation unless genuinely ambiguous:
+- If Brad mentions shop/office/work = use SHOP (${SHOP})
+- If Brad mentions home/house = use HOME (${HOME})
+- If unclear and it's a morning appointment, default to HOME
+- If unclear and Brad is mid-workday, default to SHOP
+
 TOOLS YOU HAVE:
 You have access to Google Maps via the /api/maps route. ALWAYS use it for drive time questions. NEVER say you cannot calculate drive times. NEVER say you don't have mapping tools. You absolutely do.
 
@@ -861,24 +868,24 @@ async function resolveOrCreateFolder(folderName) {
  * DEPARTURE HELPERS
  * ========================================================================== */
 
-function detectDepartureOrigin(message) {
-  const m = message.toLowerCase();
-
-  // SHOP wins over HOME. Match explicit SHOP references first, then
-  // negated-HOME phrases ("not from home", "not leaving home", "not at home")
-  // which also imply SHOP. Without this precedence
+// Returns SHOP / HOME if the text explicitly names one of Brad's locations,
+// otherwise null. Caller decides what default to apply.
+function detectExplicitDepartureOrigin(text) {
+  const m = (text || "").toLowerCase();
+  // SHOP precedence — explicit SHOP refs and negated-HOME refs ("not from
+  // home", "not leaving home", "not at home") both mean SHOP. Without this
   // "I'm not leaving from home, I'm leaving from the shop" would default to
   // HOME because the message contains "from home" as a substring.
   if (
     /\bfrom\s+(?:the\s+)?shop\b/.test(m) ||
     /\bleaving\s+(?:the\s+)?shop\b/.test(m) ||
     /\bat\s+the\s+shop\b/.test(m) ||
+    /\bin\s+the\s+shop\b/.test(m) ||
     /\bnot\s+(?:leaving\s+)?(?:from\s+)?home\b/.test(m) ||
     /\bnot\s+at\s+home\b/.test(m)
   ) {
     return SHOP;
   }
-
   if (
     /\bfrom\s+home\b/.test(m) ||
     /\bfrom\s+my\s+house\b/.test(m) ||
@@ -887,8 +894,36 @@ function detectDepartureOrigin(message) {
   ) {
     return HOME;
   }
+  return null;
+}
 
-  return HOME; // default
+// Resolve departure origin with a layered policy: explicit message marker →
+// recent user-turn marker in history → time-of-day default. We never ask Brad
+// to confirm — he can correct mid-conversation and the recent-history check
+// picks up the correction next turn. Workday rhythm:
+//   < 12:00 PM  → HOME (heading out for the day)
+//   12:00-5 PM  → SHOP (mid-workday — most likely at the shop)
+//   ≥ 5:00 PM  → HOME (back home, leaving from there)
+function detectDepartureOrigin(message, history = []) {
+  const fromMessage = detectExplicitDepartureOrigin(message);
+  if (fromMessage) return fromMessage;
+
+  for (let i = history.length - 1; i >= Math.max(0, history.length - 6); i--) {
+    const turn = history[i];
+    if (turn?.role !== "user") continue;
+    const fromHistory = detectExplicitDepartureOrigin(turn.content);
+    if (fromHistory) return fromHistory;
+  }
+
+  const phoenixHour = parseInt(
+    new Date().toLocaleString("en-US", {
+      hour: "numeric", hour12: false, timeZone: TIMEZONE,
+    }),
+    10
+  );
+  if (phoenixHour < 12) return HOME;
+  if (phoenixHour < 17) return SHOP;
+  return HOME;
 }
 
 // Extract the event Brad is departing for. Requires an explicit travel-verb prefix so
@@ -2523,7 +2558,7 @@ Examples:
       // reminder_*, drive_*, and email_send: only chat, calendar_read, and
       // email_read use streamAnthropicResponse. Mixing streaming into a
       // structured reply produces garbled interleaved output.
-      const origin = detectDepartureOrigin(message);
+      const origin = detectDepartureOrigin(message, history);
       const eventName = extractEventNameFromDeparture(message);
       console.log(`[departure] origin=${origin} eventName=${eventName || "(none)"}`);
 

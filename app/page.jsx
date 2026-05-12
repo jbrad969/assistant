@@ -656,10 +656,10 @@ export default function Page() {
   // otherwise return the plain string and let the bubble's pre-wrap render it.
   // Drive/Docs URLs are turned into "Open in Drive →" buttons in either path.
   function renderAssistantContent(text) {
-    // PENDING_ATTACHMENT is hidden data for the next turn — it must stay in
-    // the messages state (so history includes it on the next /api/chat POST)
+    // SAVE markers are hidden data for the next turn — they must stay in the
+    // messages state (so history includes them on the next /api/chat POST)
     // but should never be visible in the bubble.
-    const stripped = (text || "").replace(/<!--PENDING_ATTACHMENT:[\s\S]*?-->/g, "").trim();
+    const stripped = (text || "").replace(/<!--SAVE:[\s\S]*?-->/g, "").trim();
     const formatted = formatMessage(stripped);
     if (!formatted) return formatted;
 

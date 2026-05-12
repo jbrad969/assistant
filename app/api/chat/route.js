@@ -2169,12 +2169,16 @@ Examples:
         });
       }
 
-      // If multiple emails match AND have attachments, list every candidate
-      // (per email × attachment pair) and pin each with a dcand marker so
-      // Brad's next reply ("first", "9:57", a filename) resolves directly to
-      // an email + attachment + folder triple. Per rules #11/#12 we still
-      // never silently pick — we list and wait — but the resolution is
-      // marker-driven, not free-text-driven.
+      // When multiple emails match, try to auto-resolve from Brad's current
+      // message before showing a numbered list. Two conditions auto-pick:
+      //   (a) pickDisambigCandidate matches a sender/time/PDF/"this morning"
+      //       signal in Brad's message — exactly the same logic that handles
+      //       follow-up replies, applied to the initial turn.
+      //   (b) exactly one candidate falls on today's Phoenix date.
+      // The numbered list only appears when neither condition resolves it.
+      let email;
+      let attachment;
+
       if (emailsWithAttachments.length > 1) {
         const items = [];
         for (const e of emailsWithAttachments.slice(0, 5)) {
@@ -2185,30 +2189,64 @@ Examples:
           if (items.length >= 8) break;
         }
 
-        const lines = items.map((item, i) => {
-          const e = item.email;
-          const a = item.attachment;
-          const sender = e.fromEmail || e.from || "unknown";
-          const dateLabel = e.date ? ` (${e.date})` : "";
-          return `${i + 1}. "${a.filename}" from ${sender} — "${e.subject}"${dateLabel}`;
-        });
+        const candidates = items.map((item, i) => ({
+          index: i + 1,
+          emailId: item.email.id,
+          attachmentId: item.attachment.attachmentId,
+          time: phoenixHHMM(item.email.internalDate),
+          filename: item.attachment.filename,
+          sender: item.email.fromEmail || item.email.from || "unknown",
+          mimeType: item.attachment.mimeType,
+          internalDateMs: item.email.internalDate || "0",
+        }));
 
-        const markers = items.map((item, i) => {
-          const e = item.email;
-          const a = item.attachment;
-          const fn = (a.filename || "file").replace(/[|\]]/g, "_");
-          const sender = (e.fromEmail || e.from || "unknown").replace(/[|\]]/g, "_");
-          const mime = (a.mimeType || "application/octet-stream").replace(/[|\]]/g, "_");
-          const ms = e.internalDate || "0";
-          return `[dcand:${i + 1}|${e.id}|${a.attachmentId}|${phoenixHHMM(e.internalDate)}|${fn}|${sender}|${mime}|${ms}]`;
-        });
+        let autoPick = pickDisambigCandidate(message, candidates);
+        let autoReason = autoPick ? "message-match" : null;
+        if (!autoPick) {
+          const todays = candidates.filter((c) => isPhoenixToday(c.internalDateMs));
+          if (todays.length === 1) {
+            autoPick = todays[0];
+            autoReason = "single-today";
+          }
+        }
 
-        return Response.json({
-          reply: `Multiple matches for "${emailSearch}" with attachments. Which one to save to ${targetFolderName}?\n\n${lines.join("\n")}\n\nSay the number, the time (e.g. "9:57"), or the filename — I'll save it immediately.\n\n[dfolder:${targetFolderName}]\n${markers.join("\n")}`,
-        });
+        if (autoPick) {
+          const matchingItem = items[autoPick.index - 1];
+          email = matchingItem.email;
+          attachment = matchingItem.attachment;
+          console.log("[email-to-drive auto-picked]:", {
+            emailId: email.id,
+            filename: attachment.filename,
+            reason: autoReason,
+          });
+        } else {
+          const lines = items.map((item, i) => {
+            const e = item.email;
+            const a = item.attachment;
+            const sender = e.fromEmail || e.from || "unknown";
+            const dateLabel = e.date ? ` (${e.date})` : "";
+            return `${i + 1}. "${a.filename}" from ${sender} — "${e.subject}"${dateLabel}`;
+          });
+
+          const markers = items.map((item, i) => {
+            const e = item.email;
+            const a = item.attachment;
+            const fn = (a.filename || "file").replace(/[|\]]/g, "_");
+            const sender = (e.fromEmail || e.from || "unknown").replace(/[|\]]/g, "_");
+            const mime = (a.mimeType || "application/octet-stream").replace(/[|\]]/g, "_");
+            const ms = e.internalDate || "0";
+            return `[dcand:${i + 1}|${e.id}|${a.attachmentId}|${phoenixHHMM(e.internalDate)}|${fn}|${sender}|${mime}|${ms}]`;
+          });
+
+          return Response.json({
+            reply: `Multiple matches for "${emailSearch}" with attachments. Which one to save to ${targetFolderName}?\n\n${lines.join("\n")}\n\nSay the number, the time (e.g. "9:57"), or the filename — I'll save it immediately.\n\n[dfolder:${targetFolderName}]\n${markers.join("\n")}`,
+          });
+        }
       }
 
-      const email = emailsWithAttachments[0];
+      if (!email) {
+        email = emailsWithAttachments[0];
+      }
       console.log("[email-to-drive] picked email:", {
         id: email.id,
         subject: email.subject,
@@ -2216,9 +2254,10 @@ Examples:
         attachmentCount: email.attachments.length,
       });
 
-      // If multiple attachments, list them and ask Brad which one. Never
-      // silently pick the first — rule #12 requires explicit confirmation.
-      if (email.attachments.length > 1) {
+      // If multiple attachments and no auto-picked attachment yet, list them
+      // and ask Brad which one. Never silently pick the first — rule #12
+      // requires explicit confirmation.
+      if (!attachment && email.attachments.length > 1) {
         const list = email.attachments
           .map((a, i) => `${i + 1}. "${a.filename}" (${a.mimeType})`)
           .join("\n");
@@ -2227,7 +2266,9 @@ Examples:
         });
       }
 
-      const attachment = email.attachments[0];
+      if (!attachment) {
+        attachment = email.attachments[0];
+      }
       console.log("[email-to-drive] single attachment:", attachment);
 
       // === ATOMIC create+save: Brad asked to create the folder this turn, OR

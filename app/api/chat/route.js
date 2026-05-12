@@ -20,6 +20,18 @@ const TIMEZONE = "America/Phoenix";
 const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
 const CLAUDE_MODEL = "claude-sonnet-4-5";
 
+// Cross-turn conversation state. Each handler writes the slice it owns; the
+// system prompt and a few back-reference paths read it. Module scope means
+// this persists for the life of a warm serverless instance — cold starts
+// reset it and we fall back to per-turn extraction.
+const jessState = {
+  lastEmailResults: [],   // emails from the last email_read
+  lastAttachment: null,   // { emailId, attachmentId, filename, fromEmail, date }
+  lastDriveFolder: null,  // folder name from the last email_to_drive save
+  lastDriveFiles: [],     // files from the last drive_search
+  lastCalendarEvents: [], // events from the last calendar_read fetch
+};
+
 /* ============================================================================
  * INTENT DETECTION — mutually exclusive, evaluated in declared order
  * ========================================================================== */
@@ -143,11 +155,20 @@ If you are not sure if something worked, say "I'm not sure if that worked - plea
 `;
 
 function buildSystemPrompt(today, memoryText) {
+  const stateContext = `
+Current context:
+- Last attachment discussed: ${jessState.lastAttachment?.filename || "none"}
+- Last folder mentioned: ${jessState.lastDriveFolder || "none"}
+- Last email search: ${jessState.lastEmailResults.length} emails found
+- Last Drive search: ${jessState.lastDriveFiles.length} files found
+- Last calendar fetch: ${jessState.lastCalendarEvents.length} events
+`;
+
   return `You are Jess, Brad's executive assistant.
 Today: ${today}
 Brad's home: ${HOME}
 Brad's shop: ${SHOP}
-
+${stateContext}
 Memory:
 ${memoryText || "No memories yet."}
 ${HALLUCINATION_GUARD}
@@ -1114,6 +1135,24 @@ export async function POST(req) {
         });
       }
 
+      // Update cross-turn state. lastAttachment pins the first attachment so
+      // a follow-up "save that attachment to X" can skip Gmail re-search.
+      jessState.lastEmailResults = realEmails;
+      const firstWithAttachment = realEmails.find(
+        (e) => Array.isArray(e.attachments) && e.attachments.length > 0
+      );
+      if (firstWithAttachment) {
+        const att = firstWithAttachment.attachments[0];
+        jessState.lastAttachment = {
+          emailId: firstWithAttachment.id,
+          attachmentId: att.attachmentId,
+          filename: att.filename,
+          fromEmail: firstWithAttachment.fromEmail,
+          date: firstWithAttachment.date,
+        };
+        console.log("[email read] state.lastAttachment =", att.filename);
+      }
+
       // ONLY reach Claude when we have REAL email data (every entry has a
       // verified Gmail id).
       const emailContext = realEmails
@@ -1271,6 +1310,11 @@ Return JSON: {"searchTerm": "exact name or keyword", "folderName": "folder name 
       // ID validation: drop anything failing the strict Google ID check
       // (length > 10 + no "fake" substring). Parity with email_read.
       const validFiles = (driveData.files || []).filter(hasValidGoogleId);
+
+      jessState.lastDriveFiles = validFiles;
+      if (validFiles.length > 0) {
+        console.log("[drive search] state.lastDriveFiles =", validFiles.length, "file(s)");
+      }
 
       if (validFiles.length === 0) {
         const subject = searchTerm ? `"${searchTerm}"` : "your Drive";
@@ -1719,26 +1763,61 @@ If the message has no email, set shareEmail to null.`,
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // EMAIL-TO-DRIVE — one-shot. Split Brad's message into emailDescription
-    // and folderName, then delegate to /api/drive/email-to-drive which does
-    // Gmail search → attachment fetch → folder resolve/create → upload in a
-    // single round trip. No cache, no marker, no disambig loops.
+    // EMAIL-TO-DRIVE — one-shot OR state-driven. If Brad's message points
+    // at the most recently discussed attachment ("save that attachment to X"
+    // / "save it to that folder"), use the pinned IDs from jessState and
+    // skip Gmail re-search. Otherwise fall back to the GPT-extracted
+    // description and let the API do its Gmail search.
     case "email_to_drive": {
-      const { emailDescription, folderName } = await extractEmailToDriveCommand(message);
-      console.log("[email-to-drive] extracted:", { emailDescription, folderName });
+      const refsLastAttachment =
+        !!jessState.lastAttachment &&
+        /\b(?:that\s+attachment|the\s+attachment|save\s+it\b|save\s+that\b|that\s+pdf|the\s+pdf)\b/i.test(message);
+      const refsLastFolder = /\b(?:that\s+folder|the\s+folder)\b/i.test(message);
 
-      if (!emailDescription || !folderName) {
+      let emailDescription = null;
+      let folderName = null;
+      let directAttachment = null;
+
+      if (refsLastAttachment) {
+        directAttachment = jessState.lastAttachment;
+        // Folder still needs to come from the message OR from state.
+        const extracted = await extractEmailToDriveCommand(message);
+        folderName = extracted.folderName;
+        console.log("[email-to-drive] state pick: using lastAttachment", directAttachment.filename);
+      } else {
+        const extracted = await extractEmailToDriveCommand(message);
+        emailDescription = extracted.emailDescription;
+        folderName = extracted.folderName;
+      }
+
+      if (!folderName && refsLastFolder && jessState.lastDriveFolder) {
+        folderName = jessState.lastDriveFolder;
+        console.log("[email-to-drive] state pick: using lastDriveFolder", folderName);
+      }
+
+      if (!folderName || (!directAttachment && !emailDescription)) {
         return Response.json({
           reply: "Tell me which email's attachment to save and the folder name. Example: \"Save the May 1 T&K attachment to Roof Quotes\".",
         });
       }
+
+      // API accepts either (emailId, attachmentId, filename) for a direct
+      // save OR (emailDescription, history) for a Gmail-search save.
+      const body = directAttachment
+        ? {
+            emailId: directAttachment.emailId,
+            attachmentId: directAttachment.attachmentId,
+            filename: directAttachment.filename,
+            folderName,
+          }
+        : { emailDescription, folderName, history };
 
       let result;
       try {
         const res = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ emailDescription, folderName, history }),
+          body: JSON.stringify(body),
         });
         result = await res.json();
       } catch (e) {
@@ -1751,6 +1830,8 @@ If the message has no email, set shareEmail to null.`,
           reply: `I couldn't save that - ${result.error || "unknown error"}. Try again?`,
         });
       }
+
+      jessState.lastDriveFolder = folderName;
 
       try {
         await insertMemoryWithCap(
@@ -1803,6 +1884,9 @@ If the message has no email, set shareEmail to null.`,
 
       const dates = getDetectedDates(message);
       const schedules = await Promise.all(dates.map(getCalendar));
+
+      jessState.lastCalendarEvents = schedules.flatMap((s) => s.events || []);
+      console.log("[calendar read] state.lastCalendarEvents =", jessState.lastCalendarEvents.length, "event(s)");
 
       const calendarContext = schedules
         .map((s, i) => {

@@ -117,18 +117,29 @@ async function resolveFolderId(drive, folderName) {
 
 export async function POST(req) {
   try {
-    const { emailDescription, folderName, history } = await req.json();
-    console.log("[email-to-drive] inputs:", { emailDescription, folderName });
+    const body = await req.json();
+    const { folderName, history } = body;
+    const directEmailId = body.emailId || null;
+    const directAttachmentId = body.attachmentId || null;
+    const directFilename = body.filename || null;
+    const emailDescription = body.emailDescription || null;
 
-    if (!emailDescription) {
-      return Response.json(
-        { success: false, error: "emailDescription is required" },
-        { status: 400 }
-      );
-    }
+    console.log("[email-to-drive] inputs:", {
+      folderName,
+      mode: directEmailId ? "direct" : "search",
+      emailDescription,
+      directEmailId,
+    });
+
     if (!folderName) {
       return Response.json(
         { success: false, error: "folderName is required" },
+        { status: 400 }
+      );
+    }
+    if (!directEmailId && !emailDescription) {
+      return Response.json(
+        { success: false, error: "either emailId+attachmentId or emailDescription is required" },
         { status: 400 }
       );
     }
@@ -137,48 +148,71 @@ export async function POST(req) {
     const gmail = google.gmail({ version: "v1", auth });
     const drive = google.drive({ version: "v3", auth });
 
-    const query = await planEmailSearch(emailDescription, history);
-    console.log("[email-to-drive] Gmail query:", query);
-
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults: 10,
-    });
-    const messageIds = (list.data.messages || []).map((m) => m.id);
-    console.log("[email-to-drive] message hits:", messageIds.length);
-    if (messageIds.length === 0) {
-      return Response.json({
-        success: false,
-        error: `No emails matched "${emailDescription}" (query: ${query})`,
-      });
-    }
-
-    // Walk the result list newest-first; pick the first message that
-    // actually has an attachment. Gmail's has:attachment filter is reliable
-    // but we still re-verify by parsing the payload.
     let messageData = null;
     let attachment = null;
-    for (const id of messageIds) {
+
+    if (directEmailId && directAttachmentId) {
+      // Direct mode: caller already has the IDs from jessState. Fetch the
+      // message and pull the attachment by attachmentId — no Gmail search.
       const msg = await gmail.users.messages.get({
         userId: "me",
-        id,
+        id: directEmailId,
         format: "full",
       });
-      const found = findAttachment(msg.data.payload);
-      if (found) {
-        messageData = msg.data;
-        attachment = found;
-        break;
+      messageData = msg.data;
+      attachment = findAttachment(msg.data.payload);
+      // If the recursive walk missed it (rare), trust the caller's ID and
+      // synthesize the metadata so the download still works.
+      if (!attachment) {
+        attachment = {
+          attachmentId: directAttachmentId,
+          filename: directFilename || "attachment",
+          mimeType: "application/octet-stream",
+        };
       }
-    }
-    if (!messageData || !attachment) {
-      return Response.json({
-        success: false,
-        error: `Matched ${messageIds.length} email(s) but couldn't find an attachment`,
+      console.log("[email-to-drive] direct mode picked:", directEmailId, attachment.filename);
+    } else {
+      const query = await planEmailSearch(emailDescription, history);
+      console.log("[email-to-drive] Gmail query:", query);
+
+      const list = await gmail.users.messages.list({
+        userId: "me",
+        q: query,
+        maxResults: 10,
       });
+      const messageIds = (list.data.messages || []).map((m) => m.id);
+      console.log("[email-to-drive] message hits:", messageIds.length);
+      if (messageIds.length === 0) {
+        return Response.json({
+          success: false,
+          error: `No emails matched "${emailDescription}" (query: ${query})`,
+        });
+      }
+
+      // Walk the result list newest-first; pick the first message that
+      // actually has an attachment. Gmail's has:attachment filter is reliable
+      // but we still re-verify by parsing the payload.
+      for (const id of messageIds) {
+        const msg = await gmail.users.messages.get({
+          userId: "me",
+          id,
+          format: "full",
+        });
+        const found = findAttachment(msg.data.payload);
+        if (found) {
+          messageData = msg.data;
+          attachment = found;
+          break;
+        }
+      }
+      if (!messageData || !attachment) {
+        return Response.json({
+          success: false,
+          error: `Matched ${messageIds.length} email(s) but couldn't find an attachment`,
+        });
+      }
+      console.log("[email-to-drive] search picked message:", messageData.id, "attachment:", attachment.filename);
     }
-    console.log("[email-to-drive] picked message:", messageData.id, "attachment:", attachment.filename);
 
     const { folderId, created: folderCreated } = await resolveFolderId(drive, folderName);
     console.log("Saving to folder:", folderName, "ID:", folderId);

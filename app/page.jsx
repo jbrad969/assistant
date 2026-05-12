@@ -656,7 +656,11 @@ export default function Page() {
   // otherwise return the plain string and let the bubble's pre-wrap render it.
   // Drive/Docs URLs are turned into "Open in Drive →" buttons in either path.
   function renderAssistantContent(text) {
-    const formatted = formatMessage(text);
+    // PENDING_ATTACHMENT is hidden data for the next turn — it must stay in
+    // the messages state (so history includes it on the next /api/chat POST)
+    // but should never be visible in the bubble.
+    const stripped = (text || "").replace(/<!--PENDING_ATTACHMENT:[\s\S]*?-->/g, "").trim();
+    const formatted = formatMessage(stripped);
     if (!formatted) return formatted;
 
     const lines = formatted.split("\n");
@@ -939,8 +943,12 @@ export default function Page() {
 
   function speak(text) {
     if (typeof window === "undefined" || !window.speechSynthesis || !text) return;
+    // Drop PENDING_ATTACHMENT and other HTML comments before TTS — Brad
+    // shouldn't hear "less-than-exclamation-dash-dash" read aloud.
+    const cleaned = String(text).replace(/<!--[\s\S]*?-->/g, "").trim();
+    if (!cleaned) return;
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
+    const utterance = new SpeechSynthesisUtterance(cleaned);
     if (voiceRef.current) utterance.voice = voiceRef.current;
     utterance.rate = 1;
     utterance.pitch = 1.05;

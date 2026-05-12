@@ -24,260 +24,115 @@ const CLAUDE_MODEL = "claude-sonnet-4-5";
  * INTENT DETECTION — mutually exclusive, evaluated in declared order
  * ========================================================================== */
 
-function isDeleteReminders(msg) {
-  return /\b(delete|clear|remove|wipe)\s+(?:all|every)\s+(?:of\s+)?(?:my\s+)?reminders?\b/i.test(msg);
-}
-
-function isCheckReminders(msg) {
-  const m = msg.toLowerCase();
-  if (/\b(delete|clear|remove)\b/.test(m)) return false;
-  return (
-    m.includes("what reminders") ||
-    m.includes("any reminders") ||
-    m.includes("show reminders") ||
-    m.includes("show my reminders") ||
-    m.includes("list reminders") ||
-    m.includes("upcoming reminders") ||
-    /\bdo (?:i|you) have (?:any )?reminders?\b/.test(m)
-  );
-}
-
-function isSetReminder(msg) {
-  const m = msg.toLowerCase();
-  if (isDeleteReminders(msg) || isCheckReminders(msg)) return false;
-  return (
-    m.includes("remind me") ||
-    m.includes("set a reminder") ||
-    m.includes("set reminder") ||
-    m.includes("don't let me forget") ||
-    m.includes("dont let me forget") ||
-    m.includes("don't forget") ||
-    m.includes("dont forget")
-  );
-}
-
-function isEmailRead(msg) {
-  const m = msg.toLowerCase();
-  return (
-    /\bread\s+(?:my\s+)?emails?\b/.test(m) ||
-    /\bcheck\s+(?:my\s+)?(?:emails?|inbox)\b/.test(m) ||
-    /\bany\s+(?:unread\s+|new\s+)?emails?\b/.test(m) ||
-    /\bunread\s+emails?\b/.test(m) ||
-    /\bemails?\s+from\b/.test(m) ||
-    /\bany\s+emails?\s+from\b/.test(m) ||
-    /\blast\s+emails?\b/.test(m) ||
-    /\brecent\s+emails?\b/.test(m) ||
-    /\bwhat\s+emails?\b/.test(m) ||
-    /\breach(?:ed)?\s+out\b/.test(m) ||
-    /\bemailed\s+(?:me|us)\b/.test(m) ||
-    /\bcontacted\s+(?:me|us)\b/.test(m)
-  );
-}
+/* AI INTENT CLASSIFIER replaces the keyword-based predicates. One gpt-4o-mini
+ * call per turn classifies the message + recent history into one of ~17
+ * intents. Handlers still do their own per-handler GPT extraction; the
+ * classifier exists purely for routing. Markers in prior assistant turns
+ * (SAVE_MARKER_RE / DELETE_MARKER_RE / To:Subject: drafts) bias the
+ * classifier toward the right approval intent.
+ */
 
 const EMAIL_APPROVAL_PHRASES = [
   "send it", "yes send", "yes send it", "send", "go", "go ahead",
   "do it", "looks good", "yes", "yep", "yeah", "ok send it", "okay send it",
 ];
 
+// Still used inside the email_send handler to detect an approval vs a fresh
+// send (kept as helper because the handler internals reference it).
 function isEmailApprovalPhrase(msg) {
   const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
   return EMAIL_APPROVAL_PHRASES.some((p) => m === p || m.startsWith(p + " "));
 }
 
-function isExplicitEmailSend(msg) {
-  const m = msg.toLowerCase();
-  return (
-    m.includes("send an email") ||
-    m.includes("send email") ||
-    m.includes("email to") ||
-    /\bemail\s+(her|him|nicole|mike|john|sarah|yvonne|eric|brad)\b/.test(m) ||
-    m.includes("draft an email") ||
-    m.includes("draft email") ||
-    m.includes("write an email") ||
-    m.includes("write email")
-  );
-}
-
-function isEmailSend(msg, history = []) {
-  if (isExplicitEmailSend(msg)) return true;
-  if (!isEmailApprovalPhrase(msg)) return false;
-  // Approval phrases ("yes", "go ahead", "send it") only route to the email
-  // branch when the previous assistant turn actually looks like a draft.
-  // Otherwise the same words are confirming something else — calendar,
-  // reminder, departure — and must fall through.
-  const lastAssistant = history.filter((m) => m.role === "assistant").slice(-1)[0];
-  return lookedLikeEmailDraft(lastAssistant?.content);
-}
-
-function isQuote(msg) {
-  const m = msg.toLowerCase();
-  // Require an unambiguous quote-request phrase. Bare "quote for" (e.g.
-  // "got a quote for that?") is too broad and used to false-positive.
-  return (
-    m.includes("roof quote") ||
-    m.includes("request a quote") ||
-    m.includes("send a quote") ||
-    /\bneed a quote\s+for\b/.test(m)
-  );
-}
-
-// Marker embedded in the "I found <filename> — save this?" prompt so the
-// approval handler knows which email, which attachment, and which folder
-// to act on. Format: [save:emailId:attachmentId:folderName]
+// Markers embedded in confirmation prompts so subsequent turns can recover
+// the pinned IDs without session storage.
 const SAVE_MARKER_RE = /\[save:([^:]+):([^:]+):([^\]]+)\]/;
-
-function isEmailToDrive(msg) {
-  const m = msg.toLowerCase();
-  const verb = /\b(save|move|put|upload)\b/.test(m);
-  if (!verb) return false;
-  if (!m.includes("drive") && !m.includes("folder")) return false;
-  // Strong signal: literal word "attachment"
-  if (m.includes("attachment")) return true;
-  // Weaker signal: "email" + a file-type word ("save the Thrifty PDF from
-  // the email to Receipts folder"). Without "email" we'd false-positive
-  // generic Drive moves.
-  if (m.includes("email") && /\b(pdf|file|files|doc|docs|document|image|images|photo|photos)\b/.test(m)) return true;
-  return false;
-}
-
-function isEmailToDriveApproval(msg, history = []) {
-  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
-  if (m !== "yes save it") return false;
-  const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
-  return SAVE_MARKER_RE.test(lastAssistant?.content || "");
-}
-
-// "put it back" / "move it back" — Brad is asking to undo a prior move, but
-// we don't track move history, so the handler asks for the destination
-// explicitly instead of guessing.
-function isDriveRevert(msg) {
-  const m = msg.toLowerCase();
-  return (
-    /\b(put|move)\b/.test(m) &&
-    /\bback\b/.test(m) &&
-    /\b(it|that|file|files|folder|doc|document|pdf)\b/.test(m)
-  );
-}
-
-// Marker embedded in the assistant's "are you sure" prompt so the approval
-// handler can recover the file ID on the next turn without needing session
-// storage. Format: [delete:abc123]
 const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
 
-function isDriveDelete(msg) {
-  if (isEmailToDrive(msg)) return false;
-  const m = msg.toLowerCase();
-  if (!/\b(delete|remove|trash)\b/.test(m)) return false;
-  return /\b(file|files|folder|folders|doc|docs|document|documents|pdf|contract|report)\b/.test(m);
-}
-
-function isDriveDeleteApproval(msg, history = []) {
-  const m = msg.toLowerCase().trim().replace(/[.!?]+$/, "");
-  if (m !== "yes delete it") return false;
-  const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
-  return DELETE_MARKER_RE.test(lastAssistant?.content || "");
-}
-
-function isDriveMove(msg) {
-  if (isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
-  const m = msg.toLowerCase();
-  // Verbs are word-boundaried — \bput\b prevents matching computer/input/etc.
-  if (!/\b(move|put)\b/.test(m)) return false;
-  // Mandatory file/folder/doc target — without this, calendar and reminder
-  // messages ("put gas in the truck", "move my meeting to Friday") would
-  // false-positive constantly.
-  if (!/\b(file|files|folder|folders|doc|docs|document|documents|pdf|contract|report)\b/.test(m)) return false;
-  // Destination preposition AFTER the move verb. Bare "in" excluded — every
-  // sentence has it.
-  const verbIdx = m.search(/\b(move|put)\b/);
-  return /\b(to|into|inside)\b/.test(m.slice(verbIdx));
-}
-
-function isDriveCreate(msg) {
-  if (isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
-  const m = msg.toLowerCase();
-  return /\b(create|make|new|add)\b/.test(m) && /\bfolder\b/.test(m);
-}
-
-function isDriveSearch(msg) {
-  if (isDriveCreate(msg) || isDriveMove(msg) || isEmailToDrive(msg) || isDriveRevert(msg) || isDriveDelete(msg)) return false;
-  const m = msg.toLowerCase();
-  if (m.includes("search drive") || m.includes("search my drive")) return true;
-  const verb = /\b(find|search|look for|locate|get)\b/.test(m);
-  // \bpo\b prevents matching "post", "spot", "polo", etc.
-  const target =
-    /\b(file|files|document|documents|doc|docs|folder|folders|pdf|contract|report|po)\b/.test(m) ||
-    m.includes("in drive") ||
-    m.includes("in my drive") ||
-    m.includes("on drive");
-  return verb && target;
-}
-
-function isDriveShare(msg) {
-  const m = msg.toLowerCase();
-  const verb =
-    /\bshare\b/.test(m) ||
-    m.includes("send link") ||
-    m.includes("email link") ||
-    m.includes("send the file") ||
-    m.includes("send the doc");
-  const target = /\b(file|doc|document|folder|link|pdf)\b/.test(m);
-  return verb && target;
-}
-
-function isDriveRead(msg) {
-  const m = msg.toLowerCase();
-  const verb =
-    /\b(read|open)\b/.test(m) ||
-    m.includes("show me") ||
-    m.includes("what does") ||
-    m.includes("what is in") ||
-    m.includes("what's in");
-  const target = /\b(file|doc|document|pdf)\b/.test(m);
-  return verb && target;
-}
-
-function isCalendarWrite(msg) {
-  const m = msg.toLowerCase();
-  if (m.includes("remind me")) return false;
-  const writeVerb = /\b(move|reschedule|delete event|add|cancel meeting|cancel event|create event|book)\b/.test(m);
-  const calCtx =
-    /\b(meeting|appointment|event|call|lunch|dinner|breakfast|coffee)\b/.test(m) ||
-    /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(m) ||
-    /\d\s*(am|pm)/.test(m) || /\bat\s+\d/.test(m);
-  return writeVerb && calCtx;
-}
-
-function isCalendarRead(msg) {
-  const m = msg.toLowerCase();
-  if (isSetReminder(msg) || isCalendarWrite(msg) || isCheckReminders(msg)) return false;
-  // Require an explicit calendar-intent word. Day names alone do NOT trigger
-  // (e.g. "see you Monday" is not a calendar query).
+// Strict ID validation for every Google API response. Real Gmail/Drive IDs
+// are 16+ chars of alphanumeric — anything shorter or containing "fake" is
+// fabricated/test data and must never reach Claude. Applied uniformly across
+// email_read, drive_search, drive_move, drive_share, drive_delete, and
+// email_to_drive (parity per Brad's spec).
+function hasValidGoogleId(item) {
   return (
-    m.includes("schedule") ||
-    m.includes("calendar") ||
-    m.includes("what do i have") ||
-    m.includes("what's on") ||
-    m.includes("whats on") ||
-    /\bappointments?\b/.test(m) ||
-    /\bmeetings?\b/.test(m) ||
-    /\bagenda\b/.test(m)
+    item &&
+    typeof item.id === "string" &&
+    item.id.length > 10 &&
+    !item.id.includes("fake")
   );
 }
 
-function isDeparture(msg) {
-  const m = msg.toLowerCase();
-  return (
-    /\bwhen\b.{0,30}\bleave\b/.test(m) ||
-    /\bwhat time\b.{0,30}\bleave\b/.test(m) ||
-    m.includes("how long to get") ||
-    m.includes("how long to drive") ||
-    m.includes("how long until") ||
-    m.includes("drive time") ||
-    m.includes("travel time") ||
-    /\btraffic\s+to\b/.test(m) ||
-    m.includes("should i leave")
-  );
+async function classifyIntent(message, history) {
+  const lastFewMessages = history
+    .slice(-6)
+    .map((m) => `${m.role}: ${m.content}`)
+    .join("\n");
+
+  const result = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `Classify what Brad wants to do. Return JSON with ONE intent and extracted details.
+
+Intents:
+- "email_read" - read/search/find emails in inbox
+- "email_send" - send or draft a NEW email
+- "email_approve" - Brad is approving a draft email shown in the previous assistant message (e.g. "yes send it", "send", "yes" when the prior turn shows To:/Subject:/Body:)
+- "email_to_drive" - save email attachment to Google Drive folder, OR approve a save with "yes save it" when the previous assistant message contains a "[save:" marker
+- "calendar_read" - check schedule/calendar
+- "calendar_write" - add/move/delete calendar events
+- "drive_search" - find files in Google Drive
+- "drive_create" - create a new folder in Drive
+- "drive_move" - move a file/folder in Drive to a different folder
+- "drive_share" - share a Drive file with someone
+- "drive_delete" - delete/trash a Drive file, OR approve a delete with "yes delete it" when the previous assistant message contains a "[delete:" marker
+- "drive_read" - read contents of a specific Drive file
+- "drive_revert" - "put it back" / "move it back" — Brad wants to undo a previous move but we don't track move history
+- "departure" - when to leave, drive time, traffic
+- "reminder_set" - set a NEW reminder
+- "reminder_check" - check existing reminders
+- "reminder_delete" - delete all reminders
+- "quote" - submit a NEW roof quote to T&K Roofing (ONLY when customer name, address AND roof material are all provided)
+- "chat" - general conversation, none of the above
+
+Return JSON:
+{
+  "intent": "one of the above",
+  "confidence": 0-100,
+  "details": {
+    "searchTerm": "if searching",
+    "folderName": "if drive folder involved",
+    "fileName": "if specific file mentioned",
+    "emailId": "if specific email referenced",
+    "personName": "if person mentioned",
+    "time": "if time mentioned",
+    "message": "if reminder message",
+    "customerName": "if quote",
+    "customerAddress": "if quote",
+    "roofMaterial": "if quote"
+  }
+}
+
+CRITICAL routing rules:
+- "yes save it" when the prior assistant message contains "[save:" → email_to_drive
+- "yes delete it" when the prior assistant message contains "[delete:" → drive_delete
+- "yes send it" / "send it" / "send" / "yes" when the prior assistant message contains a To: and Subject: draft → email_approve
+- Without those markers/drafts, those short approval phrases default to "chat"
+- "find" / "search" / "get" about inbox content → email_read; about files → drive_search
+- "put it back" / "move it back" → drive_revert (NOT drive_move — we don't know where it came from)
+- "move my meeting to Friday" → calendar_write (NOT drive_move — "meeting" is a calendar word)
+
+Context from recent conversation:
+${lastFewMessages}`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+
+  return JSON.parse(result.choices[0].message.content);
 }
 
 /* ============================================================================
@@ -915,15 +770,19 @@ export async function POST(req) {
 
     const msg = message.toLowerCase();
 
-    // 1. DELETE REMINDERS
-    if (isDeleteReminders(msg)) {
+    const intent = await classifyIntent(message, history);
+    console.log("Intent classified:", intent.intent, "confidence:", intent.confidence);
+
+    switch (intent.intent) {
+    // DELETE REMINDERS
+    case "reminder_delete": {
       const result = await deleteAllReminders();
       if (result.success) return Response.json({ reply: "Done — all reminders deleted." });
       return Response.json({ reply: "I had trouble deleting reminders: " + (result.error || "unknown") });
     }
 
-    // 2. CHECK REMINDERS
-    if (isCheckReminders(msg)) {
+    // CHECK REMINDERS
+    case "reminder_check": {
       const reminders = await getReminders();
       if (reminders.length === 0) return Response.json({ reply: "No reminders set." });
 
@@ -945,8 +804,8 @@ export async function POST(req) {
       return Response.json({ reply });
     }
 
-    // 3. SET REMINDER
-    if (isSetReminder(msg)) {
+    // SET REMINDER
+    case "reminder_set": {
       const extracted = await extractReminderDetails(message, history);
       console.log("Extracted reminder:", JSON.stringify(extracted));
 
@@ -985,8 +844,8 @@ export async function POST(req) {
       });
     }
 
-    // 4. EMAIL READ
-    if (isEmailRead(msg)) {
+    // EMAIL READ
+    case "email_read": {
       const lower = msg.toLowerCase();
 
       // Person extraction. Captures multi-word names (e.g. "Eric Brandley") by
@@ -1099,8 +958,11 @@ export async function POST(req) {
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 5. EMAIL SEND
-    if (isEmailSend(msg, history)) {
+    // EMAIL SEND (covers both fresh sends and approval of a prior draft;
+    // the handler body uses isEmailApprovalPhrase + lookedLikeEmailDraft
+    // to decide which path internally).
+    case "email_send":
+    case "email_approve": {
       const lastAssistantMsg = history.filter((m) => m.role === "assistant").slice(-1)[0];
       const lastContent = lastAssistantMsg?.content || "";
 
@@ -1152,8 +1014,8 @@ export async function POST(req) {
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 6. QUOTE
-    if (isQuote(msg)) {
+    // QUOTE
+    case "quote": {
       const extracted = await extractQuoteDetails(message);
       console.log("[quote] extracted:", JSON.stringify(extracted));
 
@@ -1185,8 +1047,8 @@ export async function POST(req) {
       return Response.json({ reply: "Quote submission failed: " + (data.error || "unknown") });
     }
 
-    // 7a. DRIVE SEARCH
-    if (isDriveSearch(msg)) {
+    // DRIVE SEARCH
+    case "drive_search": {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1220,10 +1082,9 @@ Return JSON: {"searchTerm": "exact name or keyword", "folderName": "folder name 
       const driveData = await driveRes.json();
       console.log("[drive search] results:", driveData.files?.length, "warning:", driveData.warning);
 
-      // ID validation: drop anything missing a Drive id (parity w/ email guard).
-      const validFiles = (driveData.files || []).filter(
-        (f) => f && typeof f.id === "string" && f.id.length > 0
-      );
+      // ID validation: drop anything failing the strict Google ID check
+      // (length > 10 + no "fake" substring). Parity with email_read.
+      const validFiles = (driveData.files || []).filter(hasValidGoogleId);
 
       if (validFiles.length === 0) {
         const subject = searchTerm ? `"${searchTerm}"` : "your Drive";
@@ -1268,8 +1129,8 @@ Return JSON: {"searchTerm": "exact name or keyword", "folderName": "folder name 
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 7b. DRIVE CREATE FOLDER
-    if (isDriveCreate(msg)) {
+    // DRIVE CREATE FOLDER
+    case "drive_create": {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1323,16 +1184,15 @@ Return JSON: {"folderName": "cleaned name", "parentFolderName": "parent folder n
       return Response.json({ reply: `I couldn't create that folder: ${data.error || "unknown error"}` });
     }
 
-    // 7b1. DRIVE REVERT — "put it back" / "move it back". We don't track move
+    // DRIVE REVERT — "put it back" / "move it back". We don't track move
     // history, so ask for the destination explicitly rather than guess.
-    if (isDriveRevert(msg)) {
+    case "drive_revert": {
       return Response.json({
         reply: "I don't track where files came from, so I can't put it back automatically. Which folder should I move it to?",
       });
     }
-
-    // 7b2. DRIVE MOVE — extract source + target, look up source, call PATCH move.
-    if (isDriveMove(msg)) {
+    // DRIVE MOVE — extract source + target, look up source, call PATCH move.
+    case "drive_move": {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1366,7 +1226,7 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
       const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
       const sData = await sRes.json();
-      const candidates = (sData.files || []).filter((f) => f && f.id);
+      const candidates = (sData.files || []).filter(hasValidGoogleId);
 
       if (candidates.length === 0) {
         return Response.json({
@@ -1457,51 +1317,55 @@ Strip filler like "the folder called", "the file named", "I just created". Retur
       });
     }
 
-    // 7b3. DRIVE DELETE APPROVAL — must come before isDriveDelete.
-    // "yes delete it" is only honored when the previous assistant turn
-    // contained a [delete:...] marker; the file ID is parsed out of that
-    // marker so we delete exactly the file Brad confirmed.
-    if (isDriveDeleteApproval(msg, history)) {
-      const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
-      const idMatch = lastAssistant?.content?.match(DELETE_MARKER_RE);
-      const fileId = idMatch?.[1];
-      if (!fileId) {
-        return Response.json({
-          reply: "I lost track of which file you confirmed. Tell me which file to delete and I'll ask again.",
+    // DRIVE DELETE — handles both fresh delete requests and "yes delete it"
+    // approvals of a prior confirmation prompt. Approval is detected via
+    // [delete:...] marker in the previous assistant turn.
+    case "drive_delete": {
+      const lastAssistantForDel = history.filter((h) => h.role === "assistant").slice(-1)[0];
+      const trimmedDelMsg = msg.trim().replace(/[.!?]+$/, "");
+      const isDelApproval =
+        trimmedDelMsg === "yes delete it" &&
+        DELETE_MARKER_RE.test(lastAssistantForDel?.content || "");
+
+      if (isDelApproval) {
+        const idMatch = lastAssistantForDel.content.match(DELETE_MARKER_RE);
+        const fileId = idMatch?.[1];
+        if (!fileId) {
+          return Response.json({
+            reply: "I lost track of which file you confirmed. Tell me which file to delete and I'll ask again.",
+          });
+        }
+        const nameMatch = lastAssistantForDel.content.match(/delete\s+["']([^"']+)["']/i);
+        const fileName = nameMatch?.[1] || "the file";
+
+        console.log("=== CALLING DRIVE DELETE ===");
+        const dRes = await fetch(`${BASE_URL}/api/drive`, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId }),
         });
+        const dData = await dRes.json();
+        console.log("Drive DELETE response:", JSON.stringify(dData));
+
+        if (!dData.success) {
+          return Response.json({
+            reply: `I couldn't delete that file: ${dData.error || "unknown error"}`,
+          });
+        }
+
+        try {
+          await insertMemoryWithCap(
+            `[LOG] Deleted "${fileName}" (id ${fileId}) on ${today}`
+          );
+        } catch (e) { console.log("[drive delete] memory log failed:", e.message); }
+
+        return Response.json({ reply: `Done — "${fileName}" moved to trash.` });
       }
-      const nameMatch = lastAssistant.content.match(/delete\s+["']([^"']+)["']/i);
-      const fileName = nameMatch?.[1] || "the file";
 
-      console.log("=== CALLING DRIVE DELETE ===");
-      const dRes = await fetch(`${BASE_URL}/api/drive`, {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileId }),
-      });
-      const dData = await dRes.json();
-      console.log("Drive DELETE response:", JSON.stringify(dData));
-
-      if (!dData.success) {
-        return Response.json({
-          reply: `I couldn't delete that file: ${dData.error || "unknown error"}`,
-        });
-      }
-
-      try {
-        await insertMemoryWithCap(
-          `[LOG] Deleted "${fileName}" (id ${fileId}) on ${today}`
-        );
-      } catch (e) { console.log("[drive delete] memory log failed:", e.message); }
-
-      return Response.json({ reply: `Done — "${fileName}" moved to trash.` });
-    }
-
-    // 7b4. DRIVE DELETE — first turn. Find the file, show it to Brad,
-    // ask for explicit confirmation. Embeds the file ID as a [delete:...]
-    // marker so the approval handler can recover it. NO API call until
-    // Brad responds with exactly "yes delete it".
-    if (isDriveDelete(msg)) {
+      // Fresh delete request — find the file, show it, ask for confirmation.
+      // Embeds the file ID as a [delete:...] marker so the approval branch
+      // above can recover it. NO API call until Brad responds with "yes delete it".
+      {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1530,7 +1394,7 @@ Strip filler like "the file called", "the folder named". Return the bare name.`,
       const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
       const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
       const sData = await sRes.json();
-      const candidates = (sData.files || []).filter((f) => f && f.id);
+      const candidates = (sData.files || []).filter(hasValidGoogleId);
 
       if (candidates.length === 0) {
         return Response.json({
@@ -1559,10 +1423,10 @@ Strip filler like "the file called", "the folder named". Return the bare name.`,
       });
     }
 
-    // 7c. DRIVE SHARE — extract source + recipient, look up source, call PATCH
-    // share. Never hands off to Claude (which would invent "Done" without a
-    // real API call).
-    if (isDriveShare(msg)) {
+    }
+    // DRIVE SHARE — extract source + recipient, look up source, call PATCH
+    // share. Never hands off to Claude.
+    case "drive_share": {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1600,7 +1464,7 @@ If the message has no email, set shareEmail to null.`,
       const sParams = new URLSearchParams({ search: sourceName, limit: "10" });
       const sRes = await fetch(`${BASE_URL}/api/drive?${sParams.toString()}`);
       const sData = await sRes.json();
-      const candidates = (sData.files || []).filter((f) => f && f.id);
+      const candidates = (sData.files || []).filter(hasValidGoogleId);
 
       if (candidates.length === 0) {
         return Response.json({
@@ -1653,8 +1517,8 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
-    // 7d. DRIVE READ — same pattern as share: needs a file ID first.
-    if (isDriveRead(msg)) {
+    // DRIVE READ — same pattern as share: needs a file ID first.
+    case "drive_read": {
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 512,
@@ -1669,13 +1533,18 @@ If the message has no email, set shareEmail to null.`,
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 7e0. EMAIL-TO-DRIVE APPROVAL — must come before isEmailToDrive.
-    // Brad confirmed a specific (emailId, attachmentId, folder) tuple shown
-    // in the previous assistant turn. Pull those values from the marker and
-    // call the upload API. NEVER re-search emails — we save exactly what
-    // Brad confirmed.
-    if (isEmailToDriveApproval(msg, history)) {
-      const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
+    // EMAIL-TO-DRIVE — handles both fresh save requests and "yes save it"
+    // approvals. Approval is detected by [save:emailId:attachmentId:folder]
+    // marker in the previous assistant message.
+    case "email_to_drive": {
+      const lastAssistantForSave = history.filter((h) => h.role === "assistant").slice(-1)[0];
+      const trimmedSaveMsg = msg.trim().replace(/[.!?]+$/, "");
+      const isSaveApproval =
+        trimmedSaveMsg === "yes save it" &&
+        SAVE_MARKER_RE.test(lastAssistantForSave?.content || "");
+
+      if (isSaveApproval) {
+      const lastAssistant = lastAssistantForSave;
       const markerMatch = lastAssistant?.content?.match(SAVE_MARKER_RE);
       if (!markerMatch) {
         return Response.json({
@@ -1755,10 +1624,10 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
-    // 7e. EMAIL ATTACHMENT TO DRIVE — first turn. Find the email + attachment,
-    // show Brad EXACTLY what we'll save, embed the IDs in a marker, and wait
-    // for "yes save it". No upload until Brad confirms.
-    if (isEmailToDrive(msg)) {
+      // Fresh save request — find the email + attachment, show Brad EXACTLY
+      // what we'll save, embed the IDs in a marker, and wait for "yes save
+      // it". No upload until Brad confirms.
+      {
       const extractRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         response_format: { type: "json_object" },
@@ -1793,7 +1662,7 @@ Examples:
         `${BASE_URL}/api/email?search=${encodeURIComponent(emailSearch)}&limit=10`
       );
       const emailData = await emailRes.json();
-      const emails = (emailData.emails || []).filter((e) => e && e.id);
+      const emails = (emailData.emails || []).filter(hasValidGoogleId);
       console.log("[email-to-drive] emails found:", emails.length);
 
       if (emails.length === 0) {
@@ -1875,8 +1744,9 @@ Examples:
       });
     }
 
-    // 7. CALENDAR WRITE
-    if (isCalendarWrite(msg)) {
+    }
+    // CALENDAR WRITE
+    case "calendar_write": {
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
@@ -1891,8 +1761,8 @@ Examples:
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 8. CALENDAR READ
-    if (isCalendarRead(msg)) {
+    // CALENDAR READ
+    case "calendar_read": {
       // If the day Brad's asking about was already retrieved earlier in the conversation,
       // skip the fetch — Claude can answer from history. Only re-fetch when Brad explicitly
       // asks ("check my calendar again", "refresh", "any new events", etc.).
@@ -1946,8 +1816,8 @@ Examples:
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // 9. DEPARTURE
-    if (isDeparture(msg)) {
+    // DEPARTURE
+    case "departure": {
       const origin = detectDepartureOrigin(message);
       const eventName = extractEventNameFromDeparture(message);
       console.log(`[departure] origin=${origin} eventName=${eventName || "(none)"}`);
@@ -2074,17 +1944,20 @@ Examples:
       });
     }
 
-    // 10. NORMAL CHAT
-    const response = await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 1024,
-      system: buildSystemPrompt(today, memoryText),
-      messages: [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
-        { role: "user", content: message },
-      ],
-    });
-    return Response.json({ reply: cleanResponse(response.content[0].text) });
+    // NORMAL CHAT — classifier returned "chat" or an unhandled intent.
+    default: {
+      const response = await anthropic.messages.create({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: buildSystemPrompt(today, memoryText),
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+      return Response.json({ reply: cleanResponse(response.content[0].text) });
+    }
+    }  // end switch
   } catch (error) {
     console.log("[chat] POST threw:", error.message);
     return Response.json({ reply: "Jess had an issue: " + error.message });

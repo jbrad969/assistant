@@ -20,13 +20,6 @@ const TIMEZONE = "America/Phoenix";
 const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
 const CLAUDE_MODEL = "claude-sonnet-4-5";
 
-// In-memory cache scoped to a single warm serverless instance. email_read
-// populates this with every attachment-bearing email so the next-turn save
-// can resolve specific references ("the May 1st one", "the Pershing one",
-// "the older one") to the right attachmentId — not just whichever single
-// item the SAVE marker happened to pin.
-let cachedEmailAttachments = [];
-
 /* ============================================================================
  * INTENT DETECTION — mutually exclusive, evaluated in declared order
  * ========================================================================== */
@@ -35,8 +28,8 @@ let cachedEmailAttachments = [];
  * call per turn classifies the message + recent history into one of ~17
  * intents. Handlers still do their own per-handler GPT extraction; the
  * classifier exists purely for routing. Markers in prior assistant turns
- * (SAVE_MARKER_RE / DELETE_MARKER_RE / To:Subject: drafts) bias the
- * classifier toward the right approval intent.
+ * (DELETE_MARKER_RE / To:Subject: drafts) bias the classifier toward the
+ * right approval intent.
  */
 
 const EMAIL_APPROVAL_PHRASES = [
@@ -54,10 +47,6 @@ function isEmailApprovalPhrase(msg) {
 // Markers embedded in confirmation prompts so subsequent turns can recover
 // the pinned IDs without session storage.
 const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
-// Email-to-drive marker: email_read emits this after finding an attachment;
-// the next-turn email_to_drive reads emailId | attachmentId | filename out of
-// it and saves without re-fetching Gmail or running any disambig.
-const SAVE_MARKER_RE = /<!--SAVE:([^|]+)\|([^|]+)\|([^>]+?)-->/;
 
 // Strict ID validation for every Google API response. Real Gmail/Drive IDs
 // are 16+ chars of alphanumeric — anything shorter or containing "fake" is
@@ -91,7 +80,7 @@ Intents:
 - "email_read" - read/search/find emails in inbox
 - "email_send" - send or draft a NEW email
 - "email_approve" - Brad is approving a draft email shown in the previous assistant message (e.g. "yes send it", "send", "yes" when the prior turn shows To:/Subject:/Body:)
-- "email_to_drive" - save an email attachment to a Google Drive folder; this includes any "yes save to X" / folder-name reply when the previous assistant message contains a SAVE marker
+- "email_to_drive" - save an email attachment to a Google Drive folder in one shot (e.g., "Save the May 1 T&K attachment to Roof Quotes", "Upload Nicholas's attachment to Receipts")
 - "calendar_read" - check schedule/calendar
 - "calendar_write" - add/move/delete calendar events
 - "drive_search" - find files in Google Drive
@@ -123,7 +112,7 @@ Return JSON:
 }
 
 CRITICAL routing rules:
-- Any "yes save to X" / "save it to X" / "put it in X" / bare folder name when prior assistant message contains "<!--SAVE:" → email_to_drive
+- "save the X attachment to Y folder" / "upload the X to Y" / "save Brad's X to Y" → email_to_drive
 - "yes delete it" when the prior assistant message contains "[delete:" → drive_delete
 - "yes send it" / "send it" / "send" / "yes" when the prior assistant message contains a To: and Subject: draft → email_approve
 - Without those markers/drafts, those short approval phrases default to "chat"
@@ -219,7 +208,7 @@ CRITICAL: Read the ENTIRE conversation history before responding. The history co
 // We don't run cleanResponse here — its regexes target multi-character XML/
 // code-fence sequences that can split across deltas. Those patterns shouldn't
 // appear in normal Claude output; if they ever do we'll strip client-side.
-function streamAnthropicResponse(params, appendText = "") {
+function streamAnthropicResponse(params) {
   const encoder = new TextEncoder();
   const readable = new ReadableStream({
     async start(controller) {
@@ -236,11 +225,6 @@ function streamAnthropicResponse(params, appendText = "") {
         console.log("[stream] anthropic stream failed:", e.message);
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`)
-        );
-      }
-      if (appendText) {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify({ text: appendText })}\n\n`)
         );
       }
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -666,93 +650,37 @@ Only Tile/Shingle/Flat for roofMaterial. If unclear, null.`,
   return JSON.parse(result.choices[0].message.content);
 }
 
-// Pick a specific email from cachedEmailAttachments when Brad's message
-// references one ("May 1st", "the Pershing one", "the first one", "today's").
-// Returns the matched email or null. Caller falls back to the SAVE marker.
-//
-// Tie-breaking: when multiple emails match a filter, the first one (most
-// recent in the cache's newest-first ordering) wins — except for "first" /
-// "older" / "earliest" which deliberately pick the oldest.
-function pickSaveCandidate(message, cache) {
-  if (!cache || cache.length === 0) return null;
-  const m = message.toLowerCase();
+// Split Brad's one-shot save command into the two pieces the API route needs:
+// emailDescription (which email to find) and folderName (where to put it).
+// The API route handles further refinement via GPT — this just splits.
+async function extractEmailToDriveCommand(message) {
+  try {
+    const result = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Split Brad's save command into two parts.
+Return JSON: {"emailDescription": "...", "folderName": "..."}.
+- emailDescription: a short phrase identifying which email's attachment (sender, date, subject keywords). Null if Brad didn't describe one.
+- folderName: the Drive folder name. Strip leading articles, title-case. Null if no folder named.
 
-  // "today's" / "this morning's" → most recent (cache is newest-first).
-  if (/\b(?:today'?s?|this\s+morning'?s?|latest|newest|most\s+recent)\b/.test(m)) {
-    return cache[0];
-  }
-
-  // "the first one" / "older" / "oldest" / "earliest" → oldest in the list.
-  if (/\b(?:first\s+one|the\s+older(?:\s+one)?|oldest|earliest|earlier\s+one)\b/.test(m)) {
-    return cache[cache.length - 1];
-  }
-
-  // Date filter: "May 1", "May 1st", "1 May".
-  const MONTHS = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
-  const monthDay = m.match(new RegExp(`\\b${MONTHS}\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, "i"));
-  const dayMonth = m.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+${MONTHS}\\b`, "i"));
-  if (monthDay || dayMonth) {
-    const monthAbbr = (monthDay?.[1] || dayMonth?.[2]).toLowerCase().slice(0, 3);
-    const day = parseInt(monthDay?.[2] || dayMonth?.[1], 10);
-    const filtered = cache.filter((e) => {
-      const dt = (e.date || "").toLowerCase();
-      return dt.includes(monthAbbr) && new RegExp(`\\b${day}\\b`).test(dt);
+Examples:
+"Save the May 1 T&K attachment to Roof Quotes" → {"emailDescription": "May 1 T&K attachment", "folderName": "Roof Quotes"}
+"Save the Pershing PDF to PO 2026" → {"emailDescription": "Pershing PDF", "folderName": "PO 2026"}
+"Upload Nicholas's attachment to Receipts" → {"emailDescription": "Nicholas's attachment", "folderName": "Receipts"}
+"Save the WattMonk invoice to Contracts" → {"emailDescription": "WattMonk invoice", "folderName": "Contracts"}
+"Save it" → {"emailDescription": null, "folderName": null}`,
+        },
+        { role: "user", content: message },
+      ],
     });
-    if (filtered.length > 0) return filtered[0];
+    return JSON.parse(result.choices[0].message.content);
+  } catch (e) {
+    console.log("[extractEmailToDriveCommand] failed:", e.message);
+    return { emailDescription: null, folderName: null };
   }
-
-  // Subject filter: capitalized proper-noun-like tokens from the portion of
-  // the message BEFORE "to"/"in"/"into" (so folder-name words like "Roof
-  // Quotes" don't match against subjects).
-  const STOP = new Set([
-    "Save", "Move", "Drive", "Drop", "Put", "Pdf", "Folder", "The", "Both",
-    "All", "And", "Or", "Brad", "Jess", "Yes", "Yep", "Ok", "Okay",
-    "Attachment", "Attachments", "Email", "Emails", "File", "Files",
-  ]);
-  const leftOfFolder = message.split(/\b(?:to|in|into)\b/i)[0] || message;
-  const candidates = (leftOfFolder.match(/\b[A-Z][a-zA-Z]{2,}\b/g) || []).filter(
-    (w) => !STOP.has(w)
-  );
-  for (const word of candidates) {
-    const wLower = word.toLowerCase();
-    const filtered = cache.filter((e) =>
-      (e.subject || "").toLowerCase().includes(wLower)
-    );
-    if (filtered.length > 0) return filtered[0];
-  }
-
-  return null;
-}
-
-// Recover the pinned save target from the previous assistant message.
-// Marker format: <!--SAVE:emailId|attachmentId|filename-->
-function parseSaveMarker(text) {
-  if (!text) return null;
-  const match = text.match(SAVE_MARKER_RE);
-  if (!match) return null;
-  const [, emailId, attachmentId, filename] = match;
-  if (!emailId || !attachmentId) return null;
-  return { emailId, attachmentId, filename };
-}
-
-// Pull a folder name out of Brad's approval message. Looks for "to/in/into X"
-// or a bare folder-name reply. Returns null when nothing matches.
-function extractFolderFromMessage(message) {
-  if (!message) return null;
-  const m = message.trim();
-  const patterns = [
-    /\b(?:to|in|into)\s+(?:the\s+)?["']([^"']+)["']\s+folder\b/i,
-    /\b(?:to|in|into)\s+(?:the\s+)?([A-Z][\w &'\-]{0,40}?)\s+folder\b/,
-    /\b(?:to|in|into)\s+["']([^"']+)["']/i,
-    /\b(?:to|in|into)\s+([A-Z][\w &'\-]{0,40}?)[.!?]?\s*$/,
-    /\bfolder\s+(?:called\s+)?["']([^"']+)["']/i,
-    /^([A-Z][\w &'\-]{1,40})[.!?]?\s*$/,
-  ];
-  for (const re of patterns) {
-    const match = m.match(re);
-    if (match && match[1]) return match[1].trim();
-  }
-  return null;
 }
 
 /* ============================================================================
@@ -1014,34 +942,9 @@ export async function POST(req) {
       /\b(tile|shingle|flat)\b/i.test(message) &&
       /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
 
-    // Email-to-drive routing: three cases force email_to_drive ahead of the
-    // classifier so verbs like "move" don't drift to drive_move and bare
-    // folder names don't drift to chat.
-    //   (a) Prior assistant turn has a SAVE marker AND message has an
-    //       approval verb.
-    //   (b) cachedEmailAttachments is non-empty AND message resolves to a
-    //       specific cached item ("save the May 1st one to X").
-    //   (c) cachedEmailAttachments is non-empty AND message is a generic
-    //       save/move directed at a folder ("save it to Roof Quotes",
-    //       "put it in the folder") — we'll use the last cached attachment.
-    const lastAssistantTurn = history.filter((h) => h.role === "assistant").slice(-1)[0];
-    const savePending = parseSaveMarker(lastAssistantTurn?.content || "");
-    const isAttachmentApproval =
-      !!savePending &&
-      /\b(?:yes|yep|yeah|ok|okay|sure|save|put|to|in|into|drop|move)\b/i.test(message);
-    const isCacheReferenceSave =
-      cachedEmailAttachments.length > 0 &&
-      /\b(?:save|move|put|upload|drop|stick)\b/i.test(message) &&
-      !!pickSaveCandidate(message, cachedEmailAttachments);
-    const isGenericCacheSave =
-      cachedEmailAttachments.length > 0 &&
-      /\b(?:save|move|put|upload|drop|stick)\s+(?:it|that|this|the\s+(?:attachment|file|pdf))\b/i.test(message);
-
     let intent;
     if (isQuoteRequest) {
       intent = { intent: "quote", confidence: 100 };
-    } else if (isAttachmentApproval || isCacheReferenceSave || isGenericCacheSave) {
-      intent = { intent: "email_to_drive", confidence: 100 };
     } else {
       intent = await classifyIntent(message, history);
     }
@@ -1227,58 +1130,18 @@ export async function POST(req) {
       const emailGuardrail =
         "\n\nEMAIL SUMMARY GUARDRAIL:\nThese are the ONLY emails that exist. Do not mention any email not in this list. If asked about a specific sender not in this list, say you found nothing from them. Never invent subjects, dates, or content. If the list above is empty, say you found nothing.";
 
-      // Cache every attachment-bearing email so a follow-up like "save the
-      // May 1st one" or "save the Pershing one" can find the right
-      // attachmentId even though the SAVE marker only pins the FIRST item.
-      // Only replace the cache when this search actually returned attachments
-      // — a zero-attachment search shouldn't wipe context Brad still relies on.
-      const freshAttachmentEmails = realEmails
-        .filter((e) => Array.isArray(e.attachments) && e.attachments.length > 0)
-        .map((e) => ({
-          emailId: e.id,
-          from: e.fromEmail,
-          subject: e.subject,
-          date: e.date,
-          internalDate: e.internalDate,
-          attachments: e.attachments,
-        }));
-      if (freshAttachmentEmails.length > 0) {
-        cachedEmailAttachments = freshAttachmentEmails;
-        console.log("[email read] cache replaced with", cachedEmailAttachments.length, "attachment-bearing email(s)");
-      } else {
-        console.log("[email read] no attachments in results; keeping existing cache of", cachedEmailAttachments.length);
-      }
-
-      // If any result has an attachment, pin the FIRST one in a SAVE marker
-      // and offer to save it. Brad's next turn ("yes save to Roof Quotes" /
-      // bare folder name) gets routed straight to email_to_drive, which reads
-      // emailId/attachmentId/filename out of the marker.
-      const emailWithAttachment = realEmails.find(
-        (e) => Array.isArray(e.attachments) && e.attachments.length > 0
-      );
-      let saveSuffix = "";
-      if (emailWithAttachment) {
-        const att = emailWithAttachment.attachments[0];
-        const safeFilename = (att.filename || "attachment").replace(/[|>]/g, "_");
-        saveSuffix = `\n\nI found "${att.filename}" attached. Want me to save it to Drive? If so, which folder?\n<!--SAVE:${emailWithAttachment.id}|${att.attachmentId}|${safeFilename}-->`;
-        console.log("[email read] pinned attachment for save:", att.filename);
-      }
-
-      return streamAnthropicResponse(
-        {
-          model: CLAUDE_MODEL,
-          max_tokens: 1024,
-          system: buildSystemPrompt(today, memoryText) + emailGuardrail,
-          messages: [
-            ...history.map((m) => ({ role: m.role, content: m.content })),
-            {
-              role: "user",
-              content: `${message}\n\n--- Email data fetched for this turn ---\n${emailContext}${groupingHint}`,
-            },
-          ],
-        },
-        saveSuffix
-      );
+      return streamAnthropicResponse({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        system: buildSystemPrompt(today, memoryText) + emailGuardrail,
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          {
+            role: "user",
+            content: `${message}\n\n--- Email data fetched for this turn ---\n${emailContext}${groupingHint}`,
+          },
+        ],
+      });
     }
 
     // EMAIL SEND (covers both fresh sends and approval of a prior draft;
@@ -1856,106 +1719,51 @@ If the message has no email, set shareEmail to null.`,
       return Response.json({ reply: cleanResponse(response.content[0].text) });
     }
 
-    // EMAIL-TO-DRIVE — strict two-turn flow.
-    //   Turn 1 (email_read): pinned the first attachment in a SAVE marker
-    //   AND cached every attachment-bearing email in cachedEmailAttachments.
-    //   Turn 2 (here): pickSaveCandidate first — if Brad referenced a
-    //   specific item ("the May 1st one", "the Pershing one", "today's"),
-    //   use THAT email's attachment instead of the default-pinned one. If no
-    //   match, fall back to the SAVE marker. Then extract folder and save.
+    // EMAIL-TO-DRIVE — one-shot. Split Brad's message into emailDescription
+    // and folderName, then delegate to /api/drive/email-to-drive which does
+    // Gmail search → attachment fetch → folder resolve/create → upload in a
+    // single round trip. No cache, no marker, no disambig loops.
     case "email_to_drive": {
-      const lastAssistant = history.filter((h) => h.role === "assistant").slice(-1)[0];
-      const pinned = parseSaveMarker(lastAssistant?.content || "");
-      const picked = pickSaveCandidate(message, cachedEmailAttachments);
+      const { emailDescription, folderName } = await extractEmailToDriveCommand(message);
+      console.log("[email-to-drive] extracted:", { emailDescription, folderName });
 
-      let target = null;
-      if (picked) {
-        const att = picked.attachments[0];
-        if (att?.attachmentId) {
-          target = {
-            emailId: picked.emailId,
-            attachmentId: att.attachmentId,
-            filename: att.filename,
-          };
-          console.log("[email-to-drive] cache pick overrides marker:", {
-            emailId: target.emailId,
-            filename: target.filename,
-            subject: picked.subject,
-            date: picked.date,
-          });
-        }
-      }
-      if (!target && pinned) {
-        target = pinned;
-        console.log("[email-to-drive] using SAVE marker (default pinned)");
-      }
-      // Final fallback: bare "save it" / "put it in the folder" with no
-      // specific reference AND no marker in history — use the most recently
-      // cached attachment-bearing email.
-      if (!target && cachedEmailAttachments.length > 0) {
-        const last = cachedEmailAttachments[0];
-        const att = last.attachments[0];
-        if (att?.attachmentId) {
-          target = {
-            emailId: last.emailId,
-            attachmentId: att.attachmentId,
-            filename: att.filename,
-          };
-          console.log("[email-to-drive] using last cached attachment:", target.filename);
-        }
-      }
-
-      if (!target) {
+      if (!emailDescription || !folderName) {
         return Response.json({
-          reply: "I don't have an attachment pinned to save. Find the email first and I'll offer to save it.",
+          reply: "Tell me which email's attachment to save and the folder name. Example: \"Save the May 1 T&K attachment to Roof Quotes\".",
         });
       }
-
-      const folderName = extractFolderFromMessage(message);
-      if (!folderName) {
-        return Response.json({
-          reply: `Which folder should I save "${target.filename}" to?`,
-        });
-      }
-
-      console.log("[email-to-drive] saving:", { ...target, folderName });
 
       let result;
       try {
         const res = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            emailId: target.emailId,
-            attachmentId: target.attachmentId,
-            filename: target.filename,
-            folderName,
-          }),
+          body: JSON.stringify({ emailDescription, folderName, history }),
         });
         result = await res.json();
       } catch (e) {
-        return Response.json({ reply: `Upload failed: ${e.message}` });
+        return Response.json({ reply: `I couldn't save that - ${e.message}. Try again?` });
       }
       console.log("[email-to-drive] result:", JSON.stringify(result));
 
-      if (result.success !== true || !result.fileId || !result.link) {
+      if (!result.success) {
         return Response.json({
-          reply: `I couldn't save "${target.filename}". Error: ${result.error || "unknown error"}`,
+          reply: `I couldn't save that - ${result.error || "unknown error"}. Try again?`,
         });
       }
 
       try {
         await insertMemoryWithCap(
           result.folderCreated
-            ? `[LOG] Created Drive folder "${folderName}" and saved "${result.name}" on ${today}`
-            : `[LOG] Saved attachment "${result.name}" to "${folderName}" on ${today}`
+            ? `[LOG] Created Drive folder "${folderName}" and saved "${result.filename}" on ${today}`
+            : `[LOG] Saved attachment "${result.filename}" to "${folderName}" on ${today}`
         );
       } catch (e) { console.log("[email-to-drive] memory log failed:", e.message); }
 
       return Response.json({
         reply: result.folderCreated
-          ? `Created "${folderName}" folder and saved "${result.name}" to it. Link: ${result.link}`
-          : `Saved "${result.name}" to ${folderName}. Link: ${result.link}`,
+          ? `Created "${folderName}" folder and saved "${result.filename}" to it. Link: ${result.link}`
+          : `Saved "${result.filename}" to ${folderName}. Link: ${result.link}`,
       });
     }
 

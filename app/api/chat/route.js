@@ -127,6 +127,7 @@ CRITICAL routing rules:
 - "find" / "search" / "get" about inbox content → email_read; about files → drive_search
 - "put it back" / "move it back" → drive_revert (NOT drive_move — we don't know where it came from)
 - "move my meeting to Friday" → calendar_write (NOT drive_move — "meeting" is a calendar word)
+- searchTerm extraction: when Brad says "T&K Roofing" or "TK Roofing", search for "tnkroofing" because that's the email domain. Extract the most likely Gmail search query, not just the name Brad said.
 
 Context from recent conversation:
 ${lastFewMessages}`,
@@ -446,7 +447,24 @@ async function getEmails(searchOrSearches = null, limit = null, recent = false) 
   return data.emails || [];
 }
 
-async function buildEmailSearchQuery(personDescription) {
+// Deterministic company-name → Gmail-domain-stub overrides. Gmail's from:
+// operator matches substrings of the address, so from:tnkroofing finds anything
+// from @tnkroofing.com. Add entries here when GPT keeps missing a known sender.
+const COMPANY_DOMAIN_OVERRIDES = {
+  "t&k": "tnkroofing",
+  "t&k roofing": "tnkroofing",
+  "tk roofing": "tnkroofing",
+  "t and k": "tnkroofing",
+  "t and k roofing": "tnkroofing",
+  "tnk": "tnkroofing",
+};
+
+async function buildEmailSearchQuery(personDescription, opts = {}) {
+  const hasAttachment = opts.hasAttachment === true;
+  const overrideKey = personDescription.toLowerCase().trim();
+  const override = COMPANY_DOMAIN_OVERRIDES[overrideKey] || null;
+
+  let queries = [];
   try {
     const result = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -454,17 +472,18 @@ async function buildEmailSearchQuery(personDescription) {
       messages: [
         {
           role: "system",
-          content: `Build Gmail search queries for finding emails involving a person.
-Return JSON: {
-  "queries": ["query1", "query2", "query3"]
-}
+          content: `Build Gmail search queries for finding emails involving a person or company.
+Return JSON: { "queries": ["query1", "query2", "query3"] }
 Rules:
-- Do not hardcode any email domain.
-- Never include in:inbox, is:unread, label:, or any other Gmail filter operator. Those over-restrict results.
-- Use only name variations with the from:, cc:, and to: operators, plus a bare-name query.
+- Never include in:inbox, is:unread, label:, or any other Gmail filter operator that over-restricts results.
+- For COMPANY names, include a from:<domain-stub> query where domain-stub is the company name lowercased with spaces, ampersands, hyphens, and punctuation stripped (Gmail's from: matches substrings of email addresses).
+- For PERSONAL names, use from:/cc:/to: with the name plus a bare-name query.
 Examples:
-- "Eric Brandley" -> ["Eric Brandley", "from:Eric Brandley", "cc:Eric Brandley"]
-- "Nicole" -> ["Nicole", "from:Nicole", "cc:Nicole", "to:Nicole"]
+- "Eric Brandley" (personal) -> ["Eric Brandley", "from:Eric Brandley", "cc:Eric Brandley", "to:Eric Brandley"]
+- "Nicole" (personal) -> ["Nicole", "from:Nicole", "cc:Nicole", "to:Nicole"]
+- "T&K Roofing" (company) -> ["from:tnkroofing", "T&K Roofing", "from:T&K Roofing"]
+- "WattMonk" (company) -> ["from:wattmonk", "WattMonk", "from:WattMonk"]
+- "Green Tech Solar" (company) -> ["from:greentechsolar", "Green Tech Solar", "from:Green Tech"]
 Generate 3-4 different query variations to maximize chances of finding the emails.`,
         },
         {
@@ -474,13 +493,31 @@ Generate 3-4 different query variations to maximize chances of finding the email
       ],
     });
     const parsed = JSON.parse(result.choices[0].message.content);
-    const queries = Array.isArray(parsed?.queries) ? parsed.queries.filter(Boolean) : [];
-    console.log(`[buildEmailSearchQuery] "${personDescription}" ->`, JSON.stringify(queries));
-    return queries.length > 0 ? queries : [`from:${personDescription} OR cc:${personDescription} OR to:${personDescription}`];
+    queries = Array.isArray(parsed?.queries) ? parsed.queries.filter(Boolean) : [];
   } catch (e) {
     console.log("[buildEmailSearchQuery] failed:", e.message);
-    return [`from:${personDescription} OR cc:${personDescription} OR to:${personDescription}`];
   }
+
+  // Promote the deterministic override to position 0 — Gmail returns the
+  // tightest matches for an exact from: domain query.
+  if (override) {
+    queries = queries.filter((q) => q.toLowerCase() !== `from:${override}`);
+    queries.unshift(`from:${override}`);
+  }
+
+  if (queries.length === 0) {
+    queries = [`from:${personDescription} OR cc:${personDescription} OR to:${personDescription}`];
+  }
+
+  if (hasAttachment) {
+    queries = queries.map((q) => `${q} has:attachment`);
+  }
+
+  console.log(
+    `[buildEmailSearchQuery] "${personDescription}" hasAtt=${hasAttachment} override=${override || "none"} ->`,
+    JSON.stringify(queries)
+  );
+  return queries;
 }
 
 async function sendEmail(to, subject, body) {
@@ -1070,11 +1107,20 @@ export async function POST(req) {
     case "email_read": {
       const lower = msg.toLowerCase();
 
+      // Detect "with attachments" / "that has attachments" / etc. so the Gmail
+      // query gets the has:attachment operator. Gmail's has:attachment is
+      // built-in and reliable — far better than fetching everything and
+      // filtering client-side.
+      const wantsAttachments =
+        /\b(?:with|having)\s+(?:an?\s+)?attachments?\b/i.test(msg) ||
+        /\bthat\s+(?:has|have)\s+attachments?\b/i.test(msg) ||
+        /\bhas\s+attachments?\b/i.test(msg);
+
       // Person extraction. Captures multi-word names (e.g. "Eric Brandley") by
       // grabbing everything from the trigger word until punctuation or EOL,
       // then trimming filler words off the tail.
       const STOP = ["i", "you", "we", "they", "he", "she", "me", "us", "someone", "anyone", "the", "a", "an"];
-      const TAIL_FILLER = /\s+(?:please|today|now|recently|lately|ever|yesterday|this week|last week)\.?$/i;
+      const TAIL_FILLER = /\s+(?:please|today|now|recently|lately|ever|yesterday|this week|last week|with\s+(?:an?\s+)?attachments?|that\s+(?:has|have)\s+attachments?|having\s+attachments?|has\s+attachments?)\.?$/i;
       const cleanName = (raw) =>
         raw.trim().replace(TAIL_FILLER, "").replace(/[?.!,]+$/, "").trim();
 
@@ -1094,12 +1140,13 @@ export async function POST(req) {
         if (name && !STOP.includes(name.toLowerCase())) searchedName = name;
       }
 
-      // Build queries. Use GPT to expand the person description into 3-4 Gmail
-      // query variations (from:, cc:, email-domain guesses, raw name) and run
-      // them in parallel.
+      // Build queries. Use GPT (+ deterministic overrides) to expand the
+      // person/company description into 3-4 Gmail query variations and run
+      // them in parallel. If Brad mentioned attachments, every variation
+      // gets has:attachment appended.
       let queries = null;
       if (searchedName) {
-        queries = await buildEmailSearchQuery(searchedName);
+        queries = await buildEmailSearchQuery(searchedName, { hasAttachment: wantsAttachments });
         console.log("Email search queries built:", JSON.stringify(queries));
       }
 

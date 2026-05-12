@@ -1036,34 +1036,44 @@ export async function POST(req) {
       console.log("Emails returned:", (rawEmails || []).length);
       console.log("First email:", JSON.stringify((rawEmails || [])[0]));
 
-      // ID VALIDATION: every email must carry a real Gmail message id. Anything
-      // without one is fabricated/garbage and must be dropped before Claude
-      // sees it. Without this, a malformed upstream response could let invented
-      // entries reach the model.
-      const emails = (rawEmails || []).filter(
-        (e) => e && typeof e.id === "string" && e.id.length > 0
-      );
-      const dropped = (rawEmails || []).length - emails.length;
-      if (dropped > 0) {
-        console.log(`[email read] DROPPED ${dropped} email(s) missing a Gmail id`);
+      // STAGE 1 — hard block on zero results. Claude is NEVER invoked when
+      // the API returned an empty list; the fixed reply below is the only
+      // thing Brad sees, so the model cannot fabricate email content.
+      const emails = rawEmails || [];
+      if (emails.length === 0) {
+        return Response.json({
+          reply: "I searched your inbox and found nothing matching that. Try a different search term.",
+        });
       }
 
-      // HALLUCINATION HARD STOP: zero results NEVER reach Claude. The reply is
-      // the fixed string below — Claude is not invoked. This is the only way
-      // to guarantee the model cannot fabricate email content.
-      if (emails.length === 0) {
-        const subject = searchedName ? `${searchedName} emails` : "your emails";
+      // STAGE 2 — ID validation. Every email must carry a real Gmail
+      // message id (>10 chars, no "fake" substring). Anything weaker is
+      // garbage/fabricated upstream and must never reach Claude. We
+      // distinguish this case from the empty-result case so a malformed
+      // upstream response doesn't masquerade as "no matches".
+      const realEmails = emails.filter(
+        (e) =>
+          e &&
+          typeof e.id === "string" &&
+          e.id.length > 10 &&
+          !e.id.includes("fake")
+      );
+      const dropped = emails.length - realEmails.length;
+      if (dropped > 0) {
+        console.log(`[email read] DROPPED ${dropped} email(s) failing ID validation`);
+      }
+      if (realEmails.length === 0) {
         return Response.json({
-          reply: `I searched for ${subject} and found nothing. Try a different name, date range, or keyword.`,
+          reply: "The search returned results but none had valid email IDs. Try again.",
         });
       }
 
       // ONLY reach Claude when we have REAL email data (every entry has a
       // verified Gmail id).
-      const emailContext = emails
+      const emailContext = realEmails
         .map(
           (e, i) =>
-            `${i + 1}. [id:${e.id}] From: ${e.from} (${e.fromEmail})\nSubject: ${e.subject}\nDate: ${e.date}\nBody: ${e.body?.slice(0, 300) || ""}`
+            `${i + 1}. ID:${e.id} From:${e.from} (${e.fromEmail}) Subject:${e.subject} Date:${e.date} Body:${e.body?.slice(0, 200) || ""}`
         )
         .join("\n\n");
 
@@ -1072,7 +1082,7 @@ export async function POST(req) {
         : "";
 
       const emailGuardrail =
-        "\n\nEMAIL SUMMARY GUARDRAIL:\nYou are summarizing REAL emails from the API. The emails above are the ONLY emails that exist. Do not mention, invent, or reference any emails not in the list above. If the list is empty, say you found nothing.";
+        "\n\nEMAIL SUMMARY GUARDRAIL:\nThese are the ONLY emails that exist. Do not mention any email not in this list. If asked about a specific sender not in this list, say you found nothing from them. Never invent subjects, dates, or content. If the list above is empty, say you found nothing.";
 
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,

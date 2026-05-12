@@ -20,6 +20,14 @@ const TIMEZONE = "America/Phoenix";
 const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
 const CLAUDE_MODEL = "claude-sonnet-4-5";
 
+// In-memory state scoped to a single warm serverless instance. Cold starts
+// reset it — that's acceptable: the email_read turn that populated the list
+// is in this turn's history anyway, so a stale clear just falls back to the
+// normal email_to_drive search flow. Used to resolve back-references like
+// "save those attachments" without re-running the email search.
+let lastEmailSearchResults = [];
+let lastMentionedFolder = null;
+
 /* ============================================================================
  * INTENT DETECTION — mutually exclusive, evaluated in declared order
  * ========================================================================== */
@@ -1022,9 +1030,20 @@ export async function POST(req) {
     const disambigPending = parseDisambigPrompt(lastAssistantTurn?.content || "");
     const isDisambigReply = !!(disambigPending && looksLikeDisambigReply(message));
 
+    // Bulk back-reference: prior email_read listed emails with attachments and
+    // Brad now says "save/move/put those (attachments)". Use the cached results
+    // — never re-search and never route this to drive_move (the verb "move" would
+    // otherwise mis-route).
+    const isBulkSaveReference =
+      lastEmailSearchResults.length > 0 &&
+      (/\b(?:save|move|put|upload|drop|stick)\s+(?:those|these|them|all\s+of\s+them|the)\b/i.test(message) ||
+        /\b(?:those|these)\s+(?:attachments?|emails?|files?|pdfs?)\b/i.test(message));
+
     let intent;
     if (isQuoteRequest) {
       intent = { intent: "quote", confidence: 100 };
+    } else if (isBulkSaveReference) {
+      intent = { intent: "email_to_drive", confidence: 100 };
     } else if (isDisambigReply) {
       intent = { intent: "email_to_drive", confidence: 100 };
     } else {
@@ -1195,6 +1214,14 @@ export async function POST(req) {
           reply: "The search returned results but none had valid email IDs. Try again.",
         });
       }
+
+      // Cache emails with attachments for "save those attachments" follow-ups.
+      // The bulk-save branch in email_to_drive reads this directly instead of
+      // re-running the search.
+      lastEmailSearchResults = realEmails.filter(
+        (e) => Array.isArray(e.attachments) && e.attachments.length > 0
+      );
+      console.log("[email read] cached emails-with-attachments:", lastEmailSearchResults.length);
 
       // ONLY reach Claude when we have REAL email data (every entry has a
       // verified Gmail id).
@@ -1812,6 +1839,114 @@ If the message has no email, set shareEmail to null.`,
         trimmedSaveMsg === "yes save it" &&
         SAVE_MARKER_RE.test(lastAssistantForSave?.content || "");
 
+      // === BULK BACK-REFERENCE: Brad said "save/move/put those attachments"
+      // after a recent email_read that returned emails-with-attachments. Save
+      // every cached email's first attachment to the named folder (or the most
+      // recently used folder) in one turn. No re-search.
+      const bulkRefRe =
+        /\b(?:save|move|put|upload|drop|stick)\s+(?:those|these|them|all\s+of\s+them|the)\b/i;
+      const thoseAttRe = /\b(?:those|these)\s+(?:attachments?|emails?|files?|pdfs?)\b/i;
+      const isBulkBackReference =
+        !isSaveApproval &&
+        lastEmailSearchResults.length > 0 &&
+        (bulkRefRe.test(message) || thoseAttRe.test(message));
+
+      if (isBulkBackReference) {
+        const folderExtractRes = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `Extract the Drive folder name Brad referenced. Return JSON: {"folderName": "exact folder name or null"}.
+Examples:
+"save those to Roof Quotes" -> {"folderName": "Roof Quotes"}
+"put those in the PO 2026 folder" -> {"folderName": "PO 2026"}
+"move them to Receipts" -> {"folderName": "Receipts"}
+"upload those into Brad's Stuff" -> {"folderName": "Brad's Stuff"}
+"save those in the folder" -> {"folderName": null}`,
+            },
+            { role: "user", content: message },
+          ],
+        });
+        let { folderName: bulkFolder } = JSON.parse(
+          folderExtractRes.choices[0].message.content
+        );
+        if (!bulkFolder) bulkFolder = lastMentionedFolder;
+        console.log("[email-to-drive bulk] folder:", bulkFolder, "cached emails:", lastEmailSearchResults.length);
+
+        if (!bulkFolder) {
+          return Response.json({
+            reply: `Which folder should I save those ${lastEmailSearchResults.length} attachment(s) to?`,
+          });
+        }
+
+        const folderLookup = await resolveOrCreateFolder(bulkFolder);
+        if (!folderLookup.folderId) {
+          return Response.json({
+            reply: `I couldn't access the "${bulkFolder}" folder: ${folderLookup.error || "unknown error"}`,
+          });
+        }
+
+        const results = await Promise.all(
+          lastEmailSearchResults.map(async (email) => {
+            const attachment = email.attachments[0];
+            try {
+              const res = await fetch(`${BASE_URL}/api/drive/email-to-drive`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  emailId: email.id,
+                  attachmentId: attachment.attachmentId,
+                  fileName: null,
+                  folderId: folderLookup.folderId,
+                }),
+              });
+              const data = await res.json();
+              return {
+                email,
+                attachment,
+                success: data.success === true && !!data.fileId,
+                name: data.name,
+                link: data.link,
+                error: data.error,
+              };
+            } catch (e) {
+              return { email, attachment, success: false, error: e.message };
+            }
+          })
+        );
+
+        const successes = results.filter((r) => r.success);
+        const failures = results.filter((r) => !r.success);
+        console.log("[email-to-drive bulk] saved:", successes.length, "failed:", failures.length);
+
+        if (successes.length === 0) {
+          const firstErr = failures[0]?.error || "unknown error";
+          return Response.json({
+            reply: `I couldn't save any of those attachments. Error: ${firstErr}`,
+          });
+        }
+
+        lastMentionedFolder = bulkFolder;
+
+        try {
+          await insertMemoryWithCap(
+            `[LOG] Bulk-saved ${successes.length} attachment(s) to "${bulkFolder}"${folderLookup.created ? " (folder just created)" : ""} on ${today}`
+          );
+        } catch (e) { console.log("[email-to-drive bulk] memory log failed:", e.message); }
+
+        const lines = successes.map((r) => `• "${r.name}" — ${r.link}`).join("\n");
+        const failNote =
+          failures.length > 0
+            ? `\n\n${failures.length} failed: ${failures.map((f) => f.attachment?.filename || "?").join(", ")}.`
+            : "";
+        const lead = folderLookup.created
+          ? `Created "${bulkFolder}" folder and saved ${successes.length} attachment(s) to it:`
+          : `Saved ${successes.length} attachment(s) to ${bulkFolder}:`;
+        return Response.json({ reply: `${lead}\n\n${lines}${failNote}` });
+      }
+
       if (isSaveApproval) {
       const lastAssistant = lastAssistantForSave;
       const markerMatch = lastAssistant?.content?.match(SAVE_MARKER_RE);
@@ -1881,6 +2016,8 @@ If the message has no email, set shareEmail to null.`,
           reply: "The upload failed - I can't find it in Drive. Want me to try again?",
         });
       }
+
+      lastMentionedFolder = folderName;
 
       try {
         await insertMemoryWithCap(
@@ -1953,6 +2090,8 @@ If the message has no email, set shareEmail to null.`,
                 reply: "The upload failed - I can't find it in Drive. Want me to try again?",
               });
             }
+
+            lastMentionedFolder = disambigState.folder;
 
             try {
               await insertMemoryWithCap(
@@ -2159,6 +2298,8 @@ Examples:
               : "The upload failed - I can't find it in Drive. Want me to try again?",
           });
         }
+
+        lastMentionedFolder = targetFolderName;
 
         try {
           await insertMemoryWithCap(

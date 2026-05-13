@@ -862,9 +862,10 @@ async function extractQuoteDetails(message) {
     messages: [
       {
         role: "system",
-        content: `Extract roof quote details. Return JSON:
-{"customerName": "full name or null", "customerEmail": "email or null", "customerAddress": "full address or null", "roofMaterial": "Tile" | "Shingle" | "Flat" | null, "notes": "any notes or null"}
-Only Tile/Shingle/Flat for roofMaterial. If unclear, null.`,
+        content: `Extract roof quote details for a T&K Roofing quote request. Return JSON:
+{"customerName": "full name or null", "customerEmail": "email or null", "customerAddress": "full address or null", "roofMaterial": "Tile" | "Shingle" | "Flat" | null, "scope": "scope of work like 'detach and reset 24 panels' or 'remove and reinstall' or null", "commission": "any dollar amount or percentage Brad mentioned for commission or null", "notes": "any other notes Brad gave that aren't scope or commission, or null"}
+Only Tile/Shingle/Flat for roofMaterial. If unclear, null.
+Scope captures the physical work being quoted (panel counts, detach/reset, remove/reinstall). Commission captures Brad's cut. Both end up in the form's special-notes field.`,
       },
       { role: "user", content: message },
     ],
@@ -1276,16 +1277,20 @@ export async function POST(req) {
       // Neither approval nor denial: drop the stale pending action and continue.
     }
 
-    // Quote routing is a hard pre-check, not classifier-driven: the AI classifier
-    // was over-triggering on stray mentions of "tile" / addresses. Require an
-    // address plus either the word "quote" or a scope phrase ("detach and reset",
-    // "remove and reinstall") that only shows up in T&K quote requests. Roof
-    // material is NOT required — the handler asks for it if missing.
+    // Quote routing is a hard pre-check, not classifier-driven: the classifier
+    // has no "quote" intent, so a bare "send a roof quote to T&K" would otherwise
+    // route to email_send and draft an email — exactly what we want to avoid.
+    // Strong signals (roof quote / quote+T&K / scope phrases) route direct.
+    // The bare word "quote" still requires an address as a disambiguator.
     const hasAddress = /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
-    const hasQuoteSignal =
-      /\bquote\b/i.test(message) ||
-      /\b(detach and reset|remove and reinstall)\b/i.test(message);
-    const isQuoteRequest = hasQuoteSignal && hasAddress;
+    const isRoofQuoteRequest = /\broof quote\b/i.test(message);
+    const isTKQuoteRequest =
+      /\bquote\b/i.test(message) &&
+      /\b(t&k|tnk|tk roofing|t and k)\b/i.test(message);
+    const isScopeQuoteRequest = /\b(detach and reset|remove and reinstall)\b/i.test(message);
+    const isGenericQuoteWithAddress = /\bquote\b/i.test(message) && hasAddress;
+    const isQuoteRequest =
+      isRoofQuoteRequest || isTKQuoteRequest || isScopeQuoteRequest || isGenericQuoteWithAddress;
 
     let intent;
     if (isQuoteRequest) {
@@ -1583,11 +1588,21 @@ export async function POST(req) {
       const extracted = await extractQuoteDetails(message);
       console.log("[quote] extracted:", JSON.stringify(extracted));
 
-      if (!extracted.customerName || !extracted.customerAddress) {
+      const missing = [];
+      if (!extracted.customerName) missing.push("customer name");
+      if (!extracted.customerAddress) missing.push("address");
+      if (missing.length) {
         return Response.json({
-          reply: "I need the customer name and address to submit the quote.",
+          reply: `I need the ${missing.join(" and ")} to submit the quote.`,
         });
       }
+
+      // Form has no scope/commission fields — fold both into special notes.
+      const noteParts = [];
+      if (extracted.scope) noteParts.push(extracted.scope);
+      if (extracted.commission) noteParts.push(`Commission: ${extracted.commission}`);
+      if (extracted.notes) noteParts.push(extracted.notes);
+      const combinedNotes = noteParts.join(". ") || null;
 
       if (!extracted.roofMaterial) {
         return Response.json({
@@ -1598,13 +1613,22 @@ export async function POST(req) {
               customerName: extracted.customerName,
               customerEmail: extracted.customerEmail,
               customerAddress: extracted.customerAddress,
-              notes: extracted.notes,
+              notes: combinedNotes,
             },
           },
         });
       }
 
-      return submitQuoteAndReply(extracted, today);
+      return submitQuoteAndReply(
+        {
+          customerName: extracted.customerName,
+          customerEmail: extracted.customerEmail,
+          customerAddress: extracted.customerAddress,
+          roofMaterial: extracted.roofMaterial,
+          notes: combinedNotes,
+        },
+        today
+      );
     }
 
     // DRIVE SEARCH

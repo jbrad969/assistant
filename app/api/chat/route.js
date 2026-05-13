@@ -94,7 +94,7 @@ Intents:
 - "email_approve" - Brad is approving a draft email shown in the previous assistant message (e.g. "yes send it", "send", "yes" when the prior turn shows To:/Subject:/Body:)
 - "email_to_drive" - save an email attachment to a Google Drive folder in one shot (e.g., "Save the May 1 T&K attachment to Roof Quotes", "Upload Nicholas's attachment to Receipts")
 - "calendar_read" - check schedule/calendar
-- "calendar_write" - add/move/delete calendar events
+- "calendar_write" - add a NEW event, OR move/delete an EXISTING event. "add appointment", "add to my calendar", "schedule a meeting", "book X", "create an event", "put X on my calendar" are all CREATE actions (a new event), NOT updates to an existing event.
 - "drive_search" - find files in Google Drive
 - "drive_create" - create a new folder in Drive
 - "drive_move" - move a file/folder in Drive to a different folder
@@ -131,6 +131,7 @@ CRITICAL routing rules:
 - "find" / "search" / "get" about inbox content → email_read; about files → drive_search
 - "put it back" / "move it back" → drive_revert (NOT drive_move — we don't know where it came from)
 - "move my meeting to Friday" → calendar_write (NOT drive_move — "meeting" is a calendar word)
+- "add Catherine Rocksloh - Mini Split Repair tomorrow at noon" / "schedule a meeting Friday 3pm" / "put a service call on my calendar Tuesday" → calendar_write (CREATE a new event — NEVER classify these as an update to an existing event)
 - searchTerm extraction: when Brad says "T&K Roofing" or "TK Roofing", search for "tnkroofing" because that's the email domain. Extract the most likely Gmail search query, not just the name Brad said.
 
 Context from recent conversation:
@@ -654,9 +655,10 @@ If the conversation already establishes time/topic for the reminder, reuse them 
   return JSON.parse(result.choices[0].message.content);
 }
 
-// Build a structured calendar action (update or delete) from Brad's free-text request.
-// `events` is the list of events on his calendar over the search window; the model must
-// pick one of their ids verbatim so we can act on it. Times are Phoenix-local (UTC-7, no DST).
+// Build a structured calendar action (create / update / delete) from Brad's free-text request.
+// `events` is the list of events on his calendar over the search window; for update/delete the
+// model must pick one of their ids verbatim. For create it should leave eventId null and fill
+// the create* fields instead. Times are Phoenix-local (UTC-7, no DST).
 async function extractCalendarAction(message, events, history) {
   const context = history.slice(-5).map((m) => `${m.role}: ${m.content}`).join("\n");
   const eventList = events
@@ -669,6 +671,9 @@ async function extractCalendarAction(message, events, history) {
     })
     .join("\n");
   const todayIso = new Date().toISOString();
+  const todayLabel = new Date().toLocaleDateString("en-US", {
+    timeZone: TIMEZONE, weekday: "long", year: "numeric", month: "long", day: "numeric",
+  });
 
   const result = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -677,7 +682,7 @@ async function extractCalendarAction(message, events, history) {
       {
         role: "system",
         content: `Extract a structured calendar action from Brad's message.
-Today (UTC): ${todayIso}. Phoenix AZ is always UTC-7 (no DST).
+Today is ${todayLabel} (UTC: ${todayIso}). Phoenix AZ is always UTC-7 (no DST).
 
 Events on Brad's calendar (id | date time | title):
 ${eventList || "(no events in window)"}
@@ -687,21 +692,29 @@ ${context || "(none)"}
 
 Return JSON only:
 {
-  "action": "update" | "delete" | "unknown",
-  "eventId": "the id of the target event, exactly as shown above, or null",
-  "newDate": "YYYY-MM-DD or null",
-  "newTime": "HH:MM 24-hour Phoenix time, or null",
-  "newTitle": "string or null",
-  "newLocation": "string or null (use empty string to clear)",
+  "action": "create" | "update" | "delete" | "unknown",
+  "eventId": "the id of the target event, exactly as shown above, or null (always null for create)",
+  "newDate": "YYYY-MM-DD or null (update only)",
+  "newTime": "HH:MM 24-hour Phoenix time, or null (update only)",
+  "newTitle": "string or null (update only)",
+  "newLocation": "string or null (update only; empty string clears it)",
+  "createTitle": "string or null (create only)",
+  "createDate": "YYYY-MM-DD or null (create only)",
+  "createTime": "HH:MM 24-hour Phoenix time, or null (create only)",
+  "createLocation": "string or null (create only)",
+  "createDuration": "integer minutes, default 60 (create only)",
   "error": "string explaining ambiguity, or null"
 }
 
 Rules:
-- eventId MUST exactly match one of the ids above. If you can't pick one with confidence, set action="unknown", eventId=null, and explain in error.
+- "add" / "schedule" / "book" / "create" / "put on my calendar" / "add appointment" / "add to my calendar" → action="create". eventId stays null. Fill the create* fields from the message. DO NOT pick an existing event to update — this is a brand new event.
 - "cancel" / "delete" / "remove" → action="delete".
-- "move" / "reschedule" / "push" / "shift" → action="update".
+- "move" / "reschedule" / "push" / "shift" / "change time" → action="update".
+- For update/delete: eventId MUST exactly match one of the ids above. If you can't pick one with confidence, set action="unknown", eventId=null, and explain in error.
 - All times Brad mentions are Phoenix local — output them as HH:MM 24-hour, do NOT convert to UTC.
-- If Brad only changes the time, leave newDate null (keep current date). Same for time.
+- For update, if Brad only changes the time, leave newDate null (keep current date). Same for time.
+- For create, default createDuration to 60 if Brad doesn't say. Pull createLocation from the message if present (e.g. an address).
+- Resolve relative dates ("tomorrow", "Thursday", "next Tuesday") against today's date shown above.
 - If multiple events could match the description, pick the soonest upcoming one and flag the ambiguity in error.`,
       },
       { role: "user", content: message },
@@ -802,6 +815,39 @@ async function executeCalendarDelete(pa) {
     return { ok: false, error: "delete sent but event still appears on the calendar" };
   }
   return { ok: true };
+}
+
+// Execute a confirmed calendar create via POST + verify the new event reads back.
+async function executeCalendarCreate(pa) {
+  const duration = Number(pa.duration) || 60;
+  const res = await fetch(`${BASE_URL}/api/calendar/today`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: pa.title,
+      start: { date: pa.date, time: pa.time },
+      durationMinutes: duration,
+      location: pa.location || undefined,
+    }),
+  });
+  const data = await res.json();
+  console.log("Calendar create result:", JSON.stringify(data));
+  if (!res.ok || data.error || !data.eventId) {
+    return { ok: false, error: data.error || "create failed" };
+  }
+
+  let verifyData;
+  try {
+    const verifyRes = await fetch(`${BASE_URL}/api/calendar/today?days=30`);
+    verifyData = await verifyRes.json();
+  } catch (e) {
+    return { ok: false, error: `create sent but verify fetch failed: ${e.message}` };
+  }
+  const created = (verifyData?.events || []).find((e) => e.id === data.eventId);
+  if (!created) {
+    return { ok: false, error: "create sent but event not found on re-fetch" };
+  }
+  return { ok: true, event: created };
 }
 
 async function extractQuoteDetails(message) {
@@ -1153,6 +1199,22 @@ export async function POST(req) {
           }
           return Response.json({
             reply: `Done — deleted "${pendingAction.eventTitle || "the event"}".`,
+            pendingAction: null,
+          });
+        }
+
+        if (pendingAction.type === "calendar_create") {
+          const result = await executeCalendarCreate(pendingAction);
+          if (!result.ok) {
+            return Response.json({
+              reply: "Calendar create failed: " + result.error,
+              pendingAction: null,
+            });
+          }
+          const ev = result.event;
+          const dayLabel = formatDateLabel(new Date(ev.start));
+          return Response.json({
+            reply: `Done — added "${ev.title}" at ${ev.time} on ${dayLabel}.`,
             pendingAction: null,
           });
         }
@@ -2068,7 +2130,7 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
-    // CALENDAR WRITE (move / reschedule / delete event)
+    // CALENDAR WRITE (create / move / reschedule / delete event)
     // Extract a structured action, return a pendingAction the client passes back
     // on approval. Execution + verification happen in the pending-action handoff
     // block at the top of POST.
@@ -2080,12 +2142,37 @@ If the message has no email, set shareEmail to null.`,
         return Response.json({ reply: "I couldn't reach your calendar to look up the event: " + cwData.error });
       }
       const cwEvents = cwData.events || [];
-      if (cwEvents.length === 0) {
-        return Response.json({ reply: "I don't see any upcoming events on your calendar in the next 14 days to change." });
-      }
 
       const action = await extractCalendarAction(message, cwEvents, history);
       console.log("[calendar write] extracted action:", JSON.stringify(action));
+
+      if (action.action === "create") {
+        if (!action.createTitle || !action.createDate || !action.createTime) {
+          return Response.json({
+            reply: action.error || "What's the title, date, and time for the new event?",
+          });
+        }
+        const duration = Number(action.createDuration) || 60;
+        const location = action.createLocation || null;
+        const whenLabel = formatPhoenixDateTime(action.createDate, action.createTime);
+        const locBit = location ? ` at ${location}` : "";
+        return Response.json({
+          reply: `I'll add "${action.createTitle}" on ${whenLabel}${locBit}. Confirm?`,
+          pendingAction: {
+            type: "calendar_create",
+            title: action.createTitle,
+            date: action.createDate,
+            time: action.createTime,
+            location,
+            duration,
+          },
+        });
+      }
+
+      // Update / delete need an existing event to target.
+      if (cwEvents.length === 0) {
+        return Response.json({ reply: "I don't see any upcoming events on your calendar in the next 14 days to change." });
+      }
 
       if (action.action === "unknown" || !action.eventId) {
         return Response.json({

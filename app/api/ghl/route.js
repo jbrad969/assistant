@@ -26,14 +26,6 @@ async function ghlFetch(path, init = {}) {
 }
 
 const GET_ACTIONS = {
-  search_contact: ({ query }) => {
-    const qs = new URLSearchParams({
-      locationId: LOCATION_ID,
-      query: query || "",
-      limit: "10",
-    });
-    return ghlFetch(`/contacts/search?${qs}`);
-  },
   get_contact: ({ contactId }) => {
     if (!contactId) throw new Error("contactId is required");
     return ghlFetch(`/contacts/${contactId}`);
@@ -53,6 +45,18 @@ const GET_ACTIONS = {
 };
 
 const POST_ACTIONS = {
+  // GHL v2 search is POST-only; sending GET to /contacts/search gets matched
+  // to /contacts/{id} with id="search" → "Contact with id search not found".
+  search_contact: ({ query }) => {
+    return ghlFetch(`/contacts/search`, {
+      method: "POST",
+      body: JSON.stringify({
+        locationId: LOCATION_ID,
+        query: query || "",
+        limit: 10,
+      }),
+    });
+  },
   add_note: ({ contactId, body }) => {
     if (!contactId || !body) throw new Error("contactId and body are required");
     return ghlFetch(`/contacts/${contactId}/notes`, {

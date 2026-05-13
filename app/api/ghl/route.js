@@ -1,66 +1,114 @@
-const GHL_BASE = "https://rest.gohighlevel.com/v1";
+const GHL_BASE = "https://services.leadconnectorhq.com";
+const LOCATION_ID = process.env.GHL_LOCATION_ID;
+const headers = {
+  "Authorization": `Bearer ${process.env.GHL_API_KEY}`,
+  "Content-Type": "application/json",
+  "Version": "2021-07-28",
+};
 
 async function ghlFetch(path, init = {}) {
   const res = await fetch(`${GHL_BASE}${path}`, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GHL_API_KEY}`,
-      ...(init.headers || {}),
-    },
+    headers: { ...headers, ...(init.headers || {}) },
   });
   const text = await res.text();
-  let body;
+  let data;
   try {
-    body = text ? JSON.parse(text) : {};
+    data = text ? JSON.parse(text) : {};
   } catch {
-    body = { raw: text };
+    data = { raw: text };
   }
   if (!res.ok) {
-    const detail = body.message || body.error || text || "unknown";
+    const detail = data.message || data.error || text || "unknown";
     throw new Error(`GHL ${res.status}: ${detail}`);
   }
-  return body;
+  return data;
 }
 
-const ACTIONS = {
-  GOHIGHLEVEL_SEARCH_CONTACTS: ({ query }) => {
-    const qs = new URLSearchParams({ query: query || "" });
-    return ghlFetch(`/contacts/?${qs}`);
+const GET_ACTIONS = {
+  search_contact: ({ query }) => {
+    const qs = new URLSearchParams({
+      locationId: LOCATION_ID,
+      query: query || "",
+      limit: "10",
+    });
+    return ghlFetch(`/contacts/search?${qs}`);
   },
-  GOHIGHLEVEL_GET_CONTACT: ({ contactId }) => {
+  get_contact: ({ contactId }) => {
     if (!contactId) throw new Error("contactId is required");
     return ghlFetch(`/contacts/${contactId}`);
   },
-  GOHIGHLEVEL_CREATE_NOTE: ({ contactId, body }) => {
+  list_contacts: () => {
+    const qs = new URLSearchParams({ locationId: LOCATION_ID, limit: "10" });
+    return ghlFetch(`/contacts/?${qs}`);
+  },
+  list_opportunities: () => {
+    const qs = new URLSearchParams({ location_id: LOCATION_ID, limit: "10" });
+    return ghlFetch(`/opportunities/search?${qs}`);
+  },
+  list_pipelines: () => {
+    const qs = new URLSearchParams({ locationId: LOCATION_ID });
+    return ghlFetch(`/opportunities/pipelines?${qs}`);
+  },
+};
+
+const POST_ACTIONS = {
+  add_note: ({ contactId, body }) => {
     if (!contactId || !body) throw new Error("contactId and body are required");
-    return ghlFetch(`/contacts/${contactId}/notes/`, {
+    return ghlFetch(`/contacts/${contactId}/notes`, {
       method: "POST",
       body: JSON.stringify({ body }),
     });
   },
-  GOHIGHLEVEL_CREATE_OPPORTUNITY: ({ name, contactId, pipelineId, status }) => {
-    if (!name || !contactId || !pipelineId) {
-      throw new Error("name, contactId, and pipelineId are required");
+  create_opportunity: ({ contactId, name, pipelineId, pipelineStageId, status }) => {
+    if (!contactId || !name || !pipelineId || !pipelineStageId) {
+      throw new Error(
+        "contactId, name, pipelineId, and pipelineStageId are required"
+      );
     }
-    return ghlFetch(`/pipelines/${pipelineId}/opportunities/`, {
+    return ghlFetch(`/opportunities/`, {
       method: "POST",
       body: JSON.stringify({
-        title: name,
+        locationId: LOCATION_ID,
         contactId,
+        name,
+        pipelineId,
+        pipelineStageId,
         status: status || "open",
       }),
     });
   },
-  GOHIGHLEVEL_SEND_SMS: ({ contactId, message }) => {
+  send_sms: ({ contactId, message }) => {
     if (!contactId || !message) throw new Error("contactId and message are required");
-    return ghlFetch(`/conversations/messages`, {
+    return ghlFetch(`/conversations/messages/outbound`, {
+      method: "POST",
+      body: JSON.stringify({ type: "SMS", contactId, message }),
+    });
+  },
+  create_contact: ({ firstName, lastName, email, phone }) => {
+    return ghlFetch(`/contacts/`, {
       method: "POST",
       body: JSON.stringify({
-        type: "SMS",
-        contactId,
-        message,
+        locationId: LOCATION_ID,
+        firstName,
+        lastName,
+        email,
+        phone,
       }),
+    });
+  },
+  update_contact: ({ contactId, fields }) => {
+    if (!contactId || !fields) throw new Error("contactId and fields are required");
+    return ghlFetch(`/contacts/${contactId}`, {
+      method: "PUT",
+      body: JSON.stringify(fields),
+    });
+  },
+  create_task: ({ contactId, title, dueDate }) => {
+    if (!contactId || !title) throw new Error("contactId and title are required");
+    return ghlFetch(`/contacts/${contactId}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ title, dueDate }),
     });
   },
 };
@@ -68,16 +116,17 @@ const ACTIONS = {
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
-    const action = searchParams.get("action") || "list";
-    if (action === "list") {
-      return Response.json({
-        tools: Object.keys(ACTIONS).map((name) => ({
-          name,
-          description: `GHL action: ${name}`,
-        })),
-      });
+    const action = searchParams.get("action");
+    const handler = GET_ACTIONS[action];
+    if (!handler) {
+      return Response.json(
+        { success: false, error: `Unknown GET action: ${action}` },
+        { status: 400 }
+      );
     }
-    return Response.json({ error: "Unknown GET action" }, { status: 400 });
+    const params = Object.fromEntries(searchParams.entries());
+    const data = await handler(params);
+    return Response.json({ success: true, data });
   } catch (error) {
     console.log("GHL GET error:", error.message);
     return Response.json({ success: false, error: error.message }, { status: 500 });
@@ -87,15 +136,15 @@ export async function GET(req) {
 export async function POST(req) {
   try {
     const { action, params } = await req.json();
-    const handler = ACTIONS[action];
+    const handler = POST_ACTIONS[action];
     if (!handler) {
       return Response.json(
-        { success: false, error: `Unsupported action: ${action}` },
+        { success: false, error: `Unknown POST action: ${action}` },
         { status: 400 }
       );
     }
     const data = await handler(params || {});
-    console.log("GHL action:", action, "result:", JSON.stringify(data).slice(0, 500));
+    console.log("GHL POST", action, "→", JSON.stringify(data).slice(0, 500));
     return Response.json({ success: true, data });
   } catch (error) {
     console.log("GHL POST error:", error.message);

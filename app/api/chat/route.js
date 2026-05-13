@@ -654,6 +654,156 @@ If the conversation already establishes time/topic for the reminder, reuse them 
   return JSON.parse(result.choices[0].message.content);
 }
 
+// Build a structured calendar action (update or delete) from Brad's free-text request.
+// `events` is the list of events on his calendar over the search window; the model must
+// pick one of their ids verbatim so we can act on it. Times are Phoenix-local (UTC-7, no DST).
+async function extractCalendarAction(message, events, history) {
+  const context = history.slice(-5).map((m) => `${m.role}: ${m.content}`).join("\n");
+  const eventList = events
+    .map((e) => {
+      const date = new Date(e.start).toLocaleDateString("en-US", {
+        weekday: "long", month: "short", day: "numeric", timeZone: TIMEZONE,
+      });
+      const loc = e.location ? ` @ ${e.location}` : "";
+      return `id=${e.id} | ${date} ${e.time} | ${e.title}${loc}`;
+    })
+    .join("\n");
+  const todayIso = new Date().toISOString();
+
+  const result = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `Extract a structured calendar action from Brad's message.
+Today (UTC): ${todayIso}. Phoenix AZ is always UTC-7 (no DST).
+
+Events on Brad's calendar (id | date time | title):
+${eventList || "(no events in window)"}
+
+Conversation context (last 5 turns):
+${context || "(none)"}
+
+Return JSON only:
+{
+  "action": "update" | "delete" | "unknown",
+  "eventId": "the id of the target event, exactly as shown above, or null",
+  "newDate": "YYYY-MM-DD or null",
+  "newTime": "HH:MM 24-hour Phoenix time, or null",
+  "newTitle": "string or null",
+  "newLocation": "string or null (use empty string to clear)",
+  "error": "string explaining ambiguity, or null"
+}
+
+Rules:
+- eventId MUST exactly match one of the ids above. If you can't pick one with confidence, set action="unknown", eventId=null, and explain in error.
+- "cancel" / "delete" / "remove" → action="delete".
+- "move" / "reschedule" / "push" / "shift" → action="update".
+- All times Brad mentions are Phoenix local — output them as HH:MM 24-hour, do NOT convert to UTC.
+- If Brad only changes the time, leave newDate null (keep current date). Same for time.
+- If multiple events could match the description, pick the soonest upcoming one and flag the ambiguity in error.`,
+      },
+      { role: "user", content: message },
+    ],
+  });
+
+  try {
+    return JSON.parse(result.choices[0].message.content);
+  } catch (e) {
+    console.log("[extractCalendarAction] JSON parse failed:", e.message);
+    return { action: "unknown", eventId: null, error: "couldn't parse action" };
+  }
+}
+
+// "YYYY-MM-DD" + "HH:MM" -> Phoenix-local pretty string, e.g. "Wed, May 13, 8:30 AM".
+function formatPhoenixDateTime(date, time) {
+  const d = new Date(`${date}T${time}:00-07:00`);
+  return d.toLocaleString("en-US", {
+    weekday: "short", month: "short", day: "numeric",
+    hour: "numeric", minute: "2-digit", timeZone: TIMEZONE,
+  });
+}
+
+// Extract { date: "YYYY-MM-DD", time: "HH:MM" } in Phoenix tz from any ISO string.
+function phoenixDateTimePartsFromIso(iso) {
+  const d = new Date(iso);
+  const date = new Intl.DateTimeFormat("en-CA", {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone: TIMEZONE,
+  }).format(d);
+  // en-GB hour:minute in 24-hour with no AM/PM
+  const time = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit", minute: "2-digit", hour12: false, timeZone: TIMEZONE,
+  }).format(d);
+  return { date, time };
+}
+
+// Execute a confirmed calendar update via PATCH + verify by re-fetching.
+async function executeCalendarUpdate(pa) {
+  const oldStartMs = new Date(pa.originalStart).getTime();
+  const oldEndMs = new Date(pa.originalEnd).getTime();
+  const durationMinutes = Math.max(1, Math.round((oldEndMs - oldStartMs) / 60000));
+
+  const oldParts = phoenixDateTimePartsFromIso(pa.originalStart);
+  const newDate = pa.changes?.newDate || oldParts.date;
+  const newTime = pa.changes?.newTime || oldParts.time;
+
+  const updates = {
+    start: { date: newDate, time: newTime },
+    durationMinutes,
+  };
+  if (pa.changes?.newTitle) updates.title = pa.changes.newTitle;
+  if (pa.changes?.newLocation !== null && pa.changes?.newLocation !== undefined) {
+    updates.location = pa.changes.newLocation;
+  }
+
+  const result = await updateCalendarEvent(pa.eventId, updates);
+  if (!result.success) {
+    return { ok: false, error: result.error || "update failed" };
+  }
+
+  // Verify: re-fetch a wide window and confirm the event now reads back at the new time.
+  let verifyData;
+  try {
+    const verifyRes = await fetch(`${BASE_URL}/api/calendar/today?days=30`);
+    verifyData = await verifyRes.json();
+  } catch (e) {
+    return { ok: false, error: `update sent but verify fetch failed: ${e.message}` };
+  }
+  const updated = (verifyData?.events || []).find((e) => e.id === pa.eventId);
+  if (!updated) {
+    return { ok: false, error: "update sent but event not found on re-fetch" };
+  }
+  const verifyParts = phoenixDateTimePartsFromIso(updated.start);
+  if (verifyParts.date !== newDate || verifyParts.time !== newTime) {
+    return {
+      ok: false,
+      error: `update sent but calendar now shows ${verifyParts.date} ${verifyParts.time}, expected ${newDate} ${newTime}`,
+    };
+  }
+  return { ok: true, event: updated };
+}
+
+// Execute a confirmed calendar delete via DELETE + verify the event is gone.
+async function executeCalendarDelete(pa) {
+  const result = await deleteCalendarEvent(pa.eventId);
+  if (!result.success) {
+    return { ok: false, error: result.error || "delete failed" };
+  }
+  let verifyData;
+  try {
+    const verifyRes = await fetch(`${BASE_URL}/api/calendar/today?days=30`);
+    verifyData = await verifyRes.json();
+  } catch (e) {
+    return { ok: false, error: `delete sent but verify fetch failed: ${e.message}` };
+  }
+  const stillThere = (verifyData?.events || []).some((e) => e.id === pa.eventId);
+  if (stillThere) {
+    return { ok: false, error: "delete sent but event still appears on the calendar" };
+  }
+  return { ok: true };
+}
+
 async function extractQuoteDetails(message) {
   const result = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -955,6 +1105,61 @@ export async function POST(req) {
 
     const msg = message.toLowerCase();
 
+    // PENDING ACTION HANDOFF — runs before intent classification.
+    // If the client sent back a pendingAction from the previous turn, this
+    // turn is Brad's response to it. Approve → execute + verify. Deny → cancel.
+    // Anything else → drop the pending action and fall through to normal
+    // routing (responses below don't carry pendingAction, so the client clears it).
+    if (pendingAction && pendingAction.type) {
+      const trimmedMsg = msg.trim().replace(/[.!?]+$/, "");
+      const APPROVAL = [
+        "yes", "yep", "yeah", "yes do it", "do it", "confirm", "go", "go ahead",
+        "ok", "okay", "ok do it", "okay do it", "looks good", "send it",
+      ];
+      const DENIAL = [
+        "no", "nope", "cancel", "nevermind", "never mind", "stop", "don't", "do not", "abort",
+      ];
+      const isApproval = APPROVAL.some((p) => trimmedMsg === p || trimmedMsg.startsWith(p + " "));
+      const isDenial = DENIAL.some((p) => trimmedMsg === p || trimmedMsg.startsWith(p + " "));
+
+      if (isDenial) {
+        return Response.json({ reply: "Cancelled.", pendingAction: null });
+      }
+
+      if (isApproval) {
+        if (pendingAction.type === "calendar_update") {
+          const result = await executeCalendarUpdate(pendingAction);
+          if (!result.ok) {
+            return Response.json({
+              reply: "Calendar update failed: " + result.error,
+              pendingAction: null,
+            });
+          }
+          const ev = result.event;
+          const dayLabel = formatDateLabel(new Date(ev.start));
+          return Response.json({
+            reply: `Done — "${ev.title}" is now ${ev.time} on ${dayLabel}.`,
+            pendingAction: null,
+          });
+        }
+
+        if (pendingAction.type === "calendar_delete") {
+          const result = await executeCalendarDelete(pendingAction);
+          if (!result.ok) {
+            return Response.json({
+              reply: "Calendar delete failed: " + result.error,
+              pendingAction: null,
+            });
+          }
+          return Response.json({
+            reply: `Done — deleted "${pendingAction.eventTitle || "the event"}".`,
+            pendingAction: null,
+          });
+        }
+      }
+      // Neither approval nor denial: drop the stale pending action and continue.
+    }
+
     // Quote routing is a hard pre-check, not classifier-driven: the AI classifier
     // was over-triggering on stray mentions of "tile" / addresses. Require all three
     // signals literally in the message.
@@ -975,8 +1180,21 @@ export async function POST(req) {
     // DELETE REMINDERS
     case "reminder_delete": {
       const result = await deleteAllReminders();
-      if (result.success) return Response.json({ reply: "Done — all reminders deleted." });
-      return Response.json({ reply: "I had trouble deleting reminders: " + (result.error || "unknown") });
+      if (!result.success) {
+        return Response.json({ reply: "I had trouble deleting reminders: " + (result.error || "unknown") });
+      }
+      // The DELETE endpoint returns `remaining` — only claim Done if zero rows are left.
+      if (typeof result.remaining === "number" && result.remaining > 0) {
+        return Response.json({
+          reply: `I tried to delete reminders but ${result.remaining} are still there. Try again.`,
+        });
+      }
+      const deleted = typeof result.deleted === "number" ? result.deleted : null;
+      return Response.json({
+        reply: deleted === 0
+          ? "No reminders to delete."
+          : `Done — ${deleted ?? "all"} reminder${deleted === 1 ? "" : "s"} deleted.`,
+      });
     }
 
     // CHECK REMINDERS
@@ -1213,14 +1431,16 @@ export async function POST(req) {
         const result = await sendEmail(draft.to, draft.subject, draft.body);
         console.log("EMAIL SEND RESULT:", JSON.stringify(result));
 
-        if (result?.success === true) {
+        // Gmail's send returns a message id on success — require it before claiming sent.
+        const gmailId = typeof result?.id === "string" ? result.id.trim() : "";
+        if (result?.success === true && gmailId.length > 0) {
           try {
-            await insertMemoryWithCap(`[LOG] Sent email to ${draft.to} on ${today}: ${draft.subject}`);
+            await insertMemoryWithCap(`[LOG] Sent email to ${draft.to} on ${today}: ${draft.subject} (gmail id ${gmailId})`);
           } catch (e) { console.log("[email send] couldn't log memory:", e.message); }
           return Response.json({ reply: `Email sent to ${draft.to}.` });
         }
         return Response.json({
-          reply: "I couldn't send that email: " + (result?.error || "unknown error"),
+          reply: "I couldn't send that email: " + (result?.error || (result?.success ? "no Gmail message id returned" : "unknown error")),
         });
       }
 
@@ -1848,20 +2068,84 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
-    // CALENDAR WRITE
+    // CALENDAR WRITE (move / reschedule / delete event)
+    // Extract a structured action, return a pendingAction the client passes back
+    // on approval. Execution + verification happen in the pending-action handoff
+    // block at the top of POST.
     case "calendar_write": {
-      const response = await anthropic.messages.create({
-        model: CLAUDE_MODEL,
-        max_tokens: 1024,
-        system:
-          buildSystemPrompt(today, memoryText) +
-          "\n\nWhen moving or updating a calendar event, always show what you're about to do and ask Brad to confirm with 'yes do it' before making changes.",
-        messages: [
-          ...history.map((m) => ({ role: m.role, content: m.content })),
-          { role: "user", content: message },
-        ],
-      });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
+      const cwParams = new URLSearchParams({ days: "14" });
+      const cwRes = await fetch(`${BASE_URL}/api/calendar/today?${cwParams.toString()}`);
+      const cwData = await cwRes.json();
+      if (cwData?.error) {
+        return Response.json({ reply: "I couldn't reach your calendar to look up the event: " + cwData.error });
+      }
+      const cwEvents = cwData.events || [];
+      if (cwEvents.length === 0) {
+        return Response.json({ reply: "I don't see any upcoming events on your calendar in the next 14 days to change." });
+      }
+
+      const action = await extractCalendarAction(message, cwEvents, history);
+      console.log("[calendar write] extracted action:", JSON.stringify(action));
+
+      if (action.action === "unknown" || !action.eventId) {
+        return Response.json({
+          reply: action.error || "I'm not sure which event you want to change. Which event, and what should I do with it?",
+        });
+      }
+
+      const target = cwEvents.find((e) => e.id === action.eventId);
+      if (!target) {
+        return Response.json({ reply: "I couldn't match that to an event on your calendar — try naming it more specifically." });
+      }
+
+      const dayLabel = formatDateLabel(new Date(target.start));
+
+      if (action.action === "delete") {
+        return Response.json({
+          reply: `I'll delete "${target.title}" on ${dayLabel} at ${target.time}. Confirm?`,
+          pendingAction: {
+            type: "calendar_delete",
+            eventId: target.id,
+            eventTitle: target.title,
+          },
+        });
+      }
+
+      if (action.action === "update") {
+        const oldParts = phoenixDateTimePartsFromIso(target.start);
+        const newDate = action.newDate || oldParts.date;
+        const newTime = action.newTime || oldParts.time;
+        const movedTime = !!(action.newDate || action.newTime);
+
+        const changeBits = [];
+        if (movedTime) changeBits.push(`to ${formatPhoenixDateTime(newDate, newTime)}`);
+        if (action.newTitle) changeBits.push(`title → "${action.newTitle}"`);
+        if (action.newLocation !== undefined && action.newLocation !== null) {
+          changeBits.push(action.newLocation ? `location → "${action.newLocation}"` : "clear location");
+        }
+        if (changeBits.length === 0) {
+          return Response.json({ reply: "I can see the event, but I don't know what you want to change. New time, title, or location?" });
+        }
+
+        return Response.json({
+          reply: `I'll update "${target.title}" (currently ${target.time} on ${dayLabel}) ${changeBits.join(", ")}. Confirm?`,
+          pendingAction: {
+            type: "calendar_update",
+            eventId: target.id,
+            eventTitle: target.title,
+            originalStart: target.start,
+            originalEnd: target.end,
+            changes: {
+              newDate: action.newDate || null,
+              newTime: action.newTime || null,
+              newTitle: action.newTitle || null,
+              newLocation: action.newLocation === undefined ? null : action.newLocation,
+            },
+          },
+        });
+      }
+
+      return Response.json({ reply: "I'm not sure what kind of calendar change you want. Move, cancel, or update?" });
     }
 
     // CALENDAR READ

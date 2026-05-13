@@ -576,6 +576,10 @@ export default function Page() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [showReplyChoice, setShowReplyChoice] = useState(false);
+  // Server may return a `pendingAction` (e.g. confirm a calendar move). We echo it
+  // back on the next request; the server consumes it on approve/deny and returns
+  // null in response, which clears the state below.
+  const [pendingAction, setPendingAction] = useState(null);
   const bottomRef = useRef(null);
   const recognitionRef = useRef(null);
   const voiceRef = useRef(null);
@@ -701,7 +705,7 @@ export default function Page() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userText, history: messages }),
+        body: JSON.stringify({ message: userText, history: messages, pendingAction }),
       });
 
       const contentType = response.headers.get("content-type") || "";
@@ -710,6 +714,9 @@ export default function Page() {
         // Streaming response: append a placeholder on the first delta, then
         // grow it as more deltas arrive. The thinking indicator stays visible
         // until the first delta so an empty bubble never flashes.
+        // Streamed replies are conversational and never carry a pendingAction,
+        // so clear any stale one to keep the client and server in sync.
+        setPendingAction(null);
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let fullText = "";
@@ -772,8 +779,13 @@ export default function Page() {
           ...prev,
           { role: "assistant", content: reply },
         ]);
+        // The server is the source of truth for pendingAction. Whatever it
+        // returns (including null/undefined) becomes the new client-side value,
+        // so stale confirmations can't linger across unrelated turns.
+        setPendingAction(data.pendingAction || null);
         speak(reply);
       }
+
 
       setShowReplyChoice(true);
       loadMemory();
@@ -1017,6 +1029,7 @@ export default function Page() {
               onClick={() => {
                 stopSpeaking();
                 setShowReplyChoice(false);
+                setPendingAction(null);
                 setMessages([{ role: "assistant", content: "Hey Brad — I'm Jess. What do you need?" }]);
               }}
             >

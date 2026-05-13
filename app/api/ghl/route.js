@@ -1,42 +1,36 @@
 import { Composio } from "composio-core";
+import { CloudflareToolSet } from "composio-core";
 
-const composio = new Composio({ apiKey: process.env.COMPOSIO_API_KEY });
+const composio = new Composio(process.env.COMPOSIO_API_KEY);
 
-export async function POST(req) {
+export async function GET(req) {
   try {
-    const { action, params } = await req.json();
-
-    const toolset = composio.getToolset();
-
-    const result = await toolset.executeAction({
-      action: action,
-      params: params,
-      entityId: "brad@solarfixaz.com",
+    const toolset = new CloudflareToolSet({ apiKey: process.env.COMPOSIO_API_KEY });
+    const tools = await toolset.getTools({ apps: ["gohighlevel"] });
+    return Response.json({
+      tools: tools.map((t) => ({ name: t.name, description: t.description })),
     });
-
-    return Response.json({ success: true, data: result });
   } catch (error) {
-    console.log("GHL error:", error.message);
+    console.log("GHL GET error:", error.message);
     return Response.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
-export async function GET(req) {
+export async function POST(req) {
   try {
-    const { searchParams } = new URL(req.url);
-    const action = searchParams.get("action") || "list";
+    const { action, params } = await req.json();
+    const toolset = new CloudflareToolSet({ apiKey: process.env.COMPOSIO_API_KEY });
 
-    const toolset = composio.getToolset();
+    const result = await toolset.executeAction(
+      action,
+      params,
+      "brad@solarfixaz.com"
+    );
 
-    if (action === "list") {
-      const tools = await toolset.getTools({ apps: ["gohighlevel"] });
-      return Response.json({
-        tools: tools.map((t) => ({ name: t.name, description: t.description })),
-      });
-    }
-
-    return Response.json({ error: "Unknown action" }, { status: 400 });
+    console.log("GHL action result:", JSON.stringify(result));
+    return Response.json({ success: true, data: result });
   } catch (error) {
+    console.log("GHL POST error:", error.message);
     return Response.json({ success: false, error: error.message }, { status: 500 });
   }
 }

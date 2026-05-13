@@ -53,7 +53,7 @@ const POST_ACTIONS = {
       body: JSON.stringify({
         locationId: LOCATION_ID,
         query: query || "",
-        limit: 10,
+        pageLimit: 10,
       }),
     });
   },

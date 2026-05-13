@@ -872,6 +872,33 @@ Only Tile/Shingle/Flat for roofMaterial. If unclear, null.`,
   return JSON.parse(result.choices[0].message.content);
 }
 
+async function submitQuoteAndReply(details, today) {
+  console.log("SUBMITTING QUOTE for:", details.customerName);
+  const res = await fetch(`${BASE_URL}/api/quote`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(details),
+  });
+  const data = await res.json();
+  console.log("QUOTE RESULT:", JSON.stringify(data));
+
+  if (data.success) {
+    try {
+      await insertMemoryWithCap(
+        `[LOG] Submitted T&K quote for ${details.customerName} at ${details.customerAddress} (${details.roofMaterial}) on ${today}`
+      );
+    } catch (e) { console.log("[quote] memory log failed:", e.message); }
+    return Response.json({
+      reply: `Quote submitted to T&K Roofing for ${details.customerName} at ${details.customerAddress}. Roof: ${details.roofMaterial}. They respond in 15-30 minutes.`,
+      pendingAction: null,
+    });
+  }
+  return Response.json({
+    reply: "Quote submission failed: " + (data.error || "unknown"),
+    pendingAction: null,
+  });
+}
+
 // Split Brad's one-shot save command into the two pieces the API route needs:
 // emailDescription (which email to find) and folderName (where to put it).
 // The API route handles further refinement via GPT — this just splits.
@@ -1148,8 +1175,14 @@ export async function POST(req) {
 
     // Memory housekeeping (always before any intent branch). Skip the GPT
     // extraction + re-fetch on trivial messages — saves ~30%+ of turns.
+    // Also skip when Brad is clearly invoking the quote action (or replying to
+    // the quote material follow-up), so the quote handler owns the turn.
+    const looksLikeQuoteAction =
+      /\bquote\b/i.test(message) ||
+      /\b(detach and reset|remove and reinstall)\b/i.test(message) ||
+      pendingAction?.type === "quote_material";
     const memory = await getMemory();
-    const skipMemory = shouldSkipMemoryExtraction(message);
+    const skipMemory = shouldSkipMemoryExtraction(message) || looksLikeQuoteAction;
     if (!skipMemory) await saveOrUpdateMemory(message, memory);
     const updatedMemory = skipMemory ? memory : await getMemory();
     const memoryText = updatedMemory.map((m) => `- ${m.content}`).join("\n");
@@ -1162,6 +1195,22 @@ export async function POST(req) {
     // Anything else → drop the pending action and fall through to normal
     // routing (responses below don't carry pendingAction, so the client clears it).
     if (pendingAction && pendingAction.type) {
+      // Quote material follow-up: Brad's reply IS the data, not approval. Match
+      // tile/shingle/flat anywhere in the message, merge with the stashed partial,
+      // and submit. If Brad didn't answer the material question, fall through.
+      if (pendingAction.type === "quote_material") {
+        const materialMatch = msg.match(/\b(tile|shingle|flat)\b/);
+        if (materialMatch && pendingAction.partial) {
+          const material =
+            materialMatch[1].charAt(0).toUpperCase() + materialMatch[1].slice(1);
+          return submitQuoteAndReply(
+            { ...pendingAction.partial, roofMaterial: material },
+            today
+          );
+        }
+        // Not a material answer — drop the pending and continue routing.
+      }
+
       const trimmedMsg = msg.trim().replace(/[.!?]+$/, "");
       const APPROVAL = [
         "yes", "yep", "yeah", "yes do it", "do it", "confirm", "go", "go ahead",
@@ -1228,12 +1277,15 @@ export async function POST(req) {
     }
 
     // Quote routing is a hard pre-check, not classifier-driven: the AI classifier
-    // was over-triggering on stray mentions of "tile" / addresses. Require all three
-    // signals literally in the message.
-    const isQuoteRequest =
-      /\bquote\b/i.test(message) &&
-      /\b(tile|shingle|flat)\b/i.test(message) &&
-      /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
+    // was over-triggering on stray mentions of "tile" / addresses. Require an
+    // address plus either the word "quote" or a scope phrase ("detach and reset",
+    // "remove and reinstall") that only shows up in T&K quote requests. Roof
+    // material is NOT required — the handler asks for it if missing.
+    const hasAddress = /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i.test(message);
+    const hasQuoteSignal =
+      /\bquote\b/i.test(message) ||
+      /\b(detach and reset|remove and reinstall)\b/i.test(message);
+    const isQuoteRequest = hasQuoteSignal && hasAddress;
 
     let intent;
     if (isQuoteRequest) {
@@ -1531,32 +1583,28 @@ export async function POST(req) {
       const extracted = await extractQuoteDetails(message);
       console.log("[quote] extracted:", JSON.stringify(extracted));
 
-      if (!extracted.customerName || !extracted.customerAddress || !extracted.roofMaterial) {
+      if (!extracted.customerName || !extracted.customerAddress) {
         return Response.json({
-          reply: "I need the customer name, address, and roof material (Tile, Shingle, or Flat) to submit the quote.",
+          reply: "I need the customer name and address to submit the quote.",
         });
       }
 
-      console.log("SUBMITTING QUOTE for:", extracted.customerName);
-      const res = await fetch(`${BASE_URL}/api/quote`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(extracted),
-      });
-      const data = await res.json();
-      console.log("QUOTE RESULT:", JSON.stringify(data));
-
-      if (data.success) {
-        try {
-          await insertMemoryWithCap(
-            `[LOG] Submitted T&K quote for ${extracted.customerName} at ${extracted.customerAddress} (${extracted.roofMaterial}) on ${today}`
-          );
-        } catch (e) { console.log("[quote] memory log failed:", e.message); }
+      if (!extracted.roofMaterial) {
         return Response.json({
-          reply: `Quote submitted to T&K Roofing for ${extracted.customerName} at ${extracted.customerAddress}. Roof: ${extracted.roofMaterial}. They respond in 15-30 minutes.`,
+          reply: "What's the roof material - Tile, Shingle, or Flat?",
+          pendingAction: {
+            type: "quote_material",
+            partial: {
+              customerName: extracted.customerName,
+              customerEmail: extracted.customerEmail,
+              customerAddress: extracted.customerAddress,
+              notes: extracted.notes,
+            },
+          },
         });
       }
-      return Response.json({ reply: "Quote submission failed: " + (data.error || "unknown") });
+
+      return submitQuoteAndReply(extracted, today);
     }
 
     // DRIVE SEARCH

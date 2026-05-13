@@ -294,13 +294,18 @@ function getNextDay(dayIndex) {
 
 function getDetectedDates(message) {
   const msg = message.toLowerCase();
-  const today = new Date();
+
+  // en-US locale renders as "M/D/YYYY" — destructure in that order.
+  const phoenixStr = new Date().toLocaleDateString("en-US", { timeZone: TIMEZONE });
+  const [m, d, y] = phoenixStr.split("/").map(Number);
+  const today = new Date(
+    `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T00:00:00-07:00`
+  );
+
   const dates = [];
   if (/\btoday\b/i.test(msg)) dates.push(new Date(today));
   if (/\btomorrow\b/i.test(msg)) {
-    const d = new Date(today);
-    d.setDate(d.getDate() + 1);
-    dates.push(d);
+    dates.push(new Date(today.getTime() + 24 * 60 * 60 * 1000));
   }
   const dayMap = [
     { regex: /\bsunday\b|\bsun\b/i,                     idx: 0 },

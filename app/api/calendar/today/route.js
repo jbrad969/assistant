@@ -17,27 +17,26 @@ function getGoogleClient() {
 }
 
 function getDateRange(dateString, days = 1) {
-  const timeZone = "America/Phoenix";
+  const PHOENIX_OFFSET = -7; // UTC-7, never changes
 
-  // Parse the target date
-  const date = dateString ? new Date(dateString) : new Date();
+  // If a date string was passed in, use it; otherwise use now
+  const inputDate = dateString ? new Date(dateString) : new Date();
 
-  // Get the date parts in Phoenix timezone
-  const phoenixStr = date.toLocaleDateString("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const [month, day, year] = phoenixStr.split("/");
+  // Convert to Phoenix time by adjusting for UTC-7
+  const phoenixTime = new Date(inputDate.getTime() + (PHOENIX_OFFSET * 60 * 60 * 1000) + (inputDate.getTimezoneOffset() * 60 * 1000));
 
-  // Build start of that day in Phoenix time (UTC-7, no DST)
-  const startDate = new Date(`${year}-${month}-${day}T00:00:00-07:00`);
-  const timeMin = startDate.toISOString();
+  // Extract the date parts in Phoenix time
+  const year = phoenixTime.getUTCFullYear();
+  const month = String(phoenixTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(phoenixTime.getUTCDate()).padStart(2, '0');
 
-  // End is N days later at 23:59:59 Phoenix (single-day default matches user's spec exactly).
-  const endMs = startDate.getTime() + days * 24 * 60 * 60 * 1000 - 1000;
-  const timeMax = new Date(endMs).toISOString();
+  // Build start and end of that Phoenix day as ISO strings
+  const timeMin = `${year}-${month}-${day}T00:00:00-07:00`;
+  const timeMax = days === 1
+    ? `${year}-${month}-${day}T23:59:59-07:00`
+    : new Date(new Date(timeMin).getTime() + days * 24 * 60 * 60 * 1000 - 1000).toISOString();
+
+  console.log(`Phoenix date: ${year}-${month}-${day}, timeMin: ${timeMin}, timeMax: ${timeMax}`);
 
   return { timeMin, timeMax };
 }

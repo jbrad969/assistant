@@ -56,6 +56,25 @@ function isEmailApprovalPhrase(msg) {
   return EMAIL_APPROVAL_PHRASES.some((p) => m === p || m.startsWith(p + " "));
 }
 
+// GoHighLevel hard pre-check. Tight keywords only — generic words like
+// "contact" and "follow up" overlap with email_send/calendar intents and
+// were intentionally dropped.
+function isGHLAction(msg) {
+  const m = msg.toLowerCase();
+  return (
+    /\bghl\b/.test(m) ||
+    /\bcrm\b/.test(m) ||
+    /\bsmartboard\b/.test(m) ||
+    /\bpipeline\b/.test(m) ||
+    /\bopportunit(y|ies)\b/.test(m) ||
+    /\bleads?\b/.test(m) ||
+    /\bestimate\b/.test(m) ||
+    /\bsend sms\b/.test(m) ||
+    /\btext message\b/.test(m) ||
+    /\bworkflow\b/.test(m)
+  );
+}
+
 // Markers embedded in confirmation prompts so subsequent turns can recover
 // the pinned IDs without session storage.
 const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
@@ -1295,6 +1314,8 @@ export async function POST(req) {
     let intent;
     if (isQuoteRequest) {
       intent = { intent: "quote", confidence: 100 };
+    } else if (isGHLAction(msg)) {
+      intent = { intent: "ghl", confidence: 100 };
     } else {
       intent = await classifyIntent(message, history);
     }
@@ -1629,6 +1650,106 @@ export async function POST(req) {
         },
         today
       );
+    }
+
+    // GHL (GoHighLevel CRM via Composio)
+    // Tool-use loop: Claude emits ghl_action tool_use blocks; we POST /api/ghl
+    // and feed the result back as tool_result. Loop until stop_reason !== "tool_use"
+    // or we hit MAX_TOOL_TURNS as a safety stop.
+    case "ghl": {
+      const MAX_TOOL_TURNS = 5;
+      const ghlTool = {
+        name: "ghl_action",
+        description:
+          "Execute a GoHighLevel CRM action via Composio. Use for searching contacts, getting contact details, creating notes/opportunities, sending SMS, etc.",
+        input_schema: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              description:
+                "Composio action ID. Examples: GOHIGHLEVEL_SEARCH_CONTACTS, GOHIGHLEVEL_GET_CONTACT, GOHIGHLEVEL_CREATE_NOTE, GOHIGHLEVEL_CREATE_OPPORTUNITY, GOHIGHLEVEL_SEND_SMS.",
+            },
+            params: {
+              type: "object",
+              description:
+                "Parameters for the action. Examples: { query: 'Jane Smith' }, { contactId: 'abc', body: 'note' }, { contactId: 'abc', message: 'text' }.",
+            },
+          },
+          required: ["action", "params"],
+        },
+      };
+
+      const ghlSystem = buildSystemPrompt(today, memoryText) + `
+
+You have access to GoHighLevel CRM via the ghl_action tool.
+
+Common actions:
+- GOHIGHLEVEL_SEARCH_CONTACTS — params: { query: "name or phone" }
+- GOHIGHLEVEL_GET_CONTACT — params: { contactId: "id" }
+- GOHIGHLEVEL_CREATE_NOTE — params: { contactId: "id", body: "note text" }
+- GOHIGHLEVEL_CREATE_OPPORTUNITY — params: { name: "title", contactId: "id", pipelineId: "id", status: "open" }
+- GOHIGHLEVEL_SEND_SMS — params: { contactId: "id", message: "text" }
+
+When Brad asks about a contact, search first, then get full details with the returned id. Always show name, phone, email, and pipeline stage.`;
+
+      const conversation = [
+        ...history.map((m) => ({ role: m.role, content: m.content })),
+        { role: "user", content: message },
+      ];
+
+      let finalText = "";
+      for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+        const response = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 1024,
+          system: ghlSystem,
+          tools: [ghlTool],
+          messages: conversation,
+        });
+
+        if (response.stop_reason !== "tool_use") {
+          finalText = response.content
+            .filter((c) => c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
+          break;
+        }
+
+        conversation.push({ role: "assistant", content: response.content });
+
+        const toolUses = response.content.filter((c) => c.type === "tool_use");
+        const toolResults = [];
+        for (const tu of toolUses) {
+          try {
+            const ghlRes = await fetch(`${BASE_URL}/api/ghl`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(tu.input),
+            });
+            const data = await ghlRes.json();
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: JSON.stringify(data),
+              is_error: !data.success,
+            });
+          } catch (e) {
+            console.log("[ghl] fetch threw:", e.message);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: JSON.stringify({ success: false, error: e.message }),
+              is_error: true,
+            });
+          }
+        }
+        conversation.push({ role: "user", content: toolResults });
+      }
+
+      return Response.json({
+        reply: cleanResponse(finalText || "I wasn't able to complete that GHL action."),
+      });
     }
 
     // DRIVE SEARCH

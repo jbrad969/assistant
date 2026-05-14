@@ -10,6 +10,16 @@ function getDriveClient() {
   return google.drive({ version: "v3", auth: client });
 }
 
+function getDriveClient2() {
+  const client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    "https://project-xsf5a.vercel.app/api/google/callback"
+  );
+  client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN_2 });
+  return google.drive({ version: "v3", auth: client });
+}
+
 // Drive's q-syntax escapes single quotes with a backslash. Apostrophes in user
 // input ("Brad's report") would otherwise produce invalid queries.
 function escapeQ(s) {
@@ -74,6 +84,49 @@ const TYPE_TO_MIME = {
   slide: "application/vnd.google-apps.presentation",
 };
 
+// Run a Drive search against one account and return files tagged with that
+// account. Returns a warning string when a folder filter was specified but
+// the folder doesn't exist in this account (which is normal when folders
+// only live in one drive).
+async function searchDrive(drive, { search, folder, type, limit, account }) {
+  const clauses = ["trashed = false"];
+
+  if (search) {
+    const q = escapeQ(search);
+    clauses.push(`(name contains '${q}' or fullText contains '${q}')`);
+  }
+
+  if (type && TYPE_TO_MIME[type]) {
+    clauses.push(`mimeType = '${TYPE_TO_MIME[type]}'`);
+  } else if (type === "file") {
+    clauses.push(`mimeType != '${FOLDER_MIME}'`);
+  }
+
+  if (folder) {
+    const folderId = await findFolderId(drive, folder);
+    if (!folderId) {
+      return { files: [], warning: `No folder named "${folder}" found in ${account}.` };
+    }
+    clauses.push(`'${folderId}' in parents`);
+  }
+
+  const q = clauses.join(" and ");
+  console.log(`[/api/drive GET] account=${account} q:`, q);
+
+  const result = await drive.files.list({
+    q,
+    pageSize: limit,
+    orderBy: "modifiedTime desc",
+    fields:
+      "files(id, name, mimeType, webViewLink, webContentLink, modifiedTime, size, parents, shared, owners(displayName,emailAddress))",
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true,
+  });
+
+  const files = (result.data.files || []).map((f) => ({ ...f, account }));
+  return { files };
+}
+
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
@@ -82,50 +135,38 @@ export async function GET(req) {
     const type = searchParams.get("type");
     const limit = Math.min(parseInt(searchParams.get("limit") || "20", 10), 100);
 
-    const drive = getDriveClient();
+    const account1 = process.env.GOOGLE_EMAIL;
+    const account2 = process.env.GOOGLE_EMAIL_2;
 
-    const clauses = ["trashed = false"];
+    const [res1, res2] = await Promise.all([
+      searchDrive(getDriveClient(), { search, folder, type, limit, account: account1 }),
+      searchDrive(getDriveClient2(), { search, folder, type, limit, account: account2 }),
+    ]);
 
-    if (search) {
-      const q = escapeQ(search);
-      clauses.push(`(name contains '${q}' or fullText contains '${q}')`);
-    }
-
-    if (type && TYPE_TO_MIME[type]) {
-      clauses.push(`mimeType = '${TYPE_TO_MIME[type]}'`);
-    } else if (type === "file") {
-      clauses.push(`mimeType != '${FOLDER_MIME}'`);
-    }
-
-    if (folder) {
-      const folderId = await findFolderId(drive, folder);
-      if (!folderId) {
-        return Response.json({
-          files: [],
-          total: 0,
-          warning: `No folder named "${folder}" found.`,
-        });
+    // Dedupe by account:id (file IDs are globally unique in Drive, but
+    // keying by account preserves the source tag if the same shared file
+    // surfaces from both accounts).
+    const seen = new Set();
+    const files = [];
+    for (const f of [...res1.files, ...res2.files]) {
+      const key = `${f.account}:${f.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        files.push(f);
       }
-      clauses.push(`'${folderId}' in parents`);
     }
+    files.sort(
+      (a, b) => new Date(b.modifiedTime || 0) - new Date(a.modifiedTime || 0)
+    );
 
-    const q = clauses.join(" and ");
-    console.log("[/api/drive GET] q:", q);
+    console.log("[/api/drive GET] combined files returned:", files.length);
 
-    const result = await drive.files.list({
-      q,
-      pageSize: limit,
-      orderBy: "modifiedTime desc",
-      fields:
-        "files(id, name, mimeType, webViewLink, webContentLink, modifiedTime, size, parents, shared, owners(displayName,emailAddress))",
-      includeItemsFromAllDrives: true,
-      supportsAllDrives: true,
-    });
-
-    const files = result.data.files || [];
-    console.log("[/api/drive GET] files returned:", files.length);
-
-    return Response.json({ files, total: files.length });
+    const response = { files, total: files.length };
+    if (files.length === 0) {
+      const warnings = [res1.warning, res2.warning].filter(Boolean);
+      if (warnings.length) response.warning = warnings.join(" ");
+    }
+    return Response.json(response);
   } catch (error) {
     console.log("[/api/drive GET] FAILED:", error.message, "| code:", error.code);
     return Response.json(

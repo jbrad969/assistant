@@ -7,13 +7,22 @@ const TIMEZONE = "America/Phoenix";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function getAuth() {
+// Return an OAuth client for the requested account. Unknown/missing accounts
+// fall back to the primary so legacy callers keep working unchanged.
+function getAuth(account) {
+  const isSecondary = account && account === process.env.GOOGLE_EMAIL_2;
   const auth = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
+    isSecondary
+      ? "https://project-xsf5a.vercel.app/api/google/callback"
+      : process.env.GOOGLE_REDIRECT_URI
   );
-  auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+  auth.setCredentials({
+    refresh_token: isSecondary
+      ? process.env.GOOGLE_REFRESH_TOKEN_2
+      : process.env.GOOGLE_REFRESH_TOKEN,
+  });
   return auth;
 }
 
@@ -122,6 +131,7 @@ export async function POST(req) {
     const directEmailId = body.emailId || null;
     const directAttachmentId = body.attachmentId || null;
     const directFilename = body.filename || null;
+    const directAccount = body.account || null;
     const emailDescription = body.emailDescription || null;
 
     console.log("[email-to-drive] inputs:", {
@@ -129,6 +139,7 @@ export async function POST(req) {
       mode: directEmailId ? "direct" : "search",
       emailDescription,
       directEmailId,
+      directAccount,
     });
 
     if (!folderName) {
@@ -144,17 +155,17 @@ export async function POST(req) {
       );
     }
 
-    const auth = getAuth();
-    const gmail = google.gmail({ version: "v1", auth });
-    const drive = google.drive({ version: "v3", auth });
-
+    let auth = null;
+    let pickedAccount = null;
     let messageData = null;
     let attachment = null;
 
     if (directEmailId && directAttachmentId) {
-      // Direct mode: caller already has the IDs from jessState. Fetch the
-      // message and pull the attachment by attachmentId — no Gmail search.
-      const msg = await gmail.users.messages.get({
+      // Direct mode: caller passes IDs (and ideally `account`) from jessState.
+      // Fetch the message from the named account — no Gmail search.
+      pickedAccount = directAccount || process.env.GOOGLE_EMAIL;
+      auth = getAuth(pickedAccount);
+      const msg = await google.gmail({ version: "v1", auth }).users.messages.get({
         userId: "me",
         id: directEmailId,
         format: "full",
@@ -170,49 +181,75 @@ export async function POST(req) {
           mimeType: "application/octet-stream",
         };
       }
-      console.log("[email-to-drive] direct mode picked:", directEmailId, attachment.filename);
+      console.log("[email-to-drive] direct mode picked:", directEmailId, attachment.filename, "account:", pickedAccount);
     } else {
       const query = await planEmailSearch(emailDescription, history);
       console.log("[email-to-drive] Gmail query:", query);
 
-      const list = await gmail.users.messages.list({
-        userId: "me",
-        q: query,
-        maxResults: 10,
-      });
-      const messageIds = (list.data.messages || []).map((m) => m.id);
-      console.log("[email-to-drive] message hits:", messageIds.length);
-      if (messageIds.length === 0) {
+      // Search both accounts in parallel; we don't know which inbox owns the
+      // email Brad means.
+      const account1 = process.env.GOOGLE_EMAIL;
+      const account2 = process.env.GOOGLE_EMAIL_2;
+      const auth1 = getAuth(account1);
+      const auth2 = getAuth(account2);
+
+      const safeList = (a, label) =>
+        google
+          .gmail({ version: "v1", auth: a })
+          .users.messages.list({ userId: "me", q: query, maxResults: 10 })
+          .catch((e) => {
+            console.log(`[email-to-drive] list failed (${label}):`, e.message);
+            return { data: { messages: [] } };
+          });
+
+      const [list1, list2] = await Promise.all([
+        safeList(auth1, account1),
+        safeList(auth2, account2),
+      ]);
+
+      const candidates = [
+        ...(list1.data.messages || []).map((m) => ({ id: m.id, account: account1, auth: auth1 })),
+        ...(list2.data.messages || []).map((m) => ({ id: m.id, account: account2, auth: auth2 })),
+      ];
+      console.log("[email-to-drive] candidate count:", candidates.length);
+
+      if (candidates.length === 0) {
         return Response.json({
           success: false,
           error: `No emails matched "${emailDescription}" (query: ${query})`,
         });
       }
 
-      // Walk the result list newest-first; pick the first message that
-      // actually has an attachment. Gmail's has:attachment filter is reliable
-      // but we still re-verify by parsing the payload.
-      for (const id of messageIds) {
-        const msg = await gmail.users.messages.get({
+      // Walk candidates and pick the first message that actually carries an
+      // attachment. Gmail's has:attachment filter is reliable but we still
+      // re-verify by parsing the payload.
+      for (const c of candidates) {
+        const g = google.gmail({ version: "v1", auth: c.auth });
+        const msg = await g.users.messages.get({
           userId: "me",
-          id,
+          id: c.id,
           format: "full",
         });
         const found = findAttachment(msg.data.payload);
         if (found) {
           messageData = msg.data;
           attachment = found;
+          pickedAccount = c.account;
+          auth = c.auth;
           break;
         }
       }
       if (!messageData || !attachment) {
         return Response.json({
           success: false,
-          error: `Matched ${messageIds.length} email(s) but couldn't find an attachment`,
+          error: `Matched ${candidates.length} email(s) but couldn't find an attachment`,
         });
       }
-      console.log("[email-to-drive] search picked message:", messageData.id, "attachment:", attachment.filename);
+      console.log("[email-to-drive] search picked message:", messageData.id, "attachment:", attachment.filename, "account:", pickedAccount);
     }
+
+    const gmail = google.gmail({ version: "v1", auth });
+    const drive = google.drive({ version: "v3", auth });
 
     const { folderId, created: folderCreated } = await resolveFolderId(drive, folderName);
     console.log("Saving to folder:", folderName, "ID:", folderId);
@@ -261,6 +298,7 @@ export async function POST(req) {
       link: uploaded.data.webViewLink,
       folderName,
       folderCreated,
+      account: pickedAccount,
     });
   } catch (error) {
     console.log("[email-to-drive] FAILED:", error.message, "| code:", error.code);

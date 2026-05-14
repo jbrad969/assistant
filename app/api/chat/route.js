@@ -26,7 +26,7 @@ const CLAUDE_MODEL = "claude-sonnet-4-5";
 // reset it and we fall back to per-turn extraction.
 const jessState = {
   lastEmailResults: [],   // emails from the last email_read
-  lastAttachment: null,   // { emailId, attachmentId, filename, fromEmail, date }
+  lastAttachment: null,   // { emailId, attachmentId, filename, fromEmail, date, account }
   lastDriveFolder: null,  // folder name from the last email_to_drive save
   lastDriveFiles: [],     // files from the last drive_search
   lastCalendarEvents: [], // events from the last calendar_read fetch
@@ -1550,6 +1550,7 @@ export async function POST(req) {
           filename: att.filename,
           fromEmail: firstWithAttachment.fromEmail,
           date: firstWithAttachment.date,
+          account: firstWithAttachment.account,
         };
         console.log("[email read] state.lastAttachment =", att.filename);
       }
@@ -2481,6 +2482,7 @@ If the message has no email, set shareEmail to null.`,
             emailId: directAttachment.emailId,
             attachmentId: directAttachment.attachmentId,
             filename: directAttachment.filename,
+            account: directAttachment.account,
             folderName,
           }
         : { emailDescription, folderName, history };

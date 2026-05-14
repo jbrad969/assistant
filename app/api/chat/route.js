@@ -1764,6 +1764,20 @@ export async function POST(req) {
         }
       }
 
+      // Polish the outbound SMS body before it leaves. Brad dictates these and
+      // grammar/caps/punctuation come through rough — Claude tightens it up.
+      if (action === "send_sms" && params.message) {
+        const cleaned = await anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 200,
+          system: "Fix grammar, capitalization and punctuation on this text message. Keep it natural and conversational. Don't add anything extra. Just return the corrected message text only.",
+          messages: [{ role: "user", content: params.message }],
+        });
+        const polished = cleanResponse(cleaned.content[0].text);
+        console.log("[ghl] SMS polished:", JSON.stringify(params.message), "→", JSON.stringify(polished));
+        params.message = polished;
+      }
+
       // Actions that hit POST /api/ghl. Everything else (get_contact, list_*) is GET.
       const postActions = [
         "search_contact",

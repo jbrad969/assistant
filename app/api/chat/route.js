@@ -1715,11 +1715,13 @@ export async function POST(req) {
 
       // Resolve contactId from prior search if extractor didn't get one.
       // Lets "add a note to Lewis Anderson" use Lewis's id from the last search.
-      const NEEDS_CONTACT_ID = [
+      // send_sms is excluded — we always re-search for SMS so we hit the current
+      // phone number on file, not whatever was cached.
+      const CACHE_RESOLVE_ACTIONS = [
         "add_note", "get_contact", "create_opportunity",
-        "send_sms", "update_contact", "create_task",
+        "update_contact", "create_task",
       ];
-      if (NEEDS_CONTACT_ID.includes(action) && !params.contactId) {
+      if (CACHE_RESOLVE_ACTIONS.includes(action) && !params.contactId) {
         const resolved = resolveContactIdFromMessage(message, jessState.lastGHLContacts);
         if (resolved) {
           params.contactId = resolved;
@@ -1727,11 +1729,23 @@ export async function POST(req) {
         }
       }
 
-      // For add_note specifically: if we still have no contactId, search GHL by
-      // name so Brad doesn't have to do "search Lewis, then add note" in two turns.
-      if (action === "add_note" && !params.contactId) {
-        const nameMatch = message.match(/\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/);
-        const extractedName = nameMatch ? nameMatch[1] : null;
+      // Auto-search GHL by name. send_sms always re-searches (per Brad: don't
+      // trust the cache for outbound SMS). add_note only searches if the cache
+      // resolver above didn't already find a match.
+      const needsFreshSearch = action === "send_sms";
+      const needsFallbackSearch = action === "add_note" && !params.contactId;
+      if (needsFreshSearch || needsFallbackSearch) {
+        const smsPatterns = [
+          /\b(?:send|shoot|tell|message)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)\s+(?:a\s+)?(?:text|sms|message)/,
+          /\b(?:text|sms|message)\s+(?:to\s+)?([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/,
+        ];
+        const notePattern = /\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/;
+        const patterns = action === "send_sms" ? smsPatterns : [notePattern];
+        let extractedName = null;
+        for (const re of patterns) {
+          const m = message.match(re);
+          if (m) { extractedName = m[1]; break; }
+        }
         const query = params.contactName || extractedName;
         if (query) {
           const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
@@ -1744,7 +1758,9 @@ export async function POST(req) {
           if (contact) {
             params.contactId = contact.id || contact._id;
             jessState.lastGHLContacts = searchData.data?.contacts || [];
-            console.log("[ghl] auto-searched", query, "→ contactId:", params.contactId);
+            console.log("[ghl] auto-searched", query, "→ contactId:", params.contactId, "phone:", contact.phone);
+          } else {
+            console.log("[ghl] auto-search for", query, "returned no contacts");
           }
         }
       }

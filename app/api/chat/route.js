@@ -30,6 +30,7 @@ const jessState = {
   lastDriveFolder: null,  // folder name from the last email_to_drive save
   lastDriveFiles: [],     // files from the last drive_search
   lastCalendarEvents: [], // events from the last calendar_read fetch
+  lastGHLContacts: [],    // contacts from the last GHL search_contact result
 };
 
 /* ============================================================================
@@ -56,6 +57,28 @@ function isEmailApprovalPhrase(msg) {
   return EMAIL_APPROVAL_PHRASES.some((p) => m === p || m.startsWith(p + " "));
 }
 
+// Resolve a contactId from Brad's message by name-matching against the last
+// GHL search results. Lets "add a note to Lewis Anderson" reuse Lewis's id
+// from the prior search instead of asking Brad to paste it. Returns null if
+// no match — the caller falls through to whatever the extractor produced.
+function resolveContactIdFromMessage(message, contacts) {
+  if (!contacts || contacts.length === 0) return null;
+  const lower = message.toLowerCase();
+  const idOf = (c) => c.id || c._id;
+  for (const c of contacts) {
+    const fullName = [c.firstName, c.lastName].filter(Boolean).join(" ").trim().toLowerCase();
+    const altName = (c.contactName || c.name || "").toLowerCase();
+    if (fullName && lower.includes(fullName)) return idOf(c);
+    if (altName && lower.includes(altName)) return idOf(c);
+  }
+  // Fallback: distinctive first-name-only match (4+ chars to avoid "Bo" → many).
+  for (const c of contacts) {
+    const fn = (c.firstName || "").toLowerCase();
+    if (fn.length >= 4 && lower.includes(fn)) return idOf(c);
+  }
+  return null;
+}
+
 // GoHighLevel hard pre-check. Tight keywords only — generic words like
 // "contact" and "follow up" overlap with email_send/calendar intents and
 // were intentionally dropped.
@@ -71,7 +94,11 @@ function isGHLAction(msg) {
     /\bestimate\b/.test(m) ||
     /\bsend sms\b/.test(m) ||
     /\btext message\b/.test(m) ||
-    /\bworkflow\b/.test(m)
+    /\bworkflow\b/.test(m) ||
+    /\badd a note\b/.test(m) ||
+    /\badd note\b/.test(m) ||
+    /\bnote to\b/.test(m) ||
+    /\blog a note\b/.test(m)
   );
 }
 
@@ -1685,6 +1712,20 @@ export async function POST(req) {
 
       const { action, params } = JSON.parse(extracted.choices[0].message.content);
 
+      // Resolve contactId from prior search if extractor didn't get one.
+      // Lets "add a note to Lewis Anderson" use Lewis's id from the last search.
+      const NEEDS_CONTACT_ID = [
+        "add_note", "get_contact", "create_opportunity",
+        "send_sms", "update_contact", "create_task",
+      ];
+      if (NEEDS_CONTACT_ID.includes(action) && !params.contactId) {
+        const resolved = resolveContactIdFromMessage(message, jessState.lastGHLContacts);
+        if (resolved) {
+          params.contactId = resolved;
+          console.log("[ghl] resolved contactId from lastGHLContacts:", resolved);
+        }
+      }
+
       // Actions that hit POST /api/ghl. Everything else (get_contact, list_*) is GET.
       const postActions = [
         "search_contact",
@@ -1713,6 +1754,13 @@ export async function POST(req) {
 
       if (!data.success) {
         return Response.json({ reply: `I couldn't complete that GHL action: ${data.error}` });
+      }
+
+      // Stash search results so follow-ups like "add a note to Lewis Anderson"
+      // can resolve a contactId without asking Brad to paste it.
+      if (action === "search_contact" && data.data) {
+        jessState.lastGHLContacts = data.data.contacts || [];
+        console.log("[ghl] stored", jessState.lastGHLContacts.length, "contacts in lastGHLContacts");
       }
 
       const response = await anthropic.messages.create({

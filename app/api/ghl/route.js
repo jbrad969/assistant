@@ -57,12 +57,15 @@ const POST_ACTIONS = {
       }),
     });
   },
-  add_note: ({ contactId, body }) => {
+  add_note: async ({ contactId, body }) => {
     if (!contactId || !body) throw new Error("contactId and body are required");
-    return ghlFetch(`/contacts/${contactId}/notes`, {
+    console.log("Adding note to contact:", contactId, "body:", body);
+    const result = await ghlFetch(`/contacts/${contactId}/notes`, {
       method: "POST",
       body: JSON.stringify({ body }),
     });
+    console.log("Note result:", JSON.stringify(result));
+    return result;
   },
   create_opportunity: ({ contactId, name, pipelineId, pipelineStageId, status }) => {
     if (!contactId || !name || !pipelineId || !pipelineStageId) {

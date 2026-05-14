@@ -1728,6 +1728,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       const saysMatch = message.match(/(?:says?|saying|that says?)\s+(.+)$/i);
       if (action === "send_sms" && !params.message && saysMatch) {
         params.message = saysMatch[1].trim();
+        console.log("Extracted SMS message:", params.message);
       }
 
       // Extract person name from message for contact lookup. Verb-first patterns
@@ -1768,36 +1769,31 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         }
       }
 
-      // Auto-resolve contactId for actions that need it
-      if (["send_sms", "add_note", "create_task", "update_contact"].includes(action) && !params.contactId && extractedName) {
-        console.log("Auto-resolving contactId for:", extractedName);
-        const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "search_contact", params: { query: extractedName } }),
-        });
-        const searchData = await searchRes.json();
-        console.log("Search result:", JSON.stringify(searchData?.data?.contacts?.slice(0, 2)));
-        const contact = searchData.data?.contacts?.[0];
-        if (contact) {
-          params.contactId = contact.id || contact._id;
-          jessState.lastGHLContact = contact;
-          jessState.lastGHLContacts = searchData.data?.contacts || [];
-          console.log("Resolved contactId:", params.contactId);
+      // Resolve contactId for actions that need it. CACHE FIRST: if Brad just
+      // searched and we have lastGHLContact, use it — don't blow away the result
+      // with a stale-name search. Only re-search if we have no cached contact
+      // and Brad gave us a name in this turn.
+      if (["send_sms", "add_note", "create_task", "update_contact"].includes(action) && !params.contactId) {
+        if (jessState.lastGHLContact) {
+          params.contactId = jessState.lastGHLContact.id || jessState.lastGHLContact._id;
+          console.log("Using cached contact:", jessState.lastGHLContact.firstName, params.contactId);
+        } else if (extractedName) {
+          console.log("Auto-resolving contactId for:", extractedName);
+          const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "search_contact", params: { query: extractedName } }),
+          });
+          const searchData = await searchRes.json();
+          console.log("Search result:", JSON.stringify(searchData?.data?.contacts?.slice(0, 2)));
+          const contact = searchData.data?.contacts?.[0];
+          if (contact) {
+            params.contactId = contact.id || contact._id;
+            jessState.lastGHLContact = contact;
+            jessState.lastGHLContacts = searchData.data?.contacts || [];
+            console.log("Resolved contactId:", params.contactId);
+          }
         }
-      }
-
-      // If still no contactId and no name to search for, fall back to the most
-      // recently found contact — handles "send him a text" / "send a text"
-      // right after a search turn.
-      if (
-        ["send_sms", "add_note", "create_task", "update_contact"].includes(action) &&
-        !params.contactId &&
-        !extractedName &&
-        jessState.lastGHLContact
-      ) {
-        params.contactId = jessState.lastGHLContact?.id || jessState.lastGHLContact?._id;
-        console.log("[ghl] fell back to lastGHLContact →", params.contactId);
       }
 
       if (action === "send_sms") {
@@ -1858,9 +1854,9 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       // Stash search results so follow-ups like "add a note to Lewis Anderson"
       // or "send him a text" can resolve a contactId without re-searching.
       if (action === "search_contact" && data.data) {
-        jessState.lastGHLContacts = data.data.contacts || [];
-        jessState.lastGHLContact = jessState.lastGHLContacts[0] || null;
-        console.log("[ghl] stored", jessState.lastGHLContacts.length, "contacts; lastGHLContact:", JSON.stringify(jessState.lastGHLContact));
+        jessState.lastGHLContacts = data.data?.contacts || [];
+        jessState.lastGHLContact = data.data?.contacts?.[0] || null;
+        console.log("Stored lastGHLContact:", jessState.lastGHLContact?.id);
       }
 
       const response = await anthropic.messages.create({

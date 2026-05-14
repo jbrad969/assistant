@@ -85,12 +85,29 @@ const POST_ACTIONS = {
       }),
     });
   },
-  send_sms: ({ contactId, message }) => {
+  send_sms: async ({ contactId, message }) => {
     if (!contactId || !message) throw new Error("contactId and message are required");
-    return ghlFetch(`/conversations/messages/outbound`, {
+    const body = { type: "SMS", contactId, message };
+    console.log("SMS request body:", JSON.stringify(body));
+    const res = await fetch(`${GHL_BASE}/conversations/messages`, {
       method: "POST",
-      body: JSON.stringify({ type: "SMS", contactId, message }),
+      headers,
+      body: JSON.stringify(body),
     });
+    const text = await res.text();
+    let result;
+    try {
+      result = text ? JSON.parse(text) : {};
+    } catch {
+      result = { raw: text };
+    }
+    console.log("SMS response status:", res.status);
+    console.log("SMS response:", JSON.stringify(result));
+    if (!res.ok) {
+      const detail = result.message || result.error || text || "unknown";
+      throw new Error(`GHL ${res.status}: ${detail}`);
+    }
+    return result;
   },
   create_contact: ({ firstName, lastName, email, phone }) => {
     return ghlFetch(`/contacts/`, {

@@ -1722,6 +1722,13 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
 
       const { action, params } = JSON.parse(extracted.choices[0].message.content);
 
+      // Regex fallback: pull SMS body from "says X" / "saying X" / "that says X"
+      // when the extractor missed it. Brad's phrasing is very consistent here.
+      const saysMatch = message.match(/(?:says?|saying|that says?)\s+(.+)$/i);
+      if (action === "send_sms" && !params.message && saysMatch) {
+        params.message = saysMatch[1].trim();
+      }
+
       // Extract person name from message for contact lookup. Verb-first patterns
       // ("Send Tim Miller a text") run first; the (to|for) pattern is a fallback
       // for "add a note to Lewis" / "task for Bob" phrasing.
@@ -1764,23 +1771,28 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         const contact = searchData.data?.contacts?.[0];
         if (contact) {
           params.contactId = contact.id || contact._id;
+          jessState.lastGHLContact = contact;
           jessState.lastGHLContacts = searchData.data?.contacts || [];
           console.log("Resolved contactId:", params.contactId);
         }
       }
 
       // If still no contactId and no name to search for, fall back to the most
-      // recently found contact — handles "send him a text" / "add a note saying X"
+      // recently found contact — handles "send him a text" / "send a text"
       // right after a search turn.
       if (
         ["send_sms", "add_note", "create_task", "update_contact"].includes(action) &&
         !params.contactId &&
         !extractedName &&
-        jessState.lastGHLContacts?.length > 0
+        jessState.lastGHLContact
       ) {
-        const last = jessState.lastGHLContacts[0];
-        params.contactId = last.id || last._id;
-        console.log("[ghl] fell back to lastGHLContacts[0] →", params.contactId);
+        params.contactId = jessState.lastGHLContact?.id || jessState.lastGHLContact?._id;
+        console.log("[ghl] fell back to lastGHLContact →", params.contactId);
+      }
+
+      if (action === "send_sms") {
+        console.log("send_sms params:", JSON.stringify(params));
+        console.log("lastGHLContact:", JSON.stringify(jessState.lastGHLContact));
       }
 
       // Polish the outbound SMS body before it leaves. Brad dictates these and
@@ -1828,10 +1840,11 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       }
 
       // Stash search results so follow-ups like "add a note to Lewis Anderson"
-      // can resolve a contactId without asking Brad to paste it.
+      // or "send him a text" can resolve a contactId without re-searching.
       if (action === "search_contact" && data.data) {
         jessState.lastGHLContacts = data.data.contacts || [];
-        console.log("[ghl] stored", jessState.lastGHLContacts.length, "contacts in lastGHLContacts");
+        jessState.lastGHLContact = jessState.lastGHLContacts[0] || null;
+        console.log("[ghl] stored", jessState.lastGHLContacts.length, "contacts; lastGHLContact:", JSON.stringify(jessState.lastGHLContact));
       }
 
       const response = await anthropic.messages.create({

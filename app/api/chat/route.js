@@ -1717,29 +1717,27 @@ export async function POST(req) {
 
       const { action, params } = JSON.parse(extracted.choices[0].message.content);
 
-      // Extract a person-name from Brad's message up front so every downstream
-      // lookup uses the same value. Patterns are case-insensitive on the verb
-      // (so "Send Tim Miller a text" works) and capture the proper-noun name.
-      const NAME_PATTERNS = [
+      // Extract person name from message for contact lookup. Verb-first patterns
+      // ("Send Tim Miller a text") run first; the (to|for) pattern is a fallback
+      // for "add a note to Lewis" / "task for Bob" phrasing.
+      const namePatterns = [
         /\b(?:send|shoot|tell|message)\s+([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)\s+(?:a\s+)?(?:text|sms|message)\b/i,
         /\b(?:text|sms|message)\s+(?:to\s+)?([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)/i,
-        /\bnote\s+(?:to|on|for|about)\s+([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)/i,
-        /\b(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/,
+        /(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/,
       ];
       let nameMatch = null;
-      for (const re of NAME_PATTERNS) {
+      for (const re of namePatterns) {
         const m = message.match(re);
-        if (m) { nameMatch = m[1]; break; }
+        if (m) { nameMatch = m; break; }
       }
-      const extractedName = params.contactName || params.name || nameMatch || "";
-      console.log("[ghl] action:", action, "extractedName:", extractedName, "params:", JSON.stringify(params));
+      const extractedName = params.contactName || params.name || (nameMatch && nameMatch[1]) || "";
+
+      console.log("GHL action:", action, "extractedName:", extractedName, "params:", JSON.stringify(params));
 
       // Resolve contactId from prior search for actions that can safely reuse
-      // cached state. send_sms and add_note are excluded — they auto-search
-      // fresh below so we hit the current phone/contact, not stale cache.
-      const CACHE_RESOLVE_ACTIONS = [
-        "get_contact", "create_opportunity", "update_contact", "create_task",
-      ];
+      // cached state. send_sms/add_note/create_task/update_contact auto-search
+      // fresh below so we hit the current contact, not stale cache.
+      const CACHE_RESOLVE_ACTIONS = ["get_contact", "create_opportunity"];
       if (CACHE_RESOLVE_ACTIONS.includes(action) && !params.contactId) {
         const resolved = resolveContactIdFromMessage(message, jessState.lastGHLContacts);
         if (resolved) {
@@ -1748,21 +1746,21 @@ export async function POST(req) {
         }
       }
 
-      // Auto-search GHL fresh for send_sms / add_note when contactId is missing.
-      if ((action === "send_sms" || action === "add_note") && !params.contactId && extractedName) {
+      // Auto-resolve contactId for actions that need it
+      if (["send_sms", "add_note", "create_task", "update_contact"].includes(action) && !params.contactId && extractedName) {
+        console.log("Auto-resolving contactId for:", extractedName);
         const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "search_contact", params: { query: extractedName } }),
         });
         const searchData = await searchRes.json();
+        console.log("Search result:", JSON.stringify(searchData?.data?.contacts?.slice(0, 2)));
         const contact = searchData.data?.contacts?.[0];
         if (contact) {
           params.contactId = contact.id || contact._id;
           jessState.lastGHLContacts = searchData.data?.contacts || [];
-          console.log("[ghl] auto-searched", extractedName, "→ contactId:", params.contactId, "phone:", contact.phone);
-        } else {
-          console.log("[ghl] auto-search for", extractedName, "returned no contacts");
+          console.log("Resolved contactId:", params.contactId);
         }
       }
 

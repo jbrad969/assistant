@@ -31,6 +31,7 @@ const jessState = {
   lastDriveFiles: [],     // files from the last drive_search
   lastCalendarEvents: [], // events from the last calendar_read fetch
   lastGHLContacts: [],    // contacts from the last GHL search_contact result
+  lastGHLContact: null,   // the single most recent contact (first hit)
 };
 
 /* ============================================================================
@@ -1737,10 +1738,19 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         /\b(?:text|sms|message)\s+(?:to\s+)?([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)/i,
         /(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/,
       ];
+      // Pronouns / articles / fillers that the verb-first regex will happily
+      // capture from "send him a text" or "send a text" but are not real names.
+      const NAME_STOPWORDS = new Set([
+        "a", "the", "him", "her", "them", "he", "she", "they",
+        "me", "us", "someone", "anyone", "everyone",
+      ]);
       let nameMatch = null;
       for (const re of namePatterns) {
         const m = message.match(re);
-        if (m) { nameMatch = m; break; }
+        if (m && !NAME_STOPWORDS.has(m[1].toLowerCase().trim().split(/\s+/)[0])) {
+          nameMatch = m;
+          break;
+        }
       }
       const extractedName = params.contactName || params.name || (nameMatch && nameMatch[1]) || "";
 
@@ -1829,6 +1839,12 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         url += `?${qs}`;
       } else {
         fetchOptions.body = JSON.stringify({ action, params });
+      }
+
+      if (action === "send_sms") {
+        console.log("FINAL SMS params before API call:", JSON.stringify(params));
+        console.log("jessState.lastGHLContact:", JSON.stringify(jessState.lastGHLContact));
+        console.log("saysMatch:", saysMatch);
       }
 
       const res = await fetch(url, fetchOptions);

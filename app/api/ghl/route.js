@@ -57,6 +57,20 @@ const POST_ACTIONS = {
       }),
     });
   },
+  // Address search uses the same /contacts/search endpoint but with a
+  // structured filter on the address1 field. Substring match via "contains"
+  // means "Wild Burro" finds "6334 N Wild Burro Trail".
+  search_by_address: ({ address }) => {
+    if (!address) throw new Error("address is required");
+    return ghlFetch(`/contacts/search`, {
+      method: "POST",
+      body: JSON.stringify({
+        locationId: LOCATION_ID,
+        filters: [{ field: "address1", operator: "contains", value: address }],
+        pageLimit: 10,
+      }),
+    });
+  },
   add_note: async ({ contactId, body }) => {
     if (!contactId || !body) throw new Error("contactId and body are required");
     console.log("Adding note to contact:", contactId, "body:", body);

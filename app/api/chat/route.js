@@ -1702,9 +1702,10 @@ export async function POST(req) {
             role: "system",
             content: `Extract GHL action from Brad's message. Return JSON:
 {
-  "action": "search_contact|get_contact|add_note|create_opportunity|send_sms|create_contact|create_task",
+  "action": "search_contact|search_by_address|get_contact|add_note|create_opportunity|send_sms|create_contact|create_task",
   "params": {
-    "query": "search term if searching",
+    "query": "search term if searching by name/phone/email",
+    "address": "street address if searching by address (e.g. '6334 South Vista Point Circle')",
     "contactId": "contact ID if known",
     "contactName": "contact full name if mentioned (e.g. 'Lewis Anderson')",
     "body": "note text if adding note",
@@ -1717,6 +1718,9 @@ export async function POST(req) {
     "phone": "phone"
   }
 }
+
+Use search_by_address when Brad gives a street address ("find the contact at 6334 South Vista Point Circle", "who lives at 123 Main St").
+Use search_contact for name/phone/email lookups.
 
 When action is send_sms, the 'message' field should contain the text after 'says' or 'saying' or 'that says'.
 Example: 'send a text that says you are the best' -> message: 'you are the best'
@@ -1735,6 +1739,18 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       if (action === "send_sms" && !params.message && saysMatch) {
         params.message = saysMatch[1].trim();
         console.log("Extracted SMS message:", params.message);
+      }
+
+      // Regex fallback: pull a street address out of the message if the
+      // extractor didn't populate it for search_by_address.
+      if (action === "search_by_address" && !params.address) {
+        const addrMatch = message.match(
+          /\b\d+\s+[A-Za-z][A-Za-z0-9.\s]*?\b(?:street|st|avenue|ave|road|rd|drive|dr|place|pl|lane|ln|boulevard|blvd|court|ct|circle|cir|way|terrace|trail|highway|hwy|parkway|pkwy)\b\.?/i
+        );
+        if (addrMatch) {
+          params.address = addrMatch[0].trim();
+          console.log("Extracted address:", params.address);
+        }
       }
 
       // Extract person name from message for contact lookup. Verb-first patterns
@@ -1844,6 +1860,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       // Actions that hit POST /api/ghl. Everything else (get_contact, list_*) is GET.
       const postActions = [
         "search_contact",
+        "search_by_address",
         "add_note",
         "create_opportunity",
         "send_sms",
@@ -1879,7 +1896,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
 
       // Stash search results so follow-ups like "add a note to Lewis Anderson"
       // or "send him a text" can resolve a contactId without re-searching.
-      if (action === "search_contact" && data.data) {
+      if ((action === "search_contact" || action === "search_by_address") && data.data) {
         jessState.lastGHLContacts = data.data?.contacts || [];
         jessState.lastGHLContact = data.data?.contacts?.[0] || null;
         if (jessState.lastGHLContact) currentContact = jessState.lastGHLContact;

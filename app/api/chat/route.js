@@ -316,7 +316,7 @@ function streamAnthropicResponse(params) {
 function cleanResponse(text) {
   if (!text) return text;
   return text
-    .replace(/<!--GHL_CONTACT:[\s\S]*?-->/g, "")
+    .replace(/<!--GHL_CONTACT:.*?-->/g, "")
     .replace(/<\/?attempt_completion>/g, "")
     .replace(/<\/?function_calls>/g, "")
     .replace(/<\/?search_calendar>/g, "")
@@ -1881,10 +1881,21 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         console.log("Stored lastGHLContact:", jessState.lastGHLContact?.id);
       }
 
+      // Inject the resolved contact into the system prompt so Claude's summary
+      // says "Text sent to B Jorgensen" instead of "Text sent to the contact".
+      const cachedContact = currentContact || historyContact;
+      const contactName = cachedContact
+        ? cachedContact.name || [cachedContact.firstName, cachedContact.lastName].filter(Boolean).join(" ")
+        : "";
+      let systemPrompt = buildSystemPrompt(today, memoryText);
+      if (cachedContact) {
+        systemPrompt += `\n\nLast GHL contact: ${contactName} (${cachedContact.phone || ""}). Refer to them by name in your reply, not as "the contact".`;
+      }
+
       const response = await anthropic.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 512,
-        system: buildSystemPrompt(today, memoryText),
+        system: systemPrompt,
         messages: [
           {
             role: "user",
@@ -1892,19 +1903,24 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
           },
         ],
       });
-      let replyText = cleanResponse(response.content[0].text);
-      // Embed a hidden marker so subsequent turns can recover the contactId
-      // from history. cleanResponse strips it from any later passes.
-      if (currentContact) {
-        const c = currentContact;
-        const marker = `<!--GHL_CONTACT:${JSON.stringify({
-          id: c.id || c._id,
-          name: [c.firstName, c.lastName].filter(Boolean).join(" ") || c.name || "",
-          phone: c.phone || "",
-        })}-->`;
-        replyText = `${replyText}\n${marker}`;
+
+      // Build the marker for history persistence, then run the whole reply
+      // through cleanResponse so Brad never sees the comment. Frontend that
+      // knows about `_ghlContact` can store it on the message for next turn.
+      let replyText = response.content[0].text;
+      let ghlContactMeta = null;
+      if (cachedContact) {
+        ghlContactMeta = {
+          id: cachedContact.id || cachedContact._id,
+          name: contactName,
+          phone: cachedContact.phone || "",
+        };
+        replyText += `\n<!--GHL_CONTACT:${JSON.stringify(ghlContactMeta)}-->`;
       }
-      return Response.json({ reply: replyText });
+      return Response.json({
+        reply: cleanResponse(replyText),
+        _ghlContact: ghlContactMeta,
+      });
     }
 
     // DRIVE SEARCH

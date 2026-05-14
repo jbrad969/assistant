@@ -316,6 +316,7 @@ function streamAnthropicResponse(params) {
 function cleanResponse(text) {
   if (!text) return text;
   return text
+    .replace(/<!--GHL_CONTACT:[\s\S]*?-->/g, "")
     .replace(/<\/?attempt_completion>/g, "")
     .replace(/<\/?function_calls>/g, "")
     .replace(/<\/?search_calendar>/g, "")
@@ -1769,13 +1770,32 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         }
       }
 
-      // Resolve contactId for actions that need it. CACHE FIRST: if Brad just
-      // searched and we have lastGHLContact, use it — don't blow away the result
-      // with a stale-name search. Only re-search if we have no cached contact
-      // and Brad gave us a name in this turn.
+      // Recover the most recent contact from history (module state doesn't
+      // persist across Vercel serverless invocations — we embed a hidden
+      // <!--GHL_CONTACT:{...}--> marker in assistant replies and parse it back).
+      let historyContact = null;
+      const recentAssistant = history.filter((m) => m.role === "assistant").slice(-3);
+      for (const m of recentAssistant) {
+        const match = m.content?.match?.(/<!--GHL_CONTACT:(.+?)-->/);
+        if (match) {
+          try { historyContact = JSON.parse(match[1]); } catch { /* ignore */ }
+          if (historyContact) break;
+        }
+      }
+      if (historyContact) console.log("Found GHL_CONTACT in history:", historyContact.id);
+
+      // Resolve contactId for actions that need it. Priority: history marker →
+      // module-state cache (warm-instance only) → fresh search by extracted name.
+      // Tracks `currentContact` so the reply can re-embed the marker.
+      let currentContact = null;
       if (["send_sms", "add_note", "create_task", "update_contact"].includes(action) && !params.contactId) {
-        if (jessState.lastGHLContact) {
+        if (historyContact) {
+          params.contactId = historyContact.id;
+          currentContact = historyContact;
+          console.log("Using historyContact:", historyContact.name, params.contactId);
+        } else if (jessState.lastGHLContact) {
           params.contactId = jessState.lastGHLContact.id || jessState.lastGHLContact._id;
+          currentContact = jessState.lastGHLContact;
           console.log("Using cached contact:", jessState.lastGHLContact.firstName, params.contactId);
         } else if (extractedName) {
           console.log("Auto-resolving contactId for:", extractedName);
@@ -1791,6 +1811,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
             params.contactId = contact.id || contact._id;
             jessState.lastGHLContact = contact;
             jessState.lastGHLContacts = searchData.data?.contacts || [];
+            currentContact = contact;
             console.log("Resolved contactId:", params.contactId);
           }
         }
@@ -1856,6 +1877,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       if (action === "search_contact" && data.data) {
         jessState.lastGHLContacts = data.data?.contacts || [];
         jessState.lastGHLContact = data.data?.contacts?.[0] || null;
+        if (jessState.lastGHLContact) currentContact = jessState.lastGHLContact;
         console.log("Stored lastGHLContact:", jessState.lastGHLContact?.id);
       }
 
@@ -1870,7 +1892,19 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
           },
         ],
       });
-      return Response.json({ reply: cleanResponse(response.content[0].text) });
+      let replyText = cleanResponse(response.content[0].text);
+      // Embed a hidden marker so subsequent turns can recover the contactId
+      // from history. cleanResponse strips it from any later passes.
+      if (currentContact) {
+        const c = currentContact;
+        const marker = `<!--GHL_CONTACT:${JSON.stringify({
+          id: c.id || c._id,
+          name: [c.firstName, c.lastName].filter(Boolean).join(" ") || c.name || "",
+          phone: c.phone || "",
+        })}-->`;
+        replyText = `${replyText}\n${marker}`;
+      }
+      return Response.json({ reply: replyText });
     }
 
     // DRIVE SEARCH

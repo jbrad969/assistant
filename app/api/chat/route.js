@@ -1339,10 +1339,10 @@ export async function POST(req) {
       isRoofQuoteRequest || isTKQuoteRequest || isScopeQuoteRequest || isGenericQuoteWithAddress;
 
     let intent;
-    if (isQuoteRequest) {
-      intent = { intent: "quote", confidence: 100 };
-    } else if (isGHLAction(msg)) {
+    if (isGHLAction(msg)) {
       intent = { intent: "ghl", confidence: 100 };
+    } else if (isQuoteRequest) {
+      intent = { intent: "quote", confidence: 100 };
     } else {
       intent = await classifyIntent(message, history);
     }
@@ -1695,6 +1695,7 @@ export async function POST(req) {
   "params": {
     "query": "search term if searching",
     "contactId": "contact ID if known",
+    "contactName": "contact full name if mentioned (e.g. 'Lewis Anderson')",
     "body": "note text if adding note",
     "message": "SMS message if sending",
     "name": "opportunity name",
@@ -1723,6 +1724,28 @@ export async function POST(req) {
         if (resolved) {
           params.contactId = resolved;
           console.log("[ghl] resolved contactId from lastGHLContacts:", resolved);
+        }
+      }
+
+      // For add_note specifically: if we still have no contactId, search GHL by
+      // name so Brad doesn't have to do "search Lewis, then add note" in two turns.
+      if (action === "add_note" && !params.contactId) {
+        const nameMatch = message.match(/\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/);
+        const extractedName = nameMatch ? nameMatch[1] : null;
+        const query = params.contactName || extractedName;
+        if (query) {
+          const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "search_contact", params: { query } }),
+          });
+          const searchData = await searchRes.json();
+          const contact = searchData.data?.contacts?.[0];
+          if (contact) {
+            params.contactId = contact.id || contact._id;
+            jessState.lastGHLContacts = searchData.data?.contacts || [];
+            console.log("[ghl] auto-searched", query, "→ contactId:", params.contactId);
+          }
         }
       }
 

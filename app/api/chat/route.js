@@ -1713,13 +1713,11 @@ export async function POST(req) {
 
       const { action, params } = JSON.parse(extracted.choices[0].message.content);
 
-      // Resolve contactId from prior search if extractor didn't get one.
-      // Lets "add a note to Lewis Anderson" use Lewis's id from the last search.
-      // send_sms is excluded — we always re-search for SMS so we hit the current
-      // phone number on file, not whatever was cached.
+      // Resolve contactId from prior search for actions that can safely reuse
+      // cached state. send_sms and add_note are excluded — they auto-search
+      // fresh below so we hit the current phone/contact, not stale cache.
       const CACHE_RESOLVE_ACTIONS = [
-        "add_note", "get_contact", "create_opportunity",
-        "update_contact", "create_task",
+        "get_contact", "create_opportunity", "update_contact", "create_task",
       ];
       if (CACHE_RESOLVE_ACTIONS.includes(action) && !params.contactId) {
         const resolved = resolveContactIdFromMessage(message, jessState.lastGHLContacts);
@@ -1729,18 +1727,14 @@ export async function POST(req) {
         }
       }
 
-      // Auto-search GHL by name. send_sms always re-searches (per Brad: don't
-      // trust the cache for outbound SMS). add_note only searches if the cache
-      // resolver above didn't already find a match.
-      const needsFreshSearch = action === "send_sms";
-      const needsFallbackSearch = action === "add_note" && !params.contactId;
-      if (needsFreshSearch || needsFallbackSearch) {
-        const smsPatterns = [
+      // Unified auto-search for send_sms and add_note: if we don't have a
+      // contactId, extract the name from Brad's message and search GHL fresh.
+      if ((action === "send_sms" || action === "add_note") && !params.contactId) {
+        const patterns = [
           /\b(?:send|shoot|tell|message)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)\s+(?:a\s+)?(?:text|sms|message)/,
           /\b(?:text|sms|message)\s+(?:to\s+)?([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/,
+          /\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/,
         ];
-        const notePattern = /\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/;
-        const patterns = action === "send_sms" ? smsPatterns : [notePattern];
         let extractedName = null;
         for (const re of patterns) {
           const m = message.match(re);

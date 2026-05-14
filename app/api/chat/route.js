@@ -98,7 +98,11 @@ function isGHLAction(msg) {
     /\badd a note\b/.test(m) ||
     /\badd note\b/.test(m) ||
     /\bnote to\b/.test(m) ||
-    /\blog a note\b/.test(m)
+    /\blog a note\b/.test(m) ||
+    // SMS phrasing: "send Tim a text", "send Tim Miller a sms", "shoot X a message"
+    /\b(?:send|shoot)\s+\w+(?:\s+\w+)?\s+(?:a\s+)?(?:text|sms|message)\b/.test(m) ||
+    // verb-form: "text Tim Miller", "sms Tim", "text him"
+    /\b(?:text|sms)\s+(?:to\s+)?\w+/.test(m)
   );
 }
 
@@ -1713,6 +1717,23 @@ export async function POST(req) {
 
       const { action, params } = JSON.parse(extracted.choices[0].message.content);
 
+      // Extract a person-name from Brad's message up front so every downstream
+      // lookup uses the same value. Patterns are case-insensitive on the verb
+      // (so "Send Tim Miller a text" works) and capture the proper-noun name.
+      const NAME_PATTERNS = [
+        /\b(?:send|shoot|tell|message)\s+([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)\s+(?:a\s+)?(?:text|sms|message)\b/i,
+        /\b(?:text|sms|message)\s+(?:to\s+)?([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)/i,
+        /\bnote\s+(?:to|on|for|about)\s+([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+)?)/i,
+        /\b(?:to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/,
+      ];
+      let nameMatch = null;
+      for (const re of NAME_PATTERNS) {
+        const m = message.match(re);
+        if (m) { nameMatch = m[1]; break; }
+      }
+      const extractedName = params.contactName || params.name || nameMatch || "";
+      console.log("[ghl] action:", action, "extractedName:", extractedName, "params:", JSON.stringify(params));
+
       // Resolve contactId from prior search for actions that can safely reuse
       // cached state. send_sms and add_note are excluded — they auto-search
       // fresh below so we hit the current phone/contact, not stale cache.
@@ -1727,35 +1748,21 @@ export async function POST(req) {
         }
       }
 
-      // Unified auto-search for send_sms and add_note: if we don't have a
-      // contactId, extract the name from Brad's message and search GHL fresh.
-      if ((action === "send_sms" || action === "add_note") && !params.contactId) {
-        const patterns = [
-          /\b(?:send|shoot|tell|message)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)\s+(?:a\s+)?(?:text|sms|message)/,
-          /\b(?:text|sms|message)\s+(?:to\s+)?([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/,
-          /\bnote\s+(?:to|on|for|about)\s+([A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+)?)/,
-        ];
-        let extractedName = null;
-        for (const re of patterns) {
-          const m = message.match(re);
-          if (m) { extractedName = m[1]; break; }
-        }
-        const query = params.contactName || extractedName;
-        if (query) {
-          const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "search_contact", params: { query } }),
-          });
-          const searchData = await searchRes.json();
-          const contact = searchData.data?.contacts?.[0];
-          if (contact) {
-            params.contactId = contact.id || contact._id;
-            jessState.lastGHLContacts = searchData.data?.contacts || [];
-            console.log("[ghl] auto-searched", query, "→ contactId:", params.contactId, "phone:", contact.phone);
-          } else {
-            console.log("[ghl] auto-search for", query, "returned no contacts");
-          }
+      // Auto-search GHL fresh for send_sms / add_note when contactId is missing.
+      if ((action === "send_sms" || action === "add_note") && !params.contactId && extractedName) {
+        const searchRes = await fetch(`${BASE_URL}/api/ghl`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "search_contact", params: { query: extractedName } }),
+        });
+        const searchData = await searchRes.json();
+        const contact = searchData.data?.contacts?.[0];
+        if (contact) {
+          params.contactId = contact.id || contact._id;
+          jessState.lastGHLContacts = searchData.data?.contacts || [];
+          console.log("[ghl] auto-searched", extractedName, "→ contactId:", params.contactId, "phone:", contact.phone);
+        } else {
+          console.log("[ghl] auto-search for", extractedName, "returned no contacts");
         }
       }
 

@@ -1709,7 +1709,12 @@ export async function POST(req) {
     "email": "email",
     "phone": "phone"
   }
-}`,
+}
+
+When action is send_sms, the 'message' field should contain the text after 'says' or 'saying' or 'that says'.
+Example: 'send a text that says you are the best' -> message: 'you are the best'
+Example: 'text him saying thanks for coming' -> message: 'thanks for coming'
+Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 min late'`,
           },
           { role: "user", content: message },
         ],
@@ -1762,6 +1767,20 @@ export async function POST(req) {
           jessState.lastGHLContacts = searchData.data?.contacts || [];
           console.log("Resolved contactId:", params.contactId);
         }
+      }
+
+      // If still no contactId and no name to search for, fall back to the most
+      // recently found contact — handles "send him a text" / "add a note saying X"
+      // right after a search turn.
+      if (
+        ["send_sms", "add_note", "create_task", "update_contact"].includes(action) &&
+        !params.contactId &&
+        !extractedName &&
+        jessState.lastGHLContacts?.length > 0
+      ) {
+        const last = jessState.lastGHLContacts[0];
+        params.contactId = last.id || last._id;
+        console.log("[ghl] fell back to lastGHLContacts[0] →", params.contactId);
       }
 
       // Polish the outbound SMS body before it leaves. Brad dictates these and

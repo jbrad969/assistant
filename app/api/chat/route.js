@@ -103,7 +103,12 @@ function isGHLAction(msg) {
     // SMS phrasing: "send Tim a text", "send Tim Miller a sms", "shoot X a message"
     /\b(?:send|shoot)\s+\w+(?:\s+\w+)?\s+(?:a\s+)?(?:text|sms|message)\b/.test(m) ||
     // verb-form: "text Tim Miller", "sms Tim", "text him"
-    /\b(?:text|sms)\s+(?:to\s+)?\w+/.test(m)
+    /\b(?:text|sms)\s+(?:to\s+)?\w+/.test(m) ||
+    // address-based contact lookups (GHL v2 search hits name/phone/email/address)
+    /\bfind\s+(?:the\s+)?contact\b/.test(m) ||
+    /\bwho\s+lives\s+at\b/.test(m) ||
+    /\bcontact\s+at\s+\d/.test(m) ||
+    /\blook\s+up\b[\s\S]*\b(?:street|st|ave|avenue|drive|dr|place|pl|way|blvd|boulevard|lane|ln|circle|cir|road|rd|court|ct)\b/.test(m)
   );
 }
 

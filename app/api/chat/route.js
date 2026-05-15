@@ -87,6 +87,9 @@ function isGHLAction(msg) {
   const m = msg.toLowerCase();
   return (
     /\bghl\b/.test(m) ||
+    /\bgo high level\b/.test(m) ||
+    /\bgohighlevel\b/.test(m) ||
+    /\bhigh level\b/.test(m) ||
     /\bcrm\b/.test(m) ||
     /\bsmartboard\b/.test(m) ||
     /\bpipeline\b/.test(m) ||
@@ -1722,6 +1725,8 @@ export async function POST(req) {
 
 Use search_by_address when Brad gives a street address ("find the contact at 6334 South Vista Point Circle", "who lives at 123 Main St").
 Use search_contact for name/phone/email lookups.
+
+When Brad says "search go high level for X" or "search ghl for X", use action: search_contact with params.query = X
 
 When action is send_sms, the 'message' field should contain the text after 'says' or 'saying' or 'that says'.
 Example: 'send a text that says you are the best' -> message: 'you are the best'

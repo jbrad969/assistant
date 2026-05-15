@@ -103,6 +103,8 @@ function isGHLAction(msg) {
     /\badd note\b/.test(m) ||
     /\bnote to\b/.test(m) ||
     /\blog a note\b/.test(m) ||
+    /\btagged\b/.test(m) ||
+    /\bcontacts?\s+from\s+source\b/.test(m) ||
     // SMS phrasing: "send Tim a text", "send Tim Miller a sms", "shoot X a message"
     /\b(?:send|shoot)\s+\w+(?:\s+\w+)?\s+(?:a\s+)?(?:text|sms|message)\b/.test(m) ||
     // verb-form: "text Tim Miller", "sms Tim", "text him"
@@ -1706,9 +1708,10 @@ export async function POST(req) {
             role: "system",
             content: `Extract GHL action from Brad's message. Return JSON:
 {
-  "action": "search_contact|search_by_address|get_contact|add_note|create_opportunity|send_sms|create_contact|create_task",
+  "action": "search_contact|search_by_address|search_by_tag|get_contact|add_note|create_opportunity|send_sms|create_contact|create_task",
   "params": {
     "query": "search term if searching by name/phone/email",
+    "tag": "tag or source name when searching by tag (e.g. 'Advosy roofing', 'HomeSmart')",
     "address": "street address if searching by address (e.g. '6334 South Vista Point Circle')",
     "contactId": "contact ID if known",
     "contactName": "contact full name if mentioned (e.g. 'Lewis Anderson')",
@@ -1729,6 +1732,8 @@ Use search_by_address when Brad gives a street address ("find the contact at 633
 Use search_contact for name/phone/email lookups.
 
 When Brad says "search go high level for X" or "search ghl for X", use action: search_contact with params.query = X
+
+When Brad says "find contacts tagged as X", "contacts from source X", or "contacts from X" where X is a company/source name (like 'Advosy roofing', 'HomeSmart'), use action: search_by_tag with params.tag = X
 
 When Brad says "last two weeks" or "recent" or "this week", extract dateFrom as ISO date string for that time period.
 Today is ${today} (ISO: ${new Date().toLocaleDateString("en-CA", { timeZone: TIMEZONE })}).
@@ -1911,7 +1916,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
 
       // Stash search results so follow-ups like "add a note to Lewis Anderson"
       // or "send him a text" can resolve a contactId without re-searching.
-      if ((action === "search_contact" || action === "search_by_address") && data.data) {
+      if ((action === "search_contact" || action === "search_by_address" || action === "search_by_tag") && data.data) {
         jessState.lastGHLContacts = data.data?.contacts || [];
         jessState.lastGHLContact = data.data?.contacts?.[0] || null;
         if (jessState.lastGHLContact) currentContact = jessState.lastGHLContact;
@@ -1932,6 +1937,12 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         const a = params.address || "that address";
         return Response.json({
           reply: `No GHL contact matched "${a}". The v2 search hits name/phone/email/address fields — if the contact uses a different address format, try searching by name.`,
+        });
+      }
+      if (action === "search_by_tag" && (data.data?.contacts?.length ?? 0) === 0) {
+        const t = params.tag || "that tag";
+        return Response.json({
+          reply: `No GHL contacts tagged "${t}". Tag names are case-sensitive in GHL — verify the exact tag spelling in Smartboard if you expected matches.`,
         });
       }
 

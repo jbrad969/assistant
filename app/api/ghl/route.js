@@ -71,6 +71,18 @@ const POST_ACTIONS = {
     filtered.sort((a, b) => new Date(b.dateAdded) - new Date(a.dateAdded));
     return { ...result, contacts: filtered };
   },
+  // Tag/source search uses the /contacts/ GET endpoint (not /contacts/search)
+  // because the search endpoint doesn't accept tag filters. dateFrom is
+  // destructured for API parity with search_contact but not exercised here —
+  // add client-side filtering if Brad needs it.
+  search_by_tag: ({ tag, dateFrom }) => {
+    const params = new URLSearchParams({
+      locationId: LOCATION_ID,
+      limit: "50",
+    });
+    if (tag) params.append("tags[]", tag);
+    return ghlFetch(`/contacts/?${params}`);
+  },
   // Address search uses the same /contacts/search endpoint but with a
   // structured filter on the address1 field. Substring match via "contains"
   // means "Wild Burro" finds "6334 N Wild Burro Trail".

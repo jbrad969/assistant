@@ -3,6 +3,11 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 
+// Allow the function up to 60s so PDF/image analysis through Claude has time
+// to finish on cold starts. Vercel's platform body-size limit (~4.5 MB) is
+// NOT configurable here — exceed it and we need direct-to-blob uploads.
+export const maxDuration = 60;
+
 /* ============================================================================
  * CLIENTS & CONSTANTS
  * ========================================================================== */
@@ -1235,10 +1240,17 @@ const VISION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "ima
 // File Q&A handler. Bypasses the intent classifier — when Brad attaches a
 // file we always send it straight to Claude with the message as the prompt
 // and prior turns as context. Returns the same { reply } shape the chat UI
-// expects for non-streaming responses.
-async function handleFileQuery({ file, message, history }) {
-  const mime = file.type || "";
-  const buf = Buffer.from(await file.arrayBuffer());
+// expects for non-streaming responses. The file lives in Supabase Storage;
+// we fetch by URL so the Vercel function's 4.5 MB body limit never applies.
+async function handleFileQuery({ fileUrl, fileMime, message, history }) {
+  const mime = fileMime || "";
+  const fileRes = await fetch(fileUrl);
+  if (!fileRes.ok) {
+    return Response.json({
+      reply: `I couldn't fetch the uploaded file (${fileRes.status}). Try uploading it again.`,
+    });
+  }
+  const buf = Buffer.from(await fileRes.arrayBuffer());
   const base64 = buf.toString("base64");
 
   let attachment;
@@ -1272,30 +1284,18 @@ async function handleFileQuery({ file, message, history }) {
 
 export async function POST(req) {
   try {
-    let message, history, pendingAction, file;
-    const contentType = req.headers.get("content-type") || "";
-    if (contentType.startsWith("multipart/form-data")) {
-      const form = await req.formData();
-      message = (form.get("message") || "").toString();
-      try { history = JSON.parse(form.get("history") || "[]"); } catch { history = []; }
-      try {
-        const pa = form.get("pendingAction");
-        pendingAction = pa ? JSON.parse(pa) : null;
-      } catch { pendingAction = null; }
-      const f = form.get("file");
-      file = f && typeof f !== "string" ? f : null;
-    } else {
-      const body = await req.json();
-      message = body.message;
-      history = body.history || [];
-      pendingAction = body.pendingAction || null;
-      file = null;
-    }
+    const { message, history = [], pendingAction = null, file = null } = await req.json();
 
     // File attached → bypass intent routing and answer Brad's question about
-    // the file directly. Document-mode for PDFs, vision for images.
-    if (file) {
-      return await handleFileQuery({ file, message, history });
+    // the file directly. The client uploaded it to Supabase Storage first and
+    // passed us the public URL, so we never carry the bytes through Vercel.
+    if (file?.url) {
+      return await handleFileQuery({
+        fileUrl: file.url,
+        fileMime: file.mime,
+        message,
+        history,
+      });
     }
 
     const today = new Date().toLocaleDateString("en-US", {

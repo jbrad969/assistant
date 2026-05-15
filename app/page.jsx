@@ -811,12 +811,52 @@ export default function Page() {
     try {
       let response;
       if (sending) {
-        const form = new FormData();
-        form.append("message", userText);
-        form.append("history", JSON.stringify(messages));
-        if (pendingAction) form.append("pendingAction", JSON.stringify(pendingAction));
-        form.append("file", sending.file);
-        response = await fetch("/api/chat", { method: "POST", body: form });
+        // Direct-to-blob upload via Supabase Storage. We ask the server for a
+        // signed upload URL, PUT the file straight to Supabase (bypassing
+        // Vercel's 4.5 MB function body limit entirely), then send only the
+        // resulting public URL to the chat route.
+        const urlRes = await fetch("/api/upload-url", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: sending.file.name }),
+        });
+        const urlData = await urlRes.json();
+        if (!urlData.success) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `Upload setup failed: ${urlData.error || "unknown"}` },
+          ]);
+          setLoading(false);
+          return;
+        }
+        const uploadRes = await fetch(urlData.uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": sending.file.type || "application/octet-stream" },
+          body: sending.file,
+        });
+        if (!uploadRes.ok) {
+          const errText = await uploadRes.text().catch(() => "");
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `Upload failed (${uploadRes.status}): ${errText.slice(0, 200)}` },
+          ]);
+          setLoading(false);
+          return;
+        }
+        response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: userText,
+            history: messages,
+            pendingAction,
+            file: {
+              url: urlData.fileUrl,
+              mime: sending.file.type,
+              name: sending.file.name,
+            },
+          }),
+        });
       } else {
         response = await fetch("/api/chat", {
           method: "POST",

@@ -122,6 +122,21 @@ function isGHLAction(msg) {
   );
 }
 
+// Explicit web-search phrasing. Pre-classifier check so Brad's "search the web
+// for X" doesn't have to round-trip through gpt-4o-mini — and won't get
+// misclassified as email_read just because he said "search".
+function isWebSearch(msg) {
+  const m = msg.toLowerCase();
+  return (
+    /\bsearch the web for\b/.test(m) ||
+    /\blook (?:it |this |that )?up online\b/.test(m) ||
+    /\bwhat'?s the latest on\b/.test(m) ||
+    /\bcurrent price of\b/.test(m) ||
+    /\bnews about\b/.test(m) ||
+    /\bweather in\b/.test(m)
+  );
+}
+
 // Markers embedded in confirmation prompts so subsequent turns can recover
 // the pinned IDs without session storage.
 const DELETE_MARKER_RE = /\[delete:([A-Za-z0-9_\-]+)\]/;
@@ -172,6 +187,7 @@ Intents:
 - "reminder_set" - set a NEW reminder
 - "reminder_check" - check existing reminders
 - "reminder_delete" - delete all reminders
+- "web_search" - Brad explicitly asks to search the web, or asks about current events/news/prices/weather that need fresh info (e.g. "search the web for X", "look up online", "what's the latest on Y", "current price of Z", "news about W", "weather in Phoenix")
 - "chat" - general conversation, none of the above
 
 Return JSON:
@@ -1437,6 +1453,8 @@ export async function POST(req) {
       intent = { intent: "ghl", confidence: 100 };
     } else if (isQuoteRequest) {
       intent = { intent: "quote", confidence: 100 };
+    } else if (isWebSearch(msg)) {
+      intent = { intent: "web_search", confidence: 100 };
     } else {
       intent = await classifyIntent(message, history);
     }
@@ -2939,11 +2957,30 @@ If the message has no email, set shareEmail to null.`,
       });
     }
 
+    // EXPLICIT WEB SEARCH — pre-check or classifier picked "web_search".
+    // Anthropic's server-side web_search tool runs the query and feeds results
+    // back into the same response, so we just stream the final text.
+    case "web_search": {
+      return streamAnthropicResponse({
+        model: CLAUDE_MODEL,
+        max_tokens: 1024,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        system: buildSystemPrompt(today, memoryText),
+        messages: [
+          ...history.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+    }
+
     // NORMAL CHAT — classifier returned "chat" or an unhandled intent.
+    // Web search is always available; Claude decides when to use it (current
+    // events, news, prices, weather, anything else that needs fresh data).
     default: {
       return streamAnthropicResponse({
         model: CLAUDE_MODEL,
         max_tokens: 1024,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
         system: buildSystemPrompt(today, memoryText),
         messages: [
           ...history.map((m) => ({ role: m.role, content: m.content })),

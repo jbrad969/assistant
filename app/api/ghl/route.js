@@ -47,14 +47,25 @@ const GET_ACTIONS = {
 const POST_ACTIONS = {
   // GHL v2 search is POST-only; sending GET to /contacts/search gets matched
   // to /contacts/{id} with id="search" → "Contact with id search not found".
-  search_contact: ({ query }) => {
+  // dateFrom/dateTo are ISO date strings (YYYY-MM-DD) filtering by dateAdded.
+  search_contact: ({ query, dateFrom, dateTo }) => {
+    const body = {
+      locationId: LOCATION_ID,
+      query: query || "",
+      pageLimit: 20,
+    };
+    if (dateFrom || dateTo) {
+      body.filters = [];
+      if (dateFrom) {
+        body.filters.push({ field: "dateAdded", operator: "gte", value: dateFrom });
+      }
+      if (dateTo) {
+        body.filters.push({ field: "dateAdded", operator: "lte", value: dateTo });
+      }
+    }
     return ghlFetch(`/contacts/search`, {
       method: "POST",
-      body: JSON.stringify({
-        locationId: LOCATION_ID,
-        query: query || "",
-        pageLimit: 10,
-      }),
+      body: JSON.stringify(body),
     });
   },
   // Address search uses the same /contacts/search endpoint but with a

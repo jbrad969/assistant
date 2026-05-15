@@ -1719,7 +1719,9 @@ export async function POST(req) {
     "firstName": "first name",
     "lastName": "last name",
     "email": "email",
-    "phone": "phone"
+    "phone": "phone",
+    "dateFrom": "ISO date string (YYYY-MM-DD) for contacts added on/after this date",
+    "dateTo": "ISO date string (YYYY-MM-DD) for contacts added on/before this date"
   }
 }
 
@@ -1727,6 +1729,13 @@ Use search_by_address when Brad gives a street address ("find the contact at 633
 Use search_contact for name/phone/email lookups.
 
 When Brad says "search go high level for X" or "search ghl for X", use action: search_contact with params.query = X
+
+When Brad says "last two weeks" or "recent" or "this week", extract dateFrom as ISO date string for that time period.
+Today is ${today} (ISO: ${new Date().toLocaleDateString("en-CA", { timeZone: TIMEZONE })}).
+'last two weeks' = dateFrom: 14 days ago ISO string
+'this week' = dateFrom: Monday of current week ISO string
+'last month' = dateFrom: 30 days ago ISO string
+'recent' = dateFrom: 14 days ago ISO string
 
 When action is send_sms, the 'message' field should contain the text after 'says' or 'saying' or 'that says'.
 Example: 'send a text that says you are the best' -> message: 'you are the best'

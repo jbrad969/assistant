@@ -57,10 +57,10 @@ const POST_ACTIONS = {
     if (dateFrom || dateTo) {
       body.filters = [];
       if (dateFrom) {
-        body.filters.push({ field: "dateAdded", operator: "gte", value: dateFrom });
+        body.filters.push({ field: "date_added", operator: "gt", value: dateFrom });
       }
       if (dateTo) {
-        body.filters.push({ field: "dateAdded", operator: "lte", value: dateTo });
+        body.filters.push({ field: "date_added", operator: "lt", value: dateTo });
       }
     }
     return ghlFetch(`/contacts/search`, {

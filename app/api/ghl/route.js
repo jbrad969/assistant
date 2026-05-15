@@ -47,26 +47,29 @@ const GET_ACTIONS = {
 const POST_ACTIONS = {
   // GHL v2 search is POST-only; sending GET to /contacts/search gets matched
   // to /contacts/{id} with id="search" → "Contact with id search not found".
-  // dateFrom/dateTo are ISO date strings (YYYY-MM-DD) filtering by dateAdded.
-  search_contact: ({ query, dateFrom, dateTo }) => {
-    const body = {
-      locationId: LOCATION_ID,
-      query: query || "",
-      pageLimit: 20,
-    };
-    if (dateFrom || dateTo) {
-      body.filters = [];
-      if (dateFrom) {
-        body.filters.push({ field: "date_added", operator: "gt", value: dateFrom });
-      }
-      if (dateTo) {
-        body.filters.push({ field: "date_added", operator: "lt", value: dateTo });
-      }
-    }
-    return ghlFetch(`/contacts/search`, {
+  // /contacts/search doesn't support server-side date filtering, so when
+  // dateFrom/dateTo are provided we pull pageLimit:50 and filter client-side.
+  search_contact: async ({ query, dateFrom, dateTo }) => {
+    const result = await ghlFetch(`/contacts/search`, {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        locationId: LOCATION_ID,
+        query: query || "",
+        pageLimit: 50,
+      }),
     });
+    if (!dateFrom && !dateTo) return result;
+    const from = dateFrom ? new Date(dateFrom) : null;
+    const to = dateTo ? new Date(dateTo) : null;
+    const filtered = (result.contacts || []).filter((c) => {
+      if (!c.dateAdded) return false;
+      const added = new Date(c.dateAdded);
+      if (from && added < from) return false;
+      if (to && added > to) return false;
+      return true;
+    });
+    filtered.sort((a, b) => new Date(b.dateAdded) - new Date(a.dateAdded));
+    return { ...result, contacts: filtered };
   },
   // Address search uses the same /contacts/search endpoint but with a
   // structured filter on the address1 field. Substring match via "contains"

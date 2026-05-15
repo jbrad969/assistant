@@ -1881,6 +1881,7 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
       const postActions = [
         "search_contact",
         "search_by_address",
+        "search_by_tag",
         "add_note",
         "create_opportunity",
         "send_sms",

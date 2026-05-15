@@ -19,7 +19,11 @@ async function ghlFetch(path, init = {}) {
     data = { raw: text };
   }
   if (!res.ok) {
-    const detail = data.message || data.error || text || "unknown";
+    console.log(`GHL ${res.status} error from ${path}:`, text);
+    const rawMessage = Array.isArray(data.message)
+      ? data.message.join("; ")
+      : data.message;
+    const detail = rawMessage || data.error || text || "unknown";
     throw new Error(`GHL ${res.status}: ${detail}`);
   }
   return data;
@@ -71,17 +75,19 @@ const POST_ACTIONS = {
     filtered.sort((a, b) => new Date(b.dateAdded) - new Date(a.dateAdded));
     return { ...result, contacts: filtered };
   },
-  // Tag/source search uses the /contacts/ GET endpoint (not /contacts/search)
-  // because the search endpoint doesn't accept tag filters. dateFrom is
-  // destructured for API parity with search_contact but not exercised here —
-  // add client-side filtering if Brad needs it.
+  // Tag search via POST /contacts/search with a filters array on the `tags`
+  // field. The `tags[]` query param on GET /contacts/ was rejected with 422
+  // ("property tags should not exist"). The `dateFrom` destructure is kept
+  // for API parity with search_contact but not exercised here.
   search_by_tag: ({ tag, dateFrom }) => {
-    const params = new URLSearchParams({
-      locationId: LOCATION_ID,
-      limit: "50",
+    return ghlFetch(`/contacts/search`, {
+      method: "POST",
+      body: JSON.stringify({
+        locationId: LOCATION_ID,
+        pageLimit: 50,
+        filters: [{ field: "tags", operator: "contains", value: tag }],
+      }),
     });
-    if (tag) params.append("tags[]", tag);
-    return ghlFetch(`/contacts/?${params}`);
   },
   // Address search uses the same /contacts/search endpoint but with a
   // structured filter on the address1 field. Substring match via "contains"

@@ -575,6 +575,7 @@ export default function Page() {
   const [editingText, setEditingText] = useState("");
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceOn, setVoiceOn] = useState(false);
   const [showReplyChoice, setShowReplyChoice] = useState(false);
   // Server may return a `pendingAction` (e.g. confirm a calendar move). We echo it
   // back on the next request; the server consumes it on approve/deny and returns
@@ -860,6 +861,21 @@ export default function Page() {
 
   useEffect(() => { loadMemory(); }, []);
 
+  // Hydrate voice preference from localStorage (client-only to stay SSR-safe).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setVoiceOn(localStorage.getItem("jessVoiceOn") === "true");
+  }, []);
+
+  function toggleVoice() {
+    const next = !voiceOn;
+    setVoiceOn(next);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("jessVoiceOn", String(next));
+    }
+    if (!next) stopSpeaking();
+  }
+
   useEffect(() => {
     checkReminders();
     const interval = setInterval(checkReminders, 5 * 60 * 1000);
@@ -950,6 +966,7 @@ export default function Page() {
   }, []);
 
   function speak(text) {
+    if (!voiceOn) return;
     if (typeof window === "undefined" || !window.speechSynthesis || !text) return;
     // Drop PENDING_ATTACHMENT and other HTML comments before TTS — Brad
     // shouldn't hear "less-than-exclamation-dash-dash" read aloud.
@@ -1040,6 +1057,14 @@ export default function Page() {
               onClick={() => setShowMemory(!showMemory)}
             >
               Memory
+            </button>
+            <button
+              className={`btn ${voiceOn ? "active" : ""}`}
+              onClick={toggleVoice}
+              aria-label={voiceOn ? "Mute Jess voice" : "Unmute Jess voice"}
+              title={voiceOn ? "Voice on — click to mute" : "Voice off — click to enable"}
+            >
+              {voiceOn ? "🔊" : "🔇"}
             </button>
           </div>
         </header>

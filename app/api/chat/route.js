@@ -1240,11 +1240,22 @@ const VISION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "ima
 // File Q&A handler. Bypasses the intent classifier — when Brad attaches a
 // file we always send it straight to Claude with the message as the prompt
 // and prior turns as context. Returns the same { reply } shape the chat UI
-// expects for non-streaming responses. The file lives in Supabase Storage;
-// we fetch by URL so the Vercel function's 4.5 MB body limit never applies.
-async function handleFileQuery({ fileUrl, fileMime, message, history }) {
+// expects for non-streaming responses. The file lives in a private Supabase
+// Storage bucket; we mint a short-lived signed URL and fetch server-side so
+// the Vercel function's 4.5 MB body limit never applies and no public URL
+// for the file is ever exposed.
+async function handleFileQuery({ filePath, fileMime, message, history }) {
   const mime = fileMime || "";
-  const fileRes = await fetch(fileUrl);
+  const { data: signed, error: signErr } = await supabase
+    .storage
+    .from("jess-uploads")
+    .createSignedUrl(filePath, 3600);
+  if (signErr || !signed?.signedUrl) {
+    return Response.json({
+      reply: `I couldn't get a read link for that upload (${signErr?.message || "no signed URL returned"}). Try uploading again.`,
+    });
+  }
+  const fileRes = await fetch(signed.signedUrl);
   if (!fileRes.ok) {
     return Response.json({
       reply: `I couldn't fetch the uploaded file (${fileRes.status}). Try uploading it again.`,
@@ -1287,11 +1298,11 @@ export async function POST(req) {
     const { message, history = [], pendingAction = null, file = null } = await req.json();
 
     // File attached → bypass intent routing and answer Brad's question about
-    // the file directly. The client uploaded it to Supabase Storage first and
-    // passed us the public URL, so we never carry the bytes through Vercel.
-    if (file?.url) {
+    // the file directly. The client uploaded it to private Supabase Storage
+    // first and passed us the path; we mint a signed read URL server-side.
+    if (file?.path) {
       return await handleFileQuery({
-        fileUrl: file.url,
+        filePath: file.path,
         fileMime: file.mime,
         message,
         history,

@@ -851,7 +851,7 @@ export default function Page() {
             history: messages,
             pendingAction,
             file: {
-              url: urlData.fileUrl,
+              path: urlData.path,
               mime: sending.file.type,
               name: sending.file.name,
             },

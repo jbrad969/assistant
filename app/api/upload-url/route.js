@@ -14,11 +14,12 @@ async function ensureBucket() {
   const { data, error } = await supabase.storage.getBucket(BUCKET);
   if (data) return;
   if (error && !/not found/i.test(error.message)) throw error;
-  // Public bucket so the chat route can fetch the file by URL without a
-  // separate signed-read step. Files accumulate — set up a Supabase scheduled
-  // function or manual cleanup if Brad ever needs to prune.
+  // Private bucket — the chat route generates short-lived signed read URLs
+  // when it needs to fetch a file for Claude. If the bucket already exists
+  // as public from an earlier deploy, delete it in the Supabase dashboard
+  // and the next upload will recreate it private.
   const { error: createErr } = await supabase.storage.createBucket(BUCKET, {
-    public: true,
+    public: false,
     fileSizeLimit: 52428800, // 50 MB
   });
   if (createErr) throw createErr;
@@ -45,13 +46,10 @@ export async function POST(req) {
       return Response.json({ success: false, error: error.message }, { status: 500 });
     }
 
-    const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(path);
-
     return Response.json({
       success: true,
       uploadUrl: data.signedUrl,
       path,
-      fileUrl: pub.publicUrl,
     });
   } catch (e) {
     console.log("upload-url error:", e.message);

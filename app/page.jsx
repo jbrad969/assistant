@@ -50,10 +50,13 @@ const styles = `
     max-width: 820px;
     margin: 0 auto;
     min-height: 100vh;
+    min-height: 100dvh;
+    min-height: var(--app-height, 100dvh);
     display: flex;
     flex-direction: column;
     position: relative;
     z-index: 1;
+    width: 100%;
   }
 
   /* HEADER */
@@ -131,6 +134,10 @@ const styles = `
     border-color: #6366f1;
     box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
   }
+
+  /* Header button content: text on desktop, single-glyph icon on mobile. */
+  .btn-icon { display: none; font-size: 16px; line-height: 1; }
+  .btn-text { display: inline; }
 
   /* MEMORY PANEL */
   .memory-panel {
@@ -267,7 +274,7 @@ const styles = `
     max-width: 78%;
     padding: 14px 18px;
     border-radius: 18px;
-    font-size: 15px;
+    font-size: 16px;
     line-height: 1.6;
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -424,9 +431,10 @@ const styles = `
     border: none;
     outline: none;
     color: #ffffff;
-    font-size: 15px;
+    font-size: 16px; /* >=16px prevents iOS auto-zoom on focus */
     font-family: 'DM Sans', sans-serif;
     padding: 8px 0;
+    min-width: 0;
   }
 
   .input-field::placeholder { color: #9999bb; }
@@ -659,6 +667,59 @@ const styles = `
     border-color: #6366f1;
     color: #ffffff;
   }
+
+  /* Hide the camera-only file picker on desktop — the paperclip covers all
+     uploads there. Camera button is only useful where there's a real camera. */
+  @media (min-width: 768px) {
+    .camera-btn { display: none; }
+  }
+
+  /* Mobile layout: compact header, larger touch targets, bigger bubble
+     padding, and the icon/text swap for the header buttons. */
+  @media (max-width: 767px) {
+    .header { padding: 12px 14px; }
+    .header-title { font-size: 15px; }
+    .header-sub { display: none; }
+    .header-actions { gap: 6px; }
+
+    .btn {
+      padding: 0;
+      width: 44px;
+      height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .btn-icon { display: inline; }
+    .btn-text { display: none; }
+
+    .chat { padding: 16px 12px 4px; gap: 16px; }
+
+    .bubble {
+      max-width: 88%;
+      padding: 16px 18px;
+      font-size: 16px;
+    }
+
+    .input-bar { padding: 12px 12px 18px; }
+
+    .input-wrap {
+      padding: 4px 4px 4px 16px;
+      gap: 6px;
+    }
+
+    .mic-btn, .attach-btn {
+      width: 44px;
+      height: 44px;
+    }
+    .mic-btn svg, .attach-btn svg { width: 20px; height: 20px; }
+
+    .send-btn {
+      padding: 12px 18px;
+      font-size: 15px;
+      min-height: 44px;
+    }
+  }
 `;
 
 export default function Page() {
@@ -821,6 +882,7 @@ export default function Page() {
           body: JSON.stringify({ filename: sending.file.name }),
         });
         const urlData = await urlRes.json();
+        console.log("[upload] urlData:", urlData);
         if (!urlData.success) {
           setMessages((prev) => [
             ...prev,
@@ -829,16 +891,30 @@ export default function Page() {
           setLoading(false);
           return;
         }
+        console.log("[upload] PUT request:", {
+          uploadUrl: urlData.uploadUrl,
+          path: urlData.path,
+          fileName: sending.file.name,
+          fileSize: sending.file.size,
+          fileType: sending.file.type,
+        });
         const uploadRes = await fetch(urlData.uploadUrl, {
           method: "PUT",
           headers: { "Content-Type": sending.file.type || "application/octet-stream" },
           body: sending.file,
         });
+        const uploadBody = await uploadRes.text().catch(() => "");
+        console.log("[upload] PUT response:", {
+          status: uploadRes.status,
+          statusText: uploadRes.statusText,
+          ok: uploadRes.ok,
+          contentType: uploadRes.headers.get("content-type"),
+          body: uploadBody.slice(0, 500),
+        });
         if (!uploadRes.ok) {
-          const errText = await uploadRes.text().catch(() => "");
           setMessages((prev) => [
             ...prev,
-            { role: "assistant", content: `Upload failed (${uploadRes.status}): ${errText.slice(0, 200)}` },
+            { role: "assistant", content: `Upload failed (${uploadRes.status}): ${uploadBody.slice(0, 200)}` },
           ]);
           setLoading(false);
           return;
@@ -1038,6 +1114,25 @@ export default function Page() {
     setVoiceOn(localStorage.getItem("jessVoiceOn") === "true");
   }, []);
 
+  // Pin .app's height to the visual viewport so the input bar sits above the
+  // mobile keyboard instead of being pushed off-screen. Cleans up on unmount.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.visualViewport) return;
+    const update = () => {
+      document.documentElement.style.setProperty(
+        "--app-height",
+        window.visualViewport.height + "px"
+      );
+    };
+    update();
+    window.visualViewport.addEventListener("resize", update);
+    window.visualViewport.addEventListener("scroll", update);
+    return () => {
+      window.visualViewport.removeEventListener("resize", update);
+      window.visualViewport.removeEventListener("scroll", update);
+    };
+  }, []);
+
   function toggleVoice() {
     const next = !voiceOn;
     setVoiceOn(next);
@@ -1232,6 +1327,8 @@ export default function Page() {
           <div className="header-actions">
             <button
               className="btn"
+              aria-label="Clear conversation"
+              title="Clear conversation"
               onClick={() => {
                 stopSpeaking();
                 setShowReplyChoice(false);
@@ -1239,13 +1336,17 @@ export default function Page() {
                 setMessages([{ role: "assistant", content: "Hey Brad — I'm Jess. What do you need?" }]);
               }}
             >
-              Clear
+              <span className="btn-icon" aria-hidden="true">🗑️</span>
+              <span className="btn-text">Clear</span>
             </button>
             <button
               className={`btn ${showMemory ? "active" : ""}`}
+              aria-label="Toggle memory panel"
+              title="Toggle memory panel"
               onClick={() => setShowMemory(!showMemory)}
             >
-              Memory
+              <span className="btn-icon" aria-hidden="true">🧠</span>
+              <span className="btn-text">Memory</span>
             </button>
             <button
               className={`btn ${voiceOn ? "active" : ""}`}
@@ -1396,6 +1497,11 @@ export default function Page() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+              onFocus={() => {
+                // When the mobile keyboard opens, give it ~300ms to animate
+                // in, then pull the latest message into view above the keyboard.
+                setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 300);
+              }}
               placeholder={isListening ? "Listening..." : "Ask Jess..."}
             />
             <button
@@ -1411,7 +1517,7 @@ export default function Page() {
             </button>
             <button
               type="button"
-              className="attach-btn"
+              className="attach-btn camera-btn"
               onClick={() => cameraInputRef.current?.click()}
               aria-label="Take photo"
               title="Take a photo"

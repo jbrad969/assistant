@@ -574,6 +574,10 @@ const styles = `
     letter-spacing: 0.3px;
   }
 
+  @media (min-width: 768px) {
+    .input-hint { display: none; }
+  }
+
   .attachment-preview {
     display: flex;
     align-items: center;

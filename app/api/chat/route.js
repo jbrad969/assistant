@@ -1909,6 +1909,23 @@ Example: 'send Tim a text saying running 10 min late' -> message: 'running 10 mi
         console.log("Stored lastGHLContact:", jessState.lastGHLContact?.id);
       }
 
+      // Honest empty-result message for searches. GHL's basic search API only
+      // hits name/phone/email/address — it can't filter by source, tag, pipeline,
+      // or custom field. A bare "0 results" reply would mislead Brad into
+      // thinking the contact doesn't exist when really the query was unsearchable.
+      if (action === "search_contact" && (data.data?.contacts?.length ?? 0) === 0) {
+        const q = params.query || "that";
+        return Response.json({
+          reply: `No GHL contact matched "${q}" on name, phone, email, or address. Heads up: GHL's basic search API can't filter by source, tag, or pipeline — if "${q}" is a lead source or tag, search Smartboard directly.`,
+        });
+      }
+      if (action === "search_by_address" && (data.data?.contacts?.length ?? 0) === 0) {
+        const a = params.address || "that address";
+        return Response.json({
+          reply: `No GHL contact matched "${a}". The v2 search hits name/phone/email/address fields — if the contact uses a different address format, try searching by name.`,
+        });
+      }
+
       // Inject the resolved contact into the system prompt so Claude's summary
       // says "Text sent to B Jorgensen" instead of "Text sent to the contact".
       const cachedContact = currentContact || historyContact;

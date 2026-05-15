@@ -890,17 +890,32 @@ export default function Page() {
         }
         speak(fullText || "Jess had no response.");
       } else {
-        const data = await response.json();
-        const reply = data.reply || "Jess had an issue.";
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: reply },
-        ]);
-        // The server is the source of truth for pendingAction. Whatever it
-        // returns (including null/undefined) becomes the new client-side value,
-        // so stale confirmations can't linger across unrelated turns.
-        setPendingAction(data.pendingAction || null);
-        speak(reply);
+        // Read as text first so we can recover from non-JSON responses —
+        // Vercel returns "Request Entity Too Large" as plain text when the
+        // body exceeds ~4.5 MB, which would otherwise crash response.json().
+        const text = await response.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch { /* not JSON */ }
+
+        if (!data) {
+          const friendly =
+            response.status === 413
+              ? "That file is too big to upload — the server's request limit is around 4.5 MB. Try a smaller image, or compress the PDF."
+              : `Server error (${response.status}): ${text.slice(0, 200)}`;
+          setMessages((prev) => [...prev, { role: "assistant", content: friendly }]);
+          setPendingAction(null);
+        } else {
+          const reply = data.reply || "Jess had an issue.";
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: reply },
+          ]);
+          // The server is the source of truth for pendingAction. Whatever it
+          // returns (including null/undefined) becomes the new client-side value,
+          // so stale confirmations can't linger across unrelated turns.
+          setPendingAction(data.pendingAction || null);
+          speak(reply);
+        }
       }
 
 

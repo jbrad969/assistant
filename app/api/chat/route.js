@@ -1227,9 +1227,76 @@ async function findUpcomingEventByTitle(eventName) {
  * POST HANDLER — intent dispatcher
  * ========================================================================== */
 
+// Supported image MIME types for Claude vision. HEIC (iPhone default) is not
+// in this set — phones must be configured to "Most Compatible" or the image
+// will be rejected with a clear error before hitting the API.
+const VISION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+// File Q&A handler. Bypasses the intent classifier — when Brad attaches a
+// file we always send it straight to Claude with the message as the prompt
+// and prior turns as context. Returns the same { reply } shape the chat UI
+// expects for non-streaming responses.
+async function handleFileQuery({ file, message, history }) {
+  const mime = file.type || "";
+  const buf = Buffer.from(await file.arrayBuffer());
+  const base64 = buf.toString("base64");
+
+  let attachment;
+  if (VISION_IMAGE_TYPES.has(mime)) {
+    attachment = { type: "image", source: { type: "base64", media_type: mime, data: base64 } };
+  } else if (mime === "application/pdf") {
+    attachment = { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } };
+  } else {
+    return Response.json({
+      reply: `I can't read ${mime || "that file type"} directly. Send a JPG, PNG, GIF, WebP, or PDF and I'll take a look.`,
+    });
+  }
+
+  const userText = (message || "").trim() || "What's in this file?";
+  const priorMessages = history
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => ({ role: m.role, content: m.content }));
+
+  const response = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 2048,
+    messages: [
+      ...priorMessages,
+      { role: "user", content: [attachment, { type: "text", text: userText }] },
+    ],
+  });
+
+  const reply = response.content?.[0]?.text || "I couldn't read that file.";
+  return Response.json({ reply });
+}
+
 export async function POST(req) {
   try {
-    const { message, history = [], pendingAction = null } = await req.json();
+    let message, history, pendingAction, file;
+    const contentType = req.headers.get("content-type") || "";
+    if (contentType.startsWith("multipart/form-data")) {
+      const form = await req.formData();
+      message = (form.get("message") || "").toString();
+      try { history = JSON.parse(form.get("history") || "[]"); } catch { history = []; }
+      try {
+        const pa = form.get("pendingAction");
+        pendingAction = pa ? JSON.parse(pa) : null;
+      } catch { pendingAction = null; }
+      const f = form.get("file");
+      file = f && typeof f !== "string" ? f : null;
+    } else {
+      const body = await req.json();
+      message = body.message;
+      history = body.history || [];
+      pendingAction = body.pendingAction || null;
+      file = null;
+    }
+
+    // File attached → bypass intent routing and answer Brad's question about
+    // the file directly. Document-mode for PDFs, vision for images.
+    if (file) {
+      return await handleFileQuery({ file, message, history });
+    }
 
     const today = new Date().toLocaleDateString("en-US", {
       weekday: "long", year: "numeric", month: "long", day: "numeric",

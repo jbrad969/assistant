@@ -541,6 +541,100 @@ const styles = `
     50%      { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
   }
 
+  .attach-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: #3a3a5a;
+    border: 1px solid #4a4a6a;
+    color: #c8c8e8;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.18s;
+    flex-shrink: 0;
+    padding: 0;
+  }
+
+  .attach-btn:hover {
+    background: #4a4a6a;
+    color: #ffffff;
+    border-color: #6366f1;
+  }
+
+  .attach-btn svg { width: 18px; height: 18px; }
+
+  .input-hint {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    text-align: center;
+    margin-top: 8px;
+    font-family: 'DM Mono', monospace;
+    letter-spacing: 0.3px;
+  }
+
+  .attachment-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    background: #2d2d4e;
+    border: 1px solid #4a4a6a;
+    border-radius: 12px;
+    width: fit-content;
+    max-width: 100%;
+  }
+
+  .attachment-thumb {
+    width: 40px;
+    height: 40px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+  }
+
+  .attachment-icon {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #3a3a5a;
+    border-radius: 6px;
+    color: #c8c8e8;
+    flex-shrink: 0;
+  }
+
+  .attachment-name {
+    font-size: 13px;
+    color: #c8c8e8;
+    font-family: 'DM Sans', sans-serif;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .attachment-remove {
+    background: #4a4a6a;
+    border: none;
+    color: #fff;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .attachment-remove:hover { background: var(--danger); }
+
   .reply-choice { display: flex; gap: 10px; }
 
   .reply-choice-btn {
@@ -576,6 +670,7 @@ export default function Page() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [voiceOn, setVoiceOn] = useState(false);
+  const [attachment, setAttachment] = useState(null); // { file, previewUrl, isImage }
   const [showReplyChoice, setShowReplyChoice] = useState(false);
   // Server may return a `pendingAction` (e.g. confirm a calendar move). We echo it
   // back on the next request; the server consumes it on approve/deny and returns
@@ -585,6 +680,8 @@ export default function Page() {
   const recognitionRef = useRef(null);
   const voiceRef = useRef(null);
   const inputRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
   const isListeningRef = useRef(false);
   const micStreamRef = useRef(null);
   const shownRemindersRef = useRef(new Set());
@@ -692,22 +789,37 @@ export default function Page() {
   }
 
   async function sendMessage() {
-    if (!input.trim() || loading) return;
+    if ((!input.trim() && !attachment) || loading) return;
 
     stopListening();
 
     const userText = input;
-    setMessages((prev) => [...prev, { role: "user", content: userText }]);
+    const sending = attachment;
+    const displayText = userText.trim()
+      ? sending ? `${userText}\n📎 ${sending.file.name}` : userText
+      : sending ? `📎 ${sending.file.name}` : "";
+    setMessages((prev) => [...prev, { role: "user", content: displayText }]);
     setInput("");
+    if (sending) clearAttachment();
     setLoading(true);
     setShowReplyChoice(false);
 
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userText, history: messages, pendingAction }),
-      });
+      let response;
+      if (sending) {
+        const form = new FormData();
+        form.append("message", userText);
+        form.append("history", JSON.stringify(messages));
+        if (pendingAction) form.append("pendingAction", JSON.stringify(pendingAction));
+        form.append("file", sending.file);
+        response = await fetch("/api/chat", { method: "POST", body: form });
+      } else {
+        response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: userText, history: messages, pendingAction }),
+        });
+      }
 
       const contentType = response.headers.get("content-type") || "";
 
@@ -874,6 +986,24 @@ export default function Page() {
       localStorage.setItem("jessVoiceOn", String(next));
     }
     if (!next) stopSpeaking();
+  }
+
+  function onFileSelected(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (attachment?.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+    const isImage = f.type.startsWith("image/");
+    setAttachment({
+      file: f,
+      previewUrl: isImage ? URL.createObjectURL(f) : null,
+      isImage,
+    });
+    e.target.value = ""; // allow re-selecting the same file
+  }
+
+  function clearAttachment() {
+    if (attachment?.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+    setAttachment(null);
   }
 
   useEffect(() => {
@@ -1169,6 +1299,37 @@ export default function Page() {
               </div>
             </div>
           )}
+          {attachment && (
+            <div className="attachment-preview">
+              {attachment.isImage ? (
+                <img src={attachment.previewUrl} alt="" className="attachment-thumb" />
+              ) : (
+                <div className="attachment-icon">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                  </svg>
+                </div>
+              )}
+              <span className="attachment-name">{attachment.file.name}</span>
+              <button className="attachment-remove" onClick={clearAttachment} aria-label="Remove attachment">×</button>
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,application/pdf,text/*"
+            onChange={onFileSelected}
+            style={{ display: "none" }}
+          />
+          <input
+            ref={cameraInputRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={onFileSelected}
+            style={{ display: "none" }}
+          />
           <div className="input-wrap">
             <input
               ref={inputRef}
@@ -1178,6 +1339,29 @@ export default function Page() {
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
               placeholder={isListening ? "Listening..." : "Ask Jess..."}
             />
+            <button
+              type="button"
+              className="attach-btn"
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach file"
+              title="Attach a file"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="attach-btn"
+              onClick={() => cameraInputRef.current?.click()}
+              aria-label="Take photo"
+              title="Take a photo"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                <circle cx="12" cy="13" r="4" />
+              </svg>
+            </button>
             <button
               type="button"
               className={`mic-btn ${isListening ? "listening" : ""}`}
@@ -1195,10 +1379,13 @@ export default function Page() {
             <button
               className="send-btn"
               onClick={sendMessage}
-              disabled={loading || !input.trim()}
+              disabled={loading || (!input.trim() && !attachment)}
             >
               Send
             </button>
+          </div>
+          <div className="input-hint">
+            For iPhone photos, please use JPG format (hold shutter button → select Photo).
           </div>
         </div>
 
